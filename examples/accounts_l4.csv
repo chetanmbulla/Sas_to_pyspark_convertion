@@ -1,0 +1,7 @@
+customer_id,region,account_type
+401,North,Business
+402,North,Personal
+403,South,Business
+404,East,Personal
+405,West,Business
+406,West,Personal

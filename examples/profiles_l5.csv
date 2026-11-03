@@ -1,0 +1,8 @@
+customer_id,first_name,last_name,region,tenure_months,active_flag
+501,Ada,Chen,North,48,1
+502,Bo,Diaz,North,8,1
+503,Cam,Patel,South,24,1
+504,Dee,Kim,South,14,0
+505,Eli,Ali,East,5,1
+506,Fay,Nguyen,East,60,1
+507,Gus,Ortiz,West,36,1

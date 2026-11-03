@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sas2pyspark"
+version = "0.1.0"
+description = "A small framework for translating a supported SAS subset to PySpark"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pyspark>=3.5"]
+reconcile = ["pyspark>=3.5", "pandas>=2.0,<3", "pyreadstat>=1.2"]
+gui = ["streamlit>=1.30", "pyspark>=3.5"]
+
+[project.scripts]
+sas2pyspark = "sas2pyspark.cli:main"
+
+[tool.setuptools]
+packages = ["sas2pyspark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

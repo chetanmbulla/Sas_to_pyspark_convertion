@@ -1,0 +1,7 @@
+customer_id,transaction_id,product,amount,commission_rate
+401,8401,Cloud,1400.00,0.08
+402,8402,Support,350.00,0.05
+403,8403,Cloud,825.00,0.08
+404,8404,Training,1100.00,0.10
+405,8405,Support,675.00,0.05
+406,8406,Cloud,0.00,0.08

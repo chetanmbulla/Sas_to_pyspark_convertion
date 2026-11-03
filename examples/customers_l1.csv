@@ -1,0 +1,7 @@
+customer_id,first_name,last_name,age,region,annual_spend
+101,Amy,Chen,29,North,1250.50
+102,Ben,Ortiz,17,North,400.00
+103,Cara,Patel,44,South,2100.00
+104,Dev,Kim,35,South,975.25
+105,Eli,Nguyen,62,East,1850.75
+106,Fay,Ali,23,East,640.00

@@ -1,0 +1,9 @@
+sale_id,region,quarter,product,amount,score1,score2,score3
+1001,North,Q1,Widget,1200.00,80,85,90
+1002,North,Q2,Gadget,450.00,70,75,72
+1003,South,Q1,Widget,800.00,90,92,88
+1004,South,Q2,Service,0.00,65,68,70
+1005,East,Q1,Gadget,1500.00,88,86,91
+1006,East,Q2,Widget,600.00,78,80,82
+1007,West,Q1,Service,950.00,84,83,86
+1008,West,Q2,Gadget,300.00,72,74,70

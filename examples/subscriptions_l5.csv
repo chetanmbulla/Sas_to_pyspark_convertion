@@ -1,0 +1,8 @@
+customer_id,plan,subscription_fee
+501,Enterprise,1250.00
+502,Starter,45.00
+503,Professional,350.00
+504,Starter,60.00
+505,Starter,25.00
+506,Enterprise,1800.00
+507,Professional,475.00
