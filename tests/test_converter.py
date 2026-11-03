@@ -919,11 +919,6 @@ class ConverterTests(unittest.TestCase):
             SasToPySparkConverter().convert(
                 "proc sql; create table o as select calculated nope from a; quit;"
             )
-        with self.assertRaises(ConversionError) as caught:
-            SasToPySparkConverter().convert(
-                "proc sql noprint; select max(x) into :mx from a; quit;"
-            )
-        self.assertIn("INTO :macro", caught.exception.message)
 
     def test_macro_text_functions(self):
         source = """
@@ -953,6 +948,30 @@ run;
         for bad in ("%substr(abc)", "%substr(abc,x)", "%scan(abc)", "%substr(abc,0)"):
             with self.assertRaises(ConversionError):
                 SasToPySparkConverter().convert(f"%let v = {bad};")
+
+    def test_runtime_macro_variables_and_restrictions(self):
+        prefix = "proc sql; select max(x) into :mx from a; quit;\n"
+        code = SasToPySparkConverter().convert(
+            prefix + "data o; set a; where x = &mx; run;"
+        ).code
+        self.assertIn("DECLARE OR REPLACE VARIABLE sas_macro_mx", code)
+        self.assertIn("x = sas_macro_mx", code)
+        symput = SasToPySparkConverter().convert(
+            "data _null_; set a; call symput('top', x); run;"
+            "data o; set a; y = &top; run;"
+        ).code
+        self.assertIn("sas_macro_top", symput)
+        for bad in (
+            prefix + "%let z = &mx;",
+            prefix + "%if &mx > 1 %then %do; data o; set a; run; %end;",
+            prefix + "data o; set &mx; run;",
+            prefix + "data o; set a; t = '&mx'; run;",
+            "proc sql; select a into :m separated by ',' from t; quit;",
+            "data _null_; set a; call symput(name, x); run;",
+            "data _null_; set a; if x then do; call symput('v', x); end; run;",
+        ):
+            with self.assertRaises(ConversionError, msg=bad):
+                SasToPySparkConverter().convert(bad)
 
     def test_macro_sysevalf_symexist_return_goto_abort(self):
         source = """
@@ -1025,7 +1044,7 @@ run;
             )
         with self.assertRaises(ConversionError):
             SasToPySparkConverter().convert(
-                "data a; set b; call symput('x', y); run;"
+                "data a; set b; call execute('x'); run;"
             )
 
     def test_proc_means_and_summary_reject_unsupported_forms(self):

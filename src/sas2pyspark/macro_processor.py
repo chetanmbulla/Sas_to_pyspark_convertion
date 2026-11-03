@@ -63,6 +63,16 @@ _MACRO_FUNCTIONS = {
     "quote", "nrquote", "bquote", "nrbquote", "substr", "scan", "index", "length",
 }
 _MACRO_LABEL = re.compile(r"%([A-Za-z_]\w*)\s*:(.*)\Z", re.S)
+_RUNTIME_PREFIX = "sas_macro_"
+_RUNTIME_STRUCTURAL = re.compile(
+    r"\b(?:set|merge|data|from|join|table|by|keep|drop|retain|var|class|tables|"
+    r"out|base|rename|update)\s*=?\s*\(?\s*$",
+    re.I,
+)
+_INTO_CLAUSE = re.compile(r"\binto\s+((?::\s*[A-Za-z_]\w*\s*,?\s*)+)", re.I)
+_CALL_SYMPUT = re.compile(
+    r"(?:.*\bthen\s+)?call\s+symputx?\s*\(\s*(['\"])([A-Za-z_]\w*)\1\s*,", re.I | re.S
+)
 _QUOTING_FUNCTIONS = {"str", "nrstr", "quote", "nrquote", "bquote", "nrbquote"}
 _DEFAULT_SCAN_DELIMITERS = " <(+&!$*);^-/,%|"
 _MACRO_SCOPE = re.compile(
@@ -520,6 +530,7 @@ class _MacroProcessor:
         self.macros: dict[str, _Macro] = {}
         self.statement_count = 0
         self.returning = False
+        self.runtime_names: set[str] = set()
         self.goto_label: str | None = None
         self.goto_statement: MacroStatement | None = None
         self.global_names: set[str] = set()
@@ -530,6 +541,19 @@ class _MacroProcessor:
         result = self._process(self.statements, {}, (), 0)
         self._check_goto_resolved()
         return result
+
+    def _register_runtime_names(self, text: str, variables: dict[str, str]) -> None:
+        """Bind variables set at run time (SELECT INTO, CALL SYMPUT) to Spark variables."""
+        names: list[str] = []
+        if (into := _INTO_CLAUSE.search(text)) is not None:
+            names.extend(re.findall(r":\s*([A-Za-z_]\w*)", into.group(1)))
+        if (call := _CALL_SYMPUT.match(text.strip())) is not None:
+            names.append(call.group(2))
+        for name in names:
+            key = name.casefold()
+            variables[key] = _RUNTIME_PREFIX + key
+            self.runtime_names.add(key)
+            self.global_names.add(key)
 
     def _check_goto_resolved(self) -> None:
         if self.goto_label is not None:
@@ -704,6 +728,7 @@ class _MacroProcessor:
                         statement,
                     )
                 variables[name.casefold()] = self._substitute(value, variables, statement)
+                self.runtime_names.discard(name.casefold())
                 index += 1
                 continue
 
@@ -816,6 +841,8 @@ class _MacroProcessor:
                 continue
 
             expanded = self._expand_inline(text, variables, call_stack, depth, statement)
+            for item in expanded:
+                self._register_runtime_names(item.text, variables)
             output.extend(expanded)
             self.statement_count += len(expanded)
             if self.statement_count > _MAX_EXPANDED_STATEMENTS:
@@ -994,7 +1021,7 @@ class _MacroProcessor:
         depth: int,
         statement: MacroStatement,
     ) -> list[MacroStatement]:
-        expanded = self._substitute(text, variables, statement)
+        expanded = self._substitute(text, variables, statement, allow_runtime=True)
         matches = list(_MACRO_CALL.finditer(expanded))
         for match in reversed(matches):
             name = match.group(1).casefold()
@@ -1015,7 +1042,11 @@ class _MacroProcessor:
         return [MacroStatement(expanded, statement.line)]
 
     def _substitute(
-        self, text: str, variables: dict[str, str], statement: MacroStatement
+        self,
+        text: str,
+        variables: dict[str, str],
+        statement: MacroStatement,
+        allow_runtime: bool = False,
     ) -> str:
         for match in re.finditer(r"%([A-Za-z_]\w*)", text):
             name = match.group(1).casefold()
@@ -1028,11 +1059,47 @@ class _MacroProcessor:
                     statement,
                 )
         return self._evaluate_functions(
-            self._resolve_variables(text, variables, statement), statement, variables
+            self._resolve_variables(text, variables, statement, allow_runtime),
+            statement,
+            variables,
         )
 
+    def _check_runtime_reference(
+        self, text: str, position: int, name: str, allow: bool, statement: MacroStatement
+    ) -> None:
+        if not allow:
+            raise MacroExpansionError(
+                f"Run-time macro variable &{name} (set by CALL SYMPUT or SELECT INTO) "
+                "cannot be used in %LET, %IF, %DO, %EVAL or macro arguments because "
+                "its value is unknown at conversion time.",
+                statement,
+            )
+        quote: str | None = None
+        for char in text[:position]:
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in {"'", '"'}:
+                quote = char
+        if quote:
+            raise MacroExpansionError(
+                f"Run-time macro variable &{name} cannot be used inside a quoted "
+                "string; use it as a bare value in an expression.",
+                statement,
+            )
+        if _RUNTIME_STRUCTURAL.search(text[:position]):
+            raise MacroExpansionError(
+                f"Run-time macro variable &{name} cannot be used as a dataset, "
+                "column or option name; it is only supported inside expressions.",
+                statement,
+            )
+
     def _resolve_variables(
-        self, text: str, variables: dict[str, str], statement: MacroStatement
+        self,
+        text: str,
+        variables: dict[str, str],
+        statement: MacroStatement,
+        allow_runtime: bool = False,
     ) -> str:
         pattern = re.compile(r"&&|&([A-Za-z_]\w*)\.?")
         for _ in range(_MAX_INDIRECTION):
@@ -1047,6 +1114,10 @@ class _MacroProcessor:
                 if name not in variables:
                     raise MacroExpansionError(
                         f"Undefined macro variable &{match.group(1)}.", statement
+                    )
+                if name in self.runtime_names:
+                    self._check_runtime_reference(
+                        text, match.start(), match.group(1), allow_runtime, statement
                     )
                 return variables[name]
 

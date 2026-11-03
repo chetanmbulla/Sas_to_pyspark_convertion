@@ -428,6 +428,39 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         rows = [(r.id, r.dbl, r.d2, r.flag) for r in namespace["df_o"].collect()]
         self.assertEqual(rows, [(2, 10, 11, "yes"), (3, 14, 15, "none")])
 
+    def test_runtime_macro_variables_into_and_symput_execute(self):
+        source = """
+        proc sql noprint;
+          select max(x), min(label) into :mx, :lab trimmed from a;
+          select max(x) into :nothing from a where x > 100;
+        quit;
+        data hi;
+          set a;
+          where x >= &mx;
+          tag = &lab;
+          missing_value = &nothing;
+        run;
+        data _null_;
+          set a;
+          if x < 5 then call symputx('last_small', x * 10);
+        run;
+        data small;
+          set a;
+          scaled = x + &last_small;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, "b"), (7, "a"), (3, "c")], "x int, label string"
+        )
+        frame.createOrReplaceTempView("a")
+        namespace = {"spark": self.spark, "df_a": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        hi = namespace["df_hi"].collect()
+        self.assertEqual([(r.x, r.tag, r.missing_value) for r in hi], [(7, "a", None)])
+        small = sorted((r.x, r.scaled) for r in namespace["df_small"].collect())
+        self.assertEqual(small, [(1, 31), (3, 33), (7, 37)])
+
     def test_if_then_do_blocks_and_delete_execute(self):
         source = """
         data out;

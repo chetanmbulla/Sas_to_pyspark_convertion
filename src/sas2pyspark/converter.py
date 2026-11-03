@@ -17,6 +17,7 @@ from .macro_processor import (
 )
 from .data_blocks import rewrite_if_blocks
 from .data_outputs import rewrite_outputs
+from .data_symput import SYMPUT_MARKER, VALUE_COLUMN, rewrite_symput
 from .date_functions import (
     DATE_FUNCTIONS,
     DateFunctionError,
@@ -187,6 +188,10 @@ _DO_LOOP = re.compile(
 _SQL_CREATE = re.compile(
     r"^\s*create\s+table\s+((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)\s+as\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
+)
+_SQL_INTO = re.compile(
+    r"\binto\s+((?::\s*[A-Za-z_]\w*\s*,?\s*)+)(?:(separated\s+by)\b|(?:trimmed|notrim)\b)?",
+    re.IGNORECASE,
 )
 _PROC_IMPORT_TOKEN = re.compile(
     r"([A-Za-z_]\w*)\s*=\s*(\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[^\s]+)"
@@ -575,11 +580,13 @@ class SasToPySparkConverter:
             parsed_program = parse_program(source)
             statements = rewrite_if_blocks(
                 rewrite_outputs(
-                    expand_macros(
-                        [
-                            _Statement(statement.text, statement.span.start_line)
-                            for statement in parsed_program.statements
-                        ]
+                    rewrite_symput(
+                        expand_macros(
+                            [
+                                _Statement(statement.text, statement.span.start_line)
+                                for statement in parsed_program.statements
+                            ]
+                        )
                     )
                 )
             )
@@ -613,7 +620,20 @@ class SasToPySparkConverter:
             statement = statements[index]
             lower = statement.text.lower()
             try:
-                if lower.startswith("data "):
+                if lower.startswith(SYMPUT_MARKER + " "):
+                    _, variable, derived = statement.text.split()
+                    frame = _python_name(derived)
+                    output.extend(
+                        [
+                            f"_symput_rows = {frame}.select({VALUE_COLUMN!r}).tail(1)",
+                            "spark.sql("
+                            f"{'DECLARE OR REPLACE VARIABLE sas_macro_' + variable + ' DEFAULT :v'!r}, "
+                            "args={'v': _symput_rows[0][0] if _symput_rows else None})",
+                            "",
+                        ]
+                    )
+                    index += 1
+                elif lower.startswith("data "):
                     block, index, block_warnings = self._convert_data_step(
                         statements, index
                     )
@@ -2971,6 +2991,30 @@ class SasToPySparkConverter:
                         ]
                     )
                 elif re.match(r"^(select|with)\b", statement, re.I):
+                    into = _SQL_INTO.search(statement)
+                    if into is not None:
+                        if into.group(2):
+                            raise ConversionError(
+                                "PROC SQL SELECT ... INTO :macro supports only "
+                                "single-row results; SEPARATED BY is unsupported."
+                            )
+                        names = re.findall(r":\s*([A-Za-z_]\w*)", into.group(1))
+                        query = self._normalize_sql(
+                            statement[: into.start()] + " " + statement[into.end() :]
+                        )
+                        lines.append(f"_into_row = spark.sql({query!r}).first()")
+                        for position, name in enumerate(names):
+                            declare = (
+                                f"DECLARE OR REPLACE VARIABLE sas_macro_{name.lower()} "
+                                "DEFAULT :v"
+                            )
+                            lines.append(
+                                f"spark.sql({declare!r}, args={{'v': "
+                                f"_into_row[{position}] if _into_row is not None else None}})"
+                            )
+                        lines.append("")
+                        index += 1
+                        continue
                     sql_count += 1
                     query = self._normalize_sql(statement)
                     lines.extend(
@@ -3002,12 +3046,6 @@ class SasToPySparkConverter:
             normalized = rewrite_calculated(normalized)
         except ValueError as error:
             raise ConversionError(str(error)) from error
-        if re.search(r"\binto\s+:", normalized, re.I):
-            raise ConversionError(
-                "PROC SQL SELECT ... INTO :macro is unsupported because macro "
-                "variables are resolved at conversion time; read the value in "
-                "PySpark with spark.sql(...).collect() instead."
-            )
         return _map_unquoted(
             normalized,
             lambda part: re.sub(

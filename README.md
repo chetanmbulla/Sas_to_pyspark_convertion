@@ -214,7 +214,7 @@ and execute it.
 - `PROC TRANSPOSE` with `DATA=`, optional `OUT=`, `VAR`, optional `BY`, and a required unique `ORDER=` column.
 - CSV-only `PROC IMPORT` with `DATAFILE=`, `OUT=`, `DBMS=CSV`, `GETNAMES=`, and one-character `DELIMITER=`.
 - CSV-only `PROC EXPORT` with `DATA=`, `OUTFILE=`, `DBMS=CSV`, `PUTNAMES=`, and one-character `DELIMITER=`.
-- `PROC SQL` with `CREATE TABLE ... AS SELECT ...` and standalone `SELECT`/`WITH` queries. `PROC SQL NOPRINT` is accepted. `LEFT`/`RIGHT`/`FULL JOIN` and `CASE` pass through to Spark SQL, and `CALCULATED alias` is rewritten to the aliased expression. `SELECT ... INTO :macro` is rejected with a clear error (macro variables are resolved at conversion time).
+- `PROC SQL` with `CREATE TABLE ... AS SELECT ...` and standalone `SELECT`/`WITH` queries. `PROC SQL NOPRINT` is accepted. `LEFT`/`RIGHT`/`FULL JOIN` and `CASE` pass through to Spark SQL, and `CALCULATED alias` is rewritten to the aliased expression. `SELECT ... INTO :macro` sets a run-time macro variable (see the macro section).
 - Common SAS comparison/logical words (`EQ`, `NE`, `GT`, `GE`, `LT`, `LE`, `AND`, `OR`, `NOT`), `MISSING(column)`, `UPCASE`, `LOWCASE`, `TODAY()`, `CAT`, `CATS`, `CATX`, `STRIP`, `COALESCE`, `COALESCEC`, `SUBSTR`, `COMPRESS`, and `ROUND`.
 - SAS block comments and statement comments.
 
@@ -263,9 +263,23 @@ a `%label:` in the same macro (including out of `%IF`/`%DO` blocks); backward
 jumps and missing labels are errors. `%ABORT` is rejected with an error when it
 is reached, because it would stop the SAS session.
 
+**Run-time macro variables.** `PROC SQL` `SELECT ... INTO :a, :b [TRIMMED]`
+(first row of the result) and `CALL SYMPUT`/`SYMPUTX('name', expression)` in a
+DATA step (including `data _null_;`, optionally as `IF cond THEN CALL SYMPUTX(...)`)
+set values that only exist when the program runs. They are generated as Spark
+SQL session variables (`DECLARE OR REPLACE VARIABLE sas_macro_<name>`), which
+**requires Spark 4.0 or later**, and later `&name` references become that
+variable inside expressions (`WHERE`, `IF`, assignments, `PROC SQL`). For
+`CALL SYMPUT` the value comes from the last row that executes the call, in the
+frame's current row order. The value keeps its Spark type (SAS would convert it
+to text), and an empty result gives `NULL`. Run-time variables cannot be used in
+`%LET`, `%IF`, `%DO`, `%EVAL`, macro arguments, quoted strings (`"&name"`), or as
+dataset/column names (`SET &name`); these raise a conversion error. `SELECT ...
+INTO ... SEPARATED BY`, a non-literal `CALL SYMPUT` name, and `CALL SYMPUT`
+inside `DO`/`SELECT`/`ELSE` blocks are unsupported.
+
 Other macro functions (such as `%SYSGET`, which depends on the machine
-environment), `CALL SYMPUT`/`SYMPUTX` (a run-time feature that cannot be
-resolved at conversion time), and other macro-language features are
+environment) and other macro-language features are
 not implemented. Without `%GLOBAL`, macro variables assigned during a macro call
 are scoped to that call and do not modify the caller's variables. Unsupported macro syntax
 raises a conversion error rather than being passed through to generated Python.
