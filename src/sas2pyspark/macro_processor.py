@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import (
+    ROUND_CEILING,
+    ROUND_DOWN,
+    ROUND_FLOOR,
+    ROUND_HALF_UP,
+    Decimal,
+    InvalidOperation,
+)
 from typing import NoReturn
 
 
@@ -49,9 +56,15 @@ _MACRO_LOOP = re.compile(
     re.I,
 )
 _MACRO_CALL = re.compile(r"%([A-Za-z_]\w*)\s*\(")
+_MACRO_WHILE = re.compile(r"%do\s+%(while|until)\s*\((.*)\)\s*$", re.I | re.S)
+_MACRO_FUNCTIONS = {"eval", "sysfunc", "upcase", "lowcase", "str", "nrstr"}
+_MACRO_SCOPE = re.compile(
+    r"%(global|local)\s+([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\Z", re.I
+)
 _MAX_DEPTH = 32
 _MAX_EXPANDED_STATEMENTS = 10_000
 _MAX_LOOP_ITERATIONS = 1_000
+_MAX_INDIRECTION = 10
 
 
 class _ConditionParser:
@@ -176,10 +189,242 @@ class _ConditionParser:
         raise MacroExpansionError(message, self.statement)
 
 
+class _EvalParser:
+    """Integer-only %EVAL expression evaluator."""
+
+    _TOKEN = re.compile(
+        r"\s*(>=|<=|<>|!=|~=|\^=|==|=|>|<|\+|-|\*|/|\(|\)|"
+        r"\b(?:eq|ne|gt|ge|lt|le|and|or|not)\b|&|\||\d+(?:\.\d+)?|[^\s()]+)",
+        re.IGNORECASE,
+    )
+    _COMPARE = {
+        "=": lambda a, b: a == b,
+        "==": lambda a, b: a == b,
+        "eq": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+        "~=": lambda a, b: a != b,
+        "^=": lambda a, b: a != b,
+        "<>": lambda a, b: a != b,
+        "ne": lambda a, b: a != b,
+        ">": lambda a, b: a > b,
+        "gt": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "ge": lambda a, b: a >= b,
+        "<": lambda a, b: a < b,
+        "lt": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+        "le": lambda a, b: a <= b,
+    }
+
+    def __init__(self, expression: str, statement: MacroStatement) -> None:
+        self.statement = statement
+        self.tokens: list[str] = []
+        position = 0
+        expression = expression.strip()
+        while position < len(expression):
+            match = self._TOKEN.match(expression, position)
+            if match is None:
+                self._error("Unsupported token in %EVAL expression.")
+            self.tokens.append(match.group(1))
+            position = match.end()
+        self.index = 0
+
+    def evaluate(self) -> int:
+        if not self.tokens:
+            self._error("%EVAL requires an expression.")
+        value = self._or()
+        if self.index != len(self.tokens):
+            self._error("Unsupported or incomplete %EVAL expression.")
+        return value
+
+    def _peek(self) -> str | None:
+        return self.tokens[self.index].casefold() if self.index < len(self.tokens) else None
+
+    def _or(self) -> int:
+        value = self._and()
+        while self._peek() in {"or", "|"}:
+            self.index += 1
+            right = self._and()
+            value = int(bool(value) or bool(right))
+        return value
+
+    def _and(self) -> int:
+        value = self._not()
+        while self._peek() in {"and", "&"}:
+            self.index += 1
+            right = self._not()
+            value = int(bool(value) and bool(right))
+        return value
+
+    def _not(self) -> int:
+        if self._peek() == "not":
+            self.index += 1
+            return int(not self._not())
+        return self._comparison()
+
+    def _comparison(self) -> int:
+        left = self._sum()
+        operator = self._peek()
+        if operator in self._COMPARE:
+            self.index += 1
+            right = self._sum()
+            return int(self._COMPARE[operator](left, right))
+        return left
+
+    def _sum(self) -> int:
+        value = self._product()
+        while self._peek() in {"+", "-"}:
+            operator = self.tokens[self.index]
+            self.index += 1
+            right = self._product()
+            value = value + right if operator == "+" else value - right
+        return value
+
+    def _product(self) -> int:
+        value = self._unary()
+        while self._peek() in {"*", "/"}:
+            operator = self.tokens[self.index]
+            self.index += 1
+            right = self._unary()
+            if operator == "*":
+                value *= right
+            else:
+                if right == 0:
+                    self._error("Division by zero in %EVAL expression.")
+                value = abs(value) // abs(right) * (1 if (value >= 0) == (right > 0) else -1)
+        return value
+
+    def _unary(self) -> int:
+        if self._peek() in {"+", "-"}:
+            sign = self.tokens[self.index]
+            self.index += 1
+            value = self._unary()
+            return -value if sign == "-" else value
+        if self._peek() == "(":
+            self.index += 1
+            value = self._or()
+            if self._peek() != ")":
+                self._error("Unclosed parenthesis in %EVAL expression.")
+            self.index += 1
+            return value
+        if self.index >= len(self.tokens):
+            self._error("Incomplete %EVAL expression.")
+        token = self.tokens[self.index]
+        if not token.isdigit():
+            self._error(
+                f"%EVAL supports integer arithmetic only; found {token!r}."
+            )
+        self.index += 1
+        return int(token)
+
+    def _error(self, message: str) -> NoReturn:
+        raise MacroExpansionError(message, self.statement)
+
+
+def _format_number(value: Decimal) -> str:
+    if value == value.to_integral_value():
+        return str(int(value))
+    return format(value.normalize(), "f")
+
+
+def _sysfunc(call: str, statement: MacroStatement) -> str:
+    match = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*\((.*)\)\s*", call, re.S)
+    if match is None:
+        raise MacroExpansionError(
+            "%SYSFUNC requires a function call such as %SYSFUNC(upcase(text)).",
+            statement,
+        )
+    name = match.group(1).casefold()
+    arguments = [item.strip() for item in _split_top_level(match.group(2), statement)]
+
+    def number(text: str) -> Decimal:
+        try:
+            return Decimal(text)
+        except InvalidOperation as error:
+            raise MacroExpansionError(
+                f"%SYSFUNC({name}) requires numeric arguments; found {text!r}.",
+                statement,
+            ) from error
+
+    text_functions = {
+        "upcase": lambda value: value.upper(),
+        "lowcase": lambda value: value.lower(),
+        "strip": lambda value: value.strip(),
+        "trim": lambda value: value.rstrip(),
+        "left": lambda value: value.lstrip(),
+    }
+    if name in text_functions and len(arguments) == 1:
+        return text_functions[name](arguments[0])
+    if name == "length" and len(arguments) == 1:
+        return str(len(arguments[0]))
+    numeric_unary = {
+        "abs": abs,
+        "int": lambda value: value.to_integral_value(rounding=ROUND_DOWN),
+        "ceil": lambda value: value.to_integral_value(rounding=ROUND_CEILING),
+        "floor": lambda value: value.to_integral_value(rounding=ROUND_FLOOR),
+    }
+    if name in numeric_unary and len(arguments) == 1:
+        return _format_number(numeric_unary[name](number(arguments[0])))
+    if name == "round" and len(arguments) in {1, 2}:
+        value = number(arguments[0])
+        unit = number(arguments[1]) if len(arguments) == 2 else Decimal(1)
+        if unit <= 0:
+            raise MacroExpansionError("%SYSFUNC(round) requires a positive unit.", statement)
+        return _format_number(
+            (value / unit).to_integral_value(rounding=ROUND_HALF_UP) * unit
+        )
+    if name in {"min", "max"} and arguments:
+        values = [number(item) for item in arguments]
+        return _format_number(min(values) if name == "min" else max(values))
+    if name == "mod" and len(arguments) == 2:
+        divisor = number(arguments[1])
+        if divisor == 0:
+            raise MacroExpansionError("%SYSFUNC(mod) divisor cannot be zero.", statement)
+        return _format_number(number(arguments[0]) % divisor)
+    raise MacroExpansionError(
+        f"%SYSFUNC({name}) is unsupported or has the wrong number of arguments; "
+        "supported: upcase, lowcase, strip, trim, left, length, abs, int, ceil, "
+        "floor, round, min, max, mod.",
+        statement,
+    )
+
+
+def _split_top_level(arguments: str, statement: MacroStatement) -> list[str]:
+    values: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    nesting = 0
+    for char in arguments:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+            current.append(char)
+        elif char == "(":
+            nesting += 1
+            current.append(char)
+        elif char == ")":
+            nesting -= 1
+            current.append(char)
+        elif char == "," and nesting == 0:
+            values.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if quote or nesting:
+        raise MacroExpansionError("Unterminated %SYSFUNC argument.", statement)
+    values.append("".join(current))
+    return values
+
+
 class _MacroProcessor:
     def __init__(self, statements: list[MacroStatement]) -> None:
         self.macros: dict[str, _Macro] = {}
         self.statement_count = 0
+        self.global_names: set[str] = set()
+        self.local_names: list[set[str]] = [set()]
         self.statements = self._extract_definitions(statements)
 
     def expand(self) -> list[MacroStatement]:
@@ -262,6 +507,23 @@ class _MacroProcessor:
             text = statement.text.strip()
             lower = text.casefold()
 
+            if lower.startswith(("%global", "%local")):
+                scope = _MACRO_SCOPE.fullmatch(text)
+                if scope is None:
+                    raise MacroExpansionError(
+                        "Expected %GLOBAL or %LOCAL followed by variable names.", statement
+                    )
+                for name in scope.group(2).split():
+                    key = name.casefold()
+                    if scope.group(1).casefold() == "global":
+                        self.global_names.add(key)
+                        variables.setdefault(key, "")
+                    else:
+                        self.local_names[-1].add(key)
+                        variables[key] = ""
+                index += 1
+                continue
+
             if lower.startswith("%let"):
                 match = _MACRO_LET.fullmatch(text)
                 if match is None:
@@ -269,10 +531,10 @@ class _MacroProcessor:
                         "Expected %LET name=value with a simple value.", statement
                     )
                 name, value = match.groups()
-                if re.search(r"%[A-Za-z_]", value):
+                if self._has_unsupported_macro_text(value):
                     raise MacroExpansionError(
-                        "Macro calls and macro-language expressions in %LET "
-                        "values are unsupported.",
+                        "Macro calls and macro-language statements in %LET "
+                        "values are unsupported; only %EVAL and %SYSFUNC are allowed.",
                         statement,
                     )
                 variables[name.casefold()] = self._substitute(value, variables, statement)
@@ -310,10 +572,33 @@ class _MacroProcessor:
                 output.extend(self._process(selected, variables, call_stack, depth + 1))
                 continue
 
-            if lower == "%do" or _MACRO_LOOP.fullmatch(text):
+            if lower == "%do" or _MACRO_LOOP.fullmatch(text) or _MACRO_WHILE.fullmatch(text):
                 body, end_index = self._read_block(statements, index + 1, statement)
                 loop_match = _MACRO_LOOP.fullmatch(text)
-                if loop_match is None:
+                while_match = _MACRO_WHILE.fullmatch(text)
+                if while_match is not None:
+                    kind, raw_condition = while_match.groups()
+                    iterations = 0
+                    while True:
+                        if kind.casefold() == "while" and not _ConditionParser(
+                            self._substitute(raw_condition, variables, statement),
+                            statement,
+                        ).evaluate():
+                            break
+                        iterations += 1
+                        if iterations > _MAX_LOOP_ITERATIONS:
+                            raise MacroExpansionError(
+                                f"%DO %{kind.upper()} exceeds the "
+                                f"{_MAX_LOOP_ITERATIONS}-iteration limit.",
+                                statement,
+                            )
+                        output.extend(self._process(body, variables, call_stack, depth + 1))
+                        if kind.casefold() == "until" and _ConditionParser(
+                            self._substitute(raw_condition, variables, statement),
+                            statement,
+                        ).evaluate():
+                            break
+                elif loop_match is None:
                     output.extend(self._process(body, variables, call_stack, depth + 1))
                 else:
                     variable, start, stop, step = loop_match.groups()
@@ -341,10 +626,9 @@ class _MacroProcessor:
                             statement,
                         )
                     for value in values:
-                        local_variables = dict(variables)
-                        local_variables[variable.casefold()] = str(value)
+                        variables[variable.casefold()] = str(value)
                         output.extend(
-                            self._process(body, local_variables, call_stack, depth + 1)
+                            self._process(body, variables, call_stack, depth + 1)
                         )
                 index = end_index
                 continue
@@ -396,7 +680,7 @@ class _MacroProcessor:
     @staticmethod
     def _opens_block(text: str) -> bool:
         lower = text.casefold()
-        if lower == "%do" or _MACRO_LOOP.fullmatch(text):
+        if lower == "%do" or _MACRO_LOOP.fullmatch(text) or _MACRO_WHILE.fullmatch(text):
             return True
         if lower.startswith("%else") and lower[len("%else") :].strip() == "%do":
             return True
@@ -510,17 +794,25 @@ class _MacroProcessor:
                     f"Missing required parameter {parameter.name!r} for macro %{name}.",
                     statement,
                 )
-            if re.search(r"%[A-Za-z_]", value):
+            if self._has_unsupported_macro_text(value):
                 raise MacroExpansionError("Macro calls inside arguments are unsupported.", statement)
             local_variables[parameter.name.casefold()] = self._substitute(
                 value, local_variables, statement
             )
-        return self._process(
-            macro.body,
-            local_variables,
-            (*call_stack, name),
-            depth + 1,
-        )
+        self.local_names.append(set())
+        try:
+            result = self._process(
+                macro.body,
+                local_variables,
+                (*call_stack, name),
+                depth + 1,
+            )
+        finally:
+            declared_local = self.local_names.pop()
+        for key in self.global_names - declared_local:
+            if key in local_variables:
+                variables[key] = local_variables[key]
+        return result
 
     def _expand_inline(
         self,
@@ -553,29 +845,75 @@ class _MacroProcessor:
     def _substitute(
         self, text: str, variables: dict[str, str], statement: MacroStatement
     ) -> str:
-        if "&&" in text:
-            raise MacroExpansionError(
-                "Indirect or repeated ampersand macro references are unsupported.",
-                statement,
-            )
         for match in re.finditer(r"%([A-Za-z_]\w*)", text):
             name = match.group(1).casefold()
             following = text[match.end() :].lstrip()
-            if name not in self.macros or not following.startswith("("):
+            if (
+                name not in self.macros and name not in _MACRO_FUNCTIONS
+            ) or not following.startswith("("):
                 raise MacroExpansionError(
                     "Unsupported macro function or statement in generated SAS code.",
                     statement,
                 )
+        return self._evaluate_functions(
+            self._resolve_variables(text, variables, statement), statement
+        )
 
-        def replace(match: re.Match[str]) -> str:
-            name = match.group(1).casefold()
-            if name not in variables:
-                raise MacroExpansionError(
-                    f"Undefined macro variable &{match.group(1)}.", statement
-                )
-            return variables[name]
+    def _resolve_variables(
+        self, text: str, variables: dict[str, str], statement: MacroStatement
+    ) -> str:
+        pattern = re.compile(r"&&|&([A-Za-z_]\w*)\.?")
+        for _ in range(_MAX_INDIRECTION):
+            rescan = False
 
-        return re.sub(r"&([A-Za-z_]\w*)\.?", replace, text)
+            def replace(match: re.Match[str]) -> str:
+                nonlocal rescan
+                if match.group(0) == "&&":
+                    rescan = True
+                    return "&"
+                name = match.group(1).casefold()
+                if name not in variables:
+                    raise MacroExpansionError(
+                        f"Undefined macro variable &{match.group(1)}.", statement
+                    )
+                return variables[name]
+
+            text = pattern.sub(replace, text)
+            if not rescan:
+                return text
+        raise MacroExpansionError(
+            "Indirect macro references exceeded the resolution limit.", statement
+        )
+
+    def _evaluate_functions(self, text: str, statement: MacroStatement) -> str:
+        pattern = re.compile(r"%(eval|sysfunc|upcase|lowcase|str|nrstr)\s*\(", re.IGNORECASE)
+        while True:
+            matches = list(pattern.finditer(text))
+            if not matches:
+                return text
+            match = matches[-1]
+            opening = text.find("(", match.start())
+            closing = self._matching_paren(text, opening, statement)
+            inner = text[opening + 1 : closing]
+            function = match.group(1).casefold()
+            if function == "eval":
+                value = str(_EvalParser(inner, statement).evaluate())
+            elif function == "sysfunc":
+                value = _sysfunc(inner, statement)
+            elif function == "upcase":
+                value = inner.strip().upper()
+            elif function == "lowcase":
+                value = inner.strip().lower()
+            else:
+                value = inner
+            text = text[: match.start()] + value + text[closing + 1 :]
+
+    @staticmethod
+    def _has_unsupported_macro_text(text: str) -> bool:
+        return any(
+            name.casefold() not in _MACRO_FUNCTIONS
+            for name in re.findall(r"%([A-Za-z_]\w*)", text)
+        )
 
     def _split_arguments(
         self, arguments: str, statement: MacroStatement

@@ -4,14 +4,28 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
+
+from .includes import IncludeError, inline_includes
+from .user_formats import FormatError, has_format, register_value, reset_formats
 
 from .macro_processor import (
     MacroExpansionError,
     MacroStatement as _Statement,
     expand_macros,
 )
+from .data_blocks import rewrite_if_blocks
+from .data_outputs import rewrite_outputs
+from .date_functions import (
+    DATE_FUNCTIONS,
+    DateFunctionError,
+    render_date_function,
+    render_format,
+    translate_date_literals,
+)
 from .sas_parser import SasParseError, parse_program
+from .sql_calculated import rewrite_calculated
 
 
 class ConversionError(ValueError):
@@ -150,6 +164,7 @@ class _DataAction:
     merge_sources: tuple[str, ...] = ()
     merge_keys: tuple[str, ...] = ()
     merge_directions: tuple[bool, ...] = ()
+    merge_in_vars: tuple[str, ...] = ()
     branches: tuple[tuple[str, str], ...] = ()
     retain_initial: str | None = None
     retain_partition: tuple[str, ...] = ()
@@ -230,6 +245,10 @@ def _map_unquoted(value: str, transform: Callable[[str], str]) -> str:
 def _expression(value: str) -> str:
     """Translate common SAS operators/functions into Spark SQL expressions."""
     expression = value.strip()
+    try:
+        expression = translate_date_literals(expression)
+    except DateFunctionError as error:
+        raise ConversionError(str(error)) from error
     substitutions = (
         (r"\bne\b|\^=", "!="),
         (r"\beq\b", "="),
@@ -426,7 +445,7 @@ def _translate_functions(expression: str) -> str:
             "SUBSTR",
             "COMPRESS",
             "ROUND",
-        } or (
+        } | DATE_FUNCTIONS or (
             opening >= len(expression) or expression[opening] != "("
         ):
             output.append(name)
@@ -441,6 +460,11 @@ def _translate_functions(expression: str) -> str:
 
 
 def _render_function(name: str, arguments: list[str]) -> str:
+    if name in DATE_FUNCTIONS:
+        try:
+            return render_date_function(name, arguments)
+        except DateFunctionError as error:
+            raise ConversionError(str(error)) from error
     if name in {"CAT", "CATS"}:
         if not arguments or any(not argument for argument in arguments):
             raise ConversionError(f"{name} requires one or more non-empty arguments.")
@@ -531,17 +555,33 @@ def _render_function(name: str, arguments: list[str]) -> str:
 class SasToPySparkConverter:
     """Convert supported SAS DATA steps and procedures into PySpark."""
 
-    def convert(self, source: str, *, sas_version: str = "auto") -> ConversionResult:
+    def convert(
+        self,
+        source: str,
+        *,
+        sas_version: str = "auto",
+        include_dir: str | Path | None = None,
+        include_root: str | Path | None = None,
+    ) -> ConversionResult:
         selected_version, version_source, version_warning = _resolve_sas_version(
             source, sas_version
         )
+        reset_formats()
+        try:
+            source = inline_includes(source, include_dir, include_root)
+        except IncludeError as error:
+            raise ConversionError(error.message, line=error.line) from error
         try:
             parsed_program = parse_program(source)
-            statements = expand_macros(
-                [
-                    _Statement(statement.text, statement.span.start_line)
-                    for statement in parsed_program.statements
-                ]
+            statements = rewrite_if_blocks(
+                rewrite_outputs(
+                    expand_macros(
+                        [
+                            _Statement(statement.text, statement.span.start_line)
+                            for statement in parsed_program.statements
+                        ]
+                    )
+                )
             )
         except SasParseError as error:
             raise ConversionError(
@@ -583,7 +623,7 @@ class SasToPySparkConverter:
                     block, index, block_warnings = self._convert_sort(statements, index)
                     output.extend(block)
                     warnings.extend(block_warnings)
-                elif lower == "proc sql":
+                elif lower == "proc sql" or lower == "proc sql noprint":
                     block, index, sql_count = self._convert_sql(statements, index, sql_count)
                     output.extend(block)
                 elif lower == "proc freq" or lower.startswith("proc freq "):
@@ -601,10 +641,50 @@ class SasToPySparkConverter:
                         statements, index, means_count
                     )
                     output.extend(block)
+                elif lower == "proc univariate" or lower.startswith("proc univariate "):
+                    options = statement.text.split()[2:]
+                    if any(not item.lower().startswith("data=") for item in options):
+                        raise ConversionError(
+                            "PROC UNIVARIATE supports only the DATA= option."
+                        )
+                    statements = list(statements)
+                    statements[index] = _Statement(
+                        "proc means "
+                        + " ".join(options)
+                        + " n nmiss mean std min median max",
+                        statement.line,
+                    )
+                    block, index, means_count = self._convert_means(
+                        statements, index, means_count
+                    )
+                    output.extend(block)
+                    warnings.append(
+                        "PROC UNIVARIATE is approximated with N, NMISS, MEAN, STD, "
+                        "MIN, MEDIAN and MAX; distribution tests, quantile tables "
+                        "and plots are not generated."
+                    )
                 elif lower == "proc transpose" or lower.startswith("proc transpose "):
                     block, index, transpose_count = self._convert_transpose(
                         statements, index, transpose_count
                     )
+                    output.extend(block)
+                elif lower == "proc format" or lower.startswith("proc format "):
+                    block, index = self._convert_format(statements, index)
+                    output.extend(block)
+                elif lower.startswith("libname "):
+                    libref = self._parse_libname(statement.text)
+                    output.extend([f"# LIBNAME {libref}: library prefixes are dropped; datasets map to Spark views.", ""])
+                    warnings.append(
+                        f"LIBNAME {libref} is not materialized; {libref}.table "
+                        "references resolve to the table name only."
+                    )
+                    index += 1
+                elif lower == "proc append" or lower.startswith("proc append "):
+                    block, index, block_warnings = self._convert_append(statements, index)
+                    output.extend(block)
+                    warnings.extend(block_warnings)
+                elif lower == "proc datasets" or lower.startswith("proc datasets "):
+                    block, index = self._convert_datasets(statements, index)
                     output.extend(block)
                 elif lower == "proc import" or lower.startswith("proc import "):
                     block, index = self._convert_import(statements, index)
@@ -638,25 +718,41 @@ class SasToPySparkConverter:
         if not match:
             raise ConversionError(f"Unsupported DATA statement: {target_statement!r}.")
         target = _dataset_name(match.group(1))
-        source: str | None = None
+        sources: tuple[str, ...] | None = None
         merge_sources: tuple[str, ...] | None = None
+        merge_in_vars: tuple[str, ...] = ()
         merge_keys: tuple[str, ...] | None = None
         merge_directions: tuple[bool, ...] | None = None
         where_filters: list[str] = []
         actions: list[_DataAction] = []
         keep: list[str] | None = None
         drop: list[str] = []
-        retain_column: str | None = None
-        retain_initial: str | None = None
-        retain_assignment_seen = False
-        retain_reset_key: str | None = None
-        retain_reset_value: str | None = None
+        retain_vars: dict[str, tuple[str, str]] = {}
+        retain_seen: set[str] = set()
+        retain_resets: dict[str, tuple[str, str]] = {}
         arrays: dict[str, tuple[str, ...]] = {}
         by_columns: tuple[str, ...] | None = None
         by_flags_used: set[str] = set()
+        display_formats: set[str] = set()
 
         def data_expression(expression: str) -> str:
             expanded = _expand_array_references(expression, arrays)
+            for in_var in merge_in_vars:
+                if in_var:
+                    expanded = _map_unquoted(
+                        expanded,
+                        lambda part, name=in_var: re.sub(
+                            rf"\b{re.escape(name)}\s*=\s*0\b",
+                            f"(NOT {name})",
+                            re.sub(
+                                rf"\b{re.escape(name)}\s*=\s*1\b",
+                                name,
+                                part,
+                                flags=re.IGNORECASE,
+                            ),
+                            flags=re.IGNORECASE,
+                        ),
+                    )
 
             def replace_by_flags(part: str) -> str:
                 def replace(match: re.Match[str]) -> str:
@@ -730,33 +826,49 @@ class SasToPySparkConverter:
                         )
                     arrays[array_name] = elements
                 elif lower.startswith("retain "):
-                    if retain_column is not None:
-                        raise ConversionError(
-                            "Only one initialized numeric RETAIN variable is "
-                            "supported per DATA step."
-                        )
-                    retain_match = re.fullmatch(
-                        r"retain\s+([A-Za-z_]\w*)\s+"
-                        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
-                        statement,
-                        re.IGNORECASE,
+                    pending_names: list[str] = []
+                    number_pattern = (
+                        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
                     )
-                    if not retain_match:
+                    for token in statement[7:].split():
+                        if re.fullmatch(number_pattern, token):
+                            if not pending_names:
+                                raise ConversionError(
+                                    "RETAIN initial value must follow a variable name."
+                                )
+                            for name in pending_names:
+                                if name.lower() in retain_vars:
+                                    raise ConversionError(
+                                        f"RETAIN variable {name!r} is declared more than once."
+                                    )
+                                retain_vars[name.lower()] = (name, token)
+                            pending_names = []
+                        elif re.fullmatch(r"[A-Za-z_]\w*", token):
+                            pending_names.append(token)
+                        else:
+                            raise ConversionError(
+                                "RETAIN supports variable names with numeric "
+                                "literal initial values, such as RETAIN a b 0 c 10;"
+                            )
+                    if pending_names or not statement[7:].strip():
                         raise ConversionError(
-                            "RETAIN supports one variable with a numeric literal "
-                            "initial value."
+                            "Every RETAIN variable needs a numeric literal initial "
+                            "value; character and uninitialized RETAIN are unsupported."
                         )
-                    retain_column = retain_match.group(1)
-                    retain_initial = retain_match.group(2)
                 elif lower.startswith("set "):
-                    if source is not None or merge_sources is not None:
+                    if sources is not None or merge_sources is not None:
                         raise ConversionError(
                             "A DATA step must use either one SET statement or one "
                             "supported MERGE statement, not both."
                         )
-                    source = _dataset_name(statement[4:].strip())
+                    input_names = statement[4:].split()
+                    if not input_names:
+                        raise ConversionError("SET requires at least one input dataset.")
+                    sources = tuple(_dataset_name(name) for name in input_names)
+                    if len(set(sources)) != len(sources):
+                        raise ConversionError("SET input datasets must have distinct names.")
                 elif lower.startswith("merge "):
-                    if source is not None or merge_sources is not None:
+                    if sources is not None or merge_sources is not None:
                         raise ConversionError(
                             "A DATA step must use either one SET statement or one "
                             "supported MERGE statement, not both."
@@ -766,16 +878,32 @@ class SasToPySparkConverter:
                             "MERGE and BY must appear before DATA-step processing "
                             "statements in the supported subset."
                         )
-                    datasets = statement[6:].split()
+                    datasets = re.findall(
+                        r"\s*((?:\w+\.)?\w+)\s*(?:\(\s*in\s*=\s*([A-Za-z_]\w*)\s*\))?",
+                        statement[6:],
+                        re.IGNORECASE,
+                    )
+                    spelled = re.sub(r"\s+", "", statement[6:])
+                    rebuilt = "".join(
+                        f"{name}(in={flag})" if flag else name for name, flag in datasets
+                    )
+                    if spelled.lower() != rebuilt.lower():
+                        raise ConversionError(
+                            f"Unsupported SAS dataset reference: {statement[6:].strip()!r}."
+                        )
                     if len(datasets) < 2:
                         raise ConversionError(
                             "MERGE requires at least two input datasets."
                         )
-                    merge_sources = tuple(_dataset_name(name) for name in datasets)
+                    merge_sources = tuple(_dataset_name(name) for name, _ in datasets)
+                    merge_in_vars = tuple(flag for _, flag in datasets)
                     if len(set(merge_sources)) != len(merge_sources):
                         raise ConversionError(
                             "MERGE input datasets must have distinct names."
                         )
+                    named_flags = [flag.lower() for flag in merge_in_vars if flag]
+                    if len(set(named_flags)) != len(named_flags):
+                        raise ConversionError("MERGE IN= variable names must be distinct.")
                 elif lower.startswith("by "):
                     tokens = statement[3:].split()
                     keys: list[tuple[str, bool]] = []
@@ -819,9 +947,10 @@ class SasToPySparkConverter:
                                 merge_sources=merge_sources,
                                 merge_keys=merge_keys,
                                 merge_directions=merge_directions,
+                                merge_in_vars=merge_in_vars,
                             )
                         )
-                    elif source is not None and by_columns is None:
+                    elif sources is not None and by_columns is None:
                         by_columns = key_names
                     else:
                         raise ConversionError(
@@ -1039,7 +1168,15 @@ class SasToPySparkConverter:
                             if index + 1 < len(statements)
                             else None
                         )
-                        if else_match is None:
+                        if (
+                            else_match is None
+                            and conditional.group(2)
+                            and re.fullmatch(
+                                r"first\s*\.\s*[A-Za-z_]\w*",
+                                conditional.group(1).strip(),
+                                re.IGNORECASE,
+                            )
+                        ):
                             reset_assignment = (
                                 _DATA_ASSIGNMENT.fullmatch(conditional.group(2).strip())
                                 if conditional.group(2)
@@ -1056,19 +1193,20 @@ class SasToPySparkConverter:
                                     "the only supported form without ELSE is a "
                                     "numeric RETAIN reset on FIRST.<BY key>."
                                 )
-                            if retain_column is None:
+                            if not retain_vars:
                                 raise ConversionError(
                                     "FIRST.<BY key> RETAIN resets require a preceding "
                                     "RETAIN declaration."
                                 )
-                            if retain_assignment_seen:
+                            reset_column = data_column(reset_assignment.group(1))
+                            reset_name = reset_column.lower()
+                            if reset_name not in retain_vars:
+                                raise ConversionError(
+                                    "FIRST.<BY key> reset must assign a retained variable."
+                                )
+                            if reset_name in retain_seen:
                                 raise ConversionError(
                                     "A RETAIN reset must precede the accumulator assignment."
-                                )
-                            reset_column = data_column(reset_assignment.group(1))
-                            if reset_column.lower() != retain_column.lower():
-                                raise ConversionError(
-                                    "FIRST.<BY key> reset must assign the retained variable."
                                 )
                             reset_value = reset_assignment.group(2).strip()
                             if not re.fullmatch(
@@ -1095,44 +1233,114 @@ class SasToPySparkConverter:
                                     f"FIRST.{reset_condition.group(1)} is not a "
                                     "variable in the BY statement."
                                 )
-                            if retain_reset_key is not None:
+                            if reset_name in retain_resets:
                                 raise ConversionError(
-                                    "Only one FIRST.<BY key> RETAIN reset is supported."
+                                    "Only one FIRST.<BY key> RETAIN reset is supported "
+                                    "per retained variable."
                                 )
                             data_expression(conditional.group(1))
-                            retain_reset_key = reset_key
-                            retain_reset_value = reset_value
+                            retain_resets[reset_name] = (reset_key, reset_value)
                         else:
-                            if not conditional.group(2):
-                                raise ConversionError(
-                                    "IF THEN branch must be a simple assignment."
+                            chain_branches: list[tuple[str, str]] = []
+                            chain_column: str | None = None
+                            chain_otherwise: str | None = None
+                            chain_has_else = False
+                            chain_index = index
+                            current = conditional
+                            while True:
+                                if not current.group(2):
+                                    raise ConversionError(
+                                        "IF THEN branch must be a simple assignment."
+                                    )
+                                branch_assignment = _DATA_ASSIGNMENT.fullmatch(
+                                    current.group(2).strip()
                                 )
-                            then_assignment = _DATA_ASSIGNMENT.fullmatch(
-                                conditional.group(2).strip()
-                            )
-                            else_assignment = _DATA_ASSIGNMENT.fullmatch(
-                                else_match.group(1).strip()
-                            )
-                            if not then_assignment or not else_assignment:
-                                raise ConversionError(
-                                    "IF THEN and ELSE branches must each be a simple assignment."
+                                if not branch_assignment:
+                                    raise ConversionError(
+                                        "IF THEN and ELSE branches must each be a simple assignment."
+                                        if chain_has_else or chain_index + 1 < len(statements)
+                                        and re.match(
+                                            r"else\b",
+                                            statements[chain_index + 1].text,
+                                            re.IGNORECASE,
+                                        )
+                                        else "IF THEN branch must be a simple assignment."
+                                    )
+                                branch_column = data_column(branch_assignment.group(1))
+                                if (
+                                    chain_column is not None
+                                    and chain_column.lower() != branch_column.lower()
+                                ):
+                                    raise ConversionError(
+                                        "IF THEN and ELSE branches must assign the same column."
+                                    )
+                                chain_column = branch_column
+                                chain_branches.append(
+                                    (
+                                        data_expression(current.group(1)),
+                                        data_expression(branch_assignment.group(2)),
+                                    )
                                 )
-                            then_column = data_column(then_assignment.group(1))
-                            else_column = data_column(else_assignment.group(1))
-                            if then_column.lower() != else_column.lower():
-                                raise ConversionError(
-                                    "IF THEN and ELSE branches must assign the same column."
+                                next_else = (
+                                    re.fullmatch(
+                                        r"else\s+(.+)",
+                                        statements[chain_index + 1].text,
+                                        re.IGNORECASE | re.DOTALL,
+                                    )
+                                    if chain_index + 1 < len(statements)
+                                    else None
                                 )
-                            actions.append(
-                                _DataAction(
-                                    kind="conditional_assign",
-                                    expression=data_expression(then_assignment.group(2)),
-                                    column=then_column,
-                                    condition=data_expression(conditional.group(1)),
-                                    otherwise=data_expression(else_assignment.group(2)),
+                                if next_else is None:
+                                    break
+                                chain_index += 1
+                                chain_has_else = True
+                                else_body = next_else.group(1).strip()
+                                else_if = _IF_THEN.fullmatch(else_body)
+                                if else_if is not None:
+                                    current = else_if
+                                    continue
+                                final_assignment = _DATA_ASSIGNMENT.fullmatch(else_body)
+                                if not final_assignment:
+                                    raise ConversionError(
+                                        "IF THEN and ELSE branches must each be a simple assignment."
+                                    )
+                                final_column = data_column(final_assignment.group(1))
+                                if chain_column.lower() != final_column.lower():
+                                    raise ConversionError(
+                                        "IF THEN and ELSE branches must assign the same column."
+                                    )
+                                chain_otherwise = data_expression(final_assignment.group(2))
+                                break
+                            assert chain_column is not None
+                            if len(chain_branches) == 1 and chain_otherwise is not None:
+                                actions.append(
+                                    _DataAction(
+                                        kind="conditional_assign",
+                                        expression=chain_branches[0][1],
+                                        column=chain_column,
+                                        condition=chain_branches[0][0],
+                                        otherwise=chain_otherwise,
+                                    )
                                 )
-                            )
-                            index += 1
+                            elif chain_otherwise is not None:
+                                actions.append(
+                                    _DataAction(
+                                        kind="select_assign",
+                                        expression=chain_otherwise,
+                                        column=chain_column,
+                                        branches=tuple(chain_branches),
+                                    )
+                                )
+                            else:
+                                actions.append(
+                                    _DataAction(
+                                        kind="conditional_keep",
+                                        expression="",
+                                        column=chain_column,
+                                        branches=tuple(chain_branches),
+                                    )
+                                )
+                            index = chain_index
                     elif re.match(r"^if\b", statement, re.IGNORECASE):
                         actions.append(_DataAction("filter", data_expression(statement[2:].strip())))
                     else:
@@ -1141,6 +1349,23 @@ class SasToPySparkConverter:
                         )
                 elif lower.startswith("else"):
                     raise ConversionError("ELSE must immediately follow a supported IF THEN assignment.")
+                elif lower.startswith("format "):
+                    format_match = re.fullmatch(
+                        r"format\s+((?:[A-Za-z_]\w*\s+)+)(\$?[A-Za-z_]\w*\.\d*)",
+                        statement,
+                        re.IGNORECASE,
+                    )
+                    if format_match is None:
+                        raise ConversionError(
+                            "FORMAT supports one or more variables followed by a "
+                            "single format, such as FORMAT birth_date date9.;"
+                        )
+                    try:
+                        if not has_format(format_match.group(2)):
+                            render_format("x", format_match.group(2))
+                    except DateFunctionError as error:
+                        raise ConversionError(str(error)) from error
+                    display_formats.update(format_match.group(1).split())
                 elif lower.startswith("keep "):
                     keep = statement[5:].split()
                 elif lower.startswith("drop "):
@@ -1152,8 +1377,13 @@ class SasToPySparkConverter:
                             f"Unsupported DATA step statement: {statement[:80]!r}."
                         )
                     column = data_column(assignment.group(1))
-                    if retain_column and column.lower() == retain_column.lower():
-                        if retain_assignment_seen:
+                    column_key = column.lower()
+                    if column_key in retain_vars:
+                        retain_column, retain_initial = retain_vars[column_key]
+                        reset_info = retain_resets.get(column_key)
+                        retain_reset_key = reset_info[0] if reset_info else None
+                        retain_reset_value = reset_info[1] if reset_info else None
+                        if column_key in retain_seen:
                             raise ConversionError(
                                 "A retained accumulator can be updated only once "
                                 "per DATA-step iteration."
@@ -1200,7 +1430,7 @@ class SasToPySparkConverter:
                                 retain_reset=retain_reset_value,
                             )
                         )
-                        retain_assignment_seen = True
+                        retain_seen.add(column_key)
                     else:
                         actions.append(
                             _DataAction(
@@ -1219,35 +1449,43 @@ class SasToPySparkConverter:
 
         if index >= len(statements):
             raise ConversionError(f"DATA step for {target!r} is missing RUN.")
-        if source is None and (merge_sources is None or merge_keys is None):
+        if sources is None and (merge_sources is None or merge_keys is None):
             raise ConversionError(
                 "DATA steps require one SET statement or a MERGE followed by BY."
             )
-        if retain_column is not None:
-            if not retain_assignment_seen:
+        if retain_vars:
+            missing = [name for key, (name, _) in retain_vars.items() if key not in retain_seen]
+            if missing:
                 raise ConversionError(
-                    "RETAIN variable must have one supported accumulator assignment."
+                    "RETAIN variable must have one supported accumulator assignment: "
+                    + ", ".join(missing)
+                    + "."
                 )
             if (
-                source is None
+                sources is None
+                or len(sources) != 1
                 or merge_sources is not None
                 or where_filters
-                or len(actions) != 1
-                or actions[0].kind != "retain_sum"
+                or any(action.kind not in {"retain_sum", "assign"} for action in actions)
             ):
                 raise ConversionError(
-                    "RETAIN currently supports one SET input and one accumulator "
-                    "assignment, without other DATA-step processing."
+                    "RETAIN currently supports one SET input with accumulator and "
+                    "simple assignment statements, without other DATA-step processing."
                 )
-            if by_columns is not None and retain_reset_key is None:
+            if by_columns is not None and len(retain_resets) != len(retain_vars):
                 raise ConversionError(
                     "BY-group RETAIN requires an IF FIRST.<BY key> reset before "
-                    "the accumulator assignment."
+                    "each accumulator assignment."
                 )
 
         lines: list[str] = []
-        if source is not None:
-            lines.append(f"{_python_name(target)} = {_python_name(source)}")
+        if sources is not None:
+            lines.append(f"{_python_name(target)} = {_python_name(sources[0])}")
+            for source in sources[1:]:
+                lines.append(
+                    f"{_python_name(target)} = {_python_name(target)}.unionByName("
+                    f"{_python_name(source)}, allowMissingColumns=True)"
+                )
         for condition in where_filters:
             lines.append(f"{_python_name(target)} = {_python_name(target)}.filter(F.expr({condition!r}))")
         by_flag_columns: list[str] = []
@@ -1321,6 +1559,7 @@ class SasToPySparkConverter:
                         action.merge_sources,
                         action.merge_keys,
                         action.merge_directions,
+                        action.merge_in_vars,
                     )
                 )
             elif action.kind == "filter":
@@ -1404,6 +1643,25 @@ class SasToPySparkConverter:
                     f"{action.column!r}, {expression})"
                 )
             elif (
+                action.kind == "conditional_keep"
+                and action.column is not None
+                and action.branches
+            ):
+                frame = _python_name(target)
+                expression = (
+                    f"F.col({action.column!r}) if {action.column!r} in {frame}.columns "
+                    "else F.lit(None)"
+                )
+                expression = f"({expression})"
+                for condition, branch_expression in reversed(action.branches):
+                    expression = (
+                        f"F.when(F.expr({condition!r}), "
+                        f"F.expr({branch_expression!r})).otherwise({expression})"
+                    )
+                lines.append(
+                    f"{frame} = {frame}.withColumn({action.column!r}, {expression})"
+                )
+            elif (
                 action.kind == "conditional_assign"
                 and action.column is not None
                 and action.condition is not None
@@ -1456,6 +1714,9 @@ class SasToPySparkConverter:
                 f"{_python_name(target)} = {_python_name(target)}.drop("
                 f"*{[ '__sas2pyspark_by_order', *by_flag_columns]!r})"
             )
+        in_names = [name for name in merge_in_vars if name]
+        if in_names:
+            lines.append(f"{_python_name(target)} = {_python_name(target)}.drop(*{in_names!r})")
         lines.extend(
             [
                 f"{_python_name(target)}.createOrReplaceTempView({target!r})",
@@ -1463,11 +1724,17 @@ class SasToPySparkConverter:
             ]
         )
         data_step_warnings = []
-        if retain_column is not None:
+        if retain_vars:
             data_step_warnings.append(
                 "RETAIN uses Spark monotonically_increasing_id() as a best-effort "
                 "row order; Spark does not guarantee SAS observation order, so "
                 "stateful results may differ or change across executions."
+            )
+        if sources is not None and len(sources) > 1:
+            data_step_warnings.append(
+                "Multiple SET inputs are concatenated with Spark unionByName; "
+                "row order is unspecified and Spark schema coercion may differ "
+                "from SAS variable type and length rules."
             )
         if by_flag_columns:
             data_step_warnings.append(
@@ -1475,6 +1742,13 @@ class SasToPySparkConverter:
                 "monotonically_increasing_id() as a best-effort observation "
                 "order; row order is unspecified and results may differ from "
                 "SAS or change across executions."
+            )
+        if display_formats:
+            data_step_warnings.append(
+                "FORMAT statement for "
+                + ", ".join(sorted(display_formats))
+                + " is display-only in SAS; values are unchanged here. Use "
+                "PUT(var, format.) where formatted text is required."
             )
         return lines, index + 1, data_step_warnings
 
@@ -1484,11 +1758,18 @@ class SasToPySparkConverter:
         sources: tuple[str, ...],
         keys: tuple[str, ...],
         directions: tuple[bool, ...],
+        in_vars: tuple[str, ...] = (),
     ) -> list[str]:
-        """Generate a guarded full-outer merge for unique SAS BY keys."""
+        """Generate a SAS BY-group merge, repeating the last row of shorter groups."""
         target_frame = _python_name(target)
         input_frames = ", ".join(_python_name(source) for source in sources)
+        in_selection = [
+            f"__sas2pyspark_merge_selection.append(F.col('__sas2pyspark_m{index}_present').isNotNull().alias({name!r}))"
+            for index, name in enumerate(in_vars)
+            if name
+        ]
         return [
+            "from pyspark.sql import Window as __sas2pyspark_window",
             f"__sas2pyspark_merge_inputs = [{input_frames}]",
             f"__sas2pyspark_merge_keys = {list(keys)!r}",
             "__sas2pyspark_merge_frames = []",
@@ -1501,10 +1782,10 @@ class SasToPySparkConverter:
             "    ]",
             "    if any(__sas2pyspark_key is None for __sas2pyspark_key in __sas2pyspark_merge_actual_keys):",
             "        raise ValueError('SAS MERGE BY key is missing from an input DataFrame.')",
-            "    if (__sas2pyspark_merge_frame",
-            "            .groupBy(*__sas2pyspark_merge_actual_keys)",
-            "            .count().filter(F.col('count') > 1).limit(1).count()):",
-            "        raise ValueError('SAS MERGE BY requires unique keys in every input DataFrame.')",
+            "    __sas2pyspark_merge_window = __sas2pyspark_window.partitionBy(*__sas2pyspark_merge_actual_keys)",
+            "    __sas2pyspark_merge_numbered = (__sas2pyspark_merge_frame",
+            "        .withColumn('__sas2pyspark_rn', F.row_number().over(__sas2pyspark_merge_window.orderBy(F.monotonically_increasing_id())))",
+            "        .withColumn('__sas2pyspark_cnt', F.count(F.lit(1)).over(__sas2pyspark_merge_window)))",
             "    __sas2pyspark_merge_columns = [",
             "        __sas2pyspark_column for __sas2pyspark_column in __sas2pyspark_merge_frame.columns",
             "        if __sas2pyspark_column.lower() not in {__sas2pyspark_key.lower() for __sas2pyspark_key in __sas2pyspark_merge_keys}",
@@ -1519,22 +1800,30 @@ class SasToPySparkConverter:
             "        for __sas2pyspark_column_index, __sas2pyspark_column in enumerate(__sas2pyspark_merge_columns)",
             "    )",
             "    __sas2pyspark_merge_projection.append(F.lit(True).alias(f'__sas2pyspark_m{__sas2pyspark_merge_index}_present'))",
-            "    __sas2pyspark_merge_frames.append(__sas2pyspark_merge_frame.select(*__sas2pyspark_merge_projection))",
-            "__sas2pyspark_merge_joined = __sas2pyspark_merge_frames[0]",
-            "for __sas2pyspark_merge_index in range(1, len(__sas2pyspark_merge_frames)):",
-            "    __sas2pyspark_merge_conditions = [",
-            "        F.coalesce(*[F.col(f'__sas2pyspark_m{__sas2pyspark_prior}_key{__sas2pyspark_key_index}')",
-            "                     for __sas2pyspark_prior in range(__sas2pyspark_merge_index)])",
-            "        .eqNullSafe(F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_key{__sas2pyspark_key_index}'))",
-            "        for __sas2pyspark_key_index in range(len(__sas2pyspark_merge_keys))",
-            "    ]",
-            "    __sas2pyspark_merge_condition = __sas2pyspark_merge_conditions[0]",
-            "    for __sas2pyspark_next_condition in __sas2pyspark_merge_conditions[1:]:",
-            "        __sas2pyspark_merge_condition = __sas2pyspark_merge_condition & __sas2pyspark_next_condition",
+            "    __sas2pyspark_merge_projection.append(F.col('__sas2pyspark_rn').alias(f'__sas2pyspark_m{__sas2pyspark_merge_index}_rn'))",
+            "    __sas2pyspark_merge_projection.append(F.col('__sas2pyspark_cnt').alias(f'__sas2pyspark_m{__sas2pyspark_merge_index}_cnt'))",
+            "    __sas2pyspark_merge_frames.append(__sas2pyspark_merge_numbered.select(*__sas2pyspark_merge_projection))",
+            "__sas2pyspark_merge_base = None",
+            "for __sas2pyspark_merge_index, __sas2pyspark_merge_frame in enumerate(__sas2pyspark_merge_frames):",
+            "    __sas2pyspark_merge_counts = __sas2pyspark_merge_frame.select(",
+            "        *[F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_key{__sas2pyspark_key_index}').alias(f'__sas2pyspark_base_key{__sas2pyspark_key_index}')",
+            "          for __sas2pyspark_key_index in range(len(__sas2pyspark_merge_keys))],",
+            "        F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_cnt').alias('__sas2pyspark_n'))",
+            "    __sas2pyspark_merge_base = __sas2pyspark_merge_counts if __sas2pyspark_merge_base is None else __sas2pyspark_merge_base.unionByName(__sas2pyspark_merge_counts)",
+            "__sas2pyspark_merge_joined = (__sas2pyspark_merge_base",
+            "    .groupBy(*[f'__sas2pyspark_base_key{__sas2pyspark_key_index}' for __sas2pyspark_key_index in range(len(__sas2pyspark_merge_keys))])",
+            "    .agg(F.max('__sas2pyspark_n').alias('__sas2pyspark_n'))",
+            "    .withColumn('__sas2pyspark_k', F.explode(F.sequence(F.lit(1), F.col('__sas2pyspark_n'))))",
+            "    .drop('__sas2pyspark_n'))",
+            "for __sas2pyspark_merge_index in range(len(__sas2pyspark_merge_frames)):",
+            "    __sas2pyspark_merge_condition = (F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_rn')",
+            "        == F.least(F.col('__sas2pyspark_k'), F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_cnt')))",
+            "    for __sas2pyspark_key_index in range(len(__sas2pyspark_merge_keys)):",
+            "        __sas2pyspark_merge_condition = __sas2pyspark_merge_condition & F.col(f'__sas2pyspark_base_key{__sas2pyspark_key_index}').eqNullSafe(F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_key{__sas2pyspark_key_index}'))",
             "    __sas2pyspark_merge_joined = __sas2pyspark_merge_joined.join(",
             "        __sas2pyspark_merge_frames[__sas2pyspark_merge_index],",
             "        __sas2pyspark_merge_condition,",
-            "        'full_outer',",
+            "        'left',",
             "    )",
             "__sas2pyspark_merge_columns = list(dict.fromkeys(",
             "    __sas2pyspark_column",
@@ -1542,9 +1831,7 @@ class SasToPySparkConverter:
             "    for __sas2pyspark_column in __sas2pyspark_input_columns",
             "))",
             "__sas2pyspark_merge_selection = [",
-            "    F.coalesce(*[F.col(f'__sas2pyspark_m{__sas2pyspark_index}_key{__sas2pyspark_key_index}')",
-            "                 for __sas2pyspark_index in range(len(__sas2pyspark_merge_frames))])",
-            "    .alias(__sas2pyspark_key)",
+            "    F.col(f'__sas2pyspark_base_key{__sas2pyspark_key_index}').alias(__sas2pyspark_key)",
             "    for __sas2pyspark_key_index, __sas2pyspark_key in enumerate(__sas2pyspark_merge_keys)",
             "]",
             "for __sas2pyspark_column_index, __sas2pyspark_column in enumerate(__sas2pyspark_merge_columns):",
@@ -1555,12 +1842,14 @@ class SasToPySparkConverter:
             "            __sas2pyspark_present = F.col(f'__sas2pyspark_m{__sas2pyspark_merge_index}_present').isNotNull()",
             "            __sas2pyspark_value = F.when(__sas2pyspark_present, __sas2pyspark_source_value).otherwise(__sas2pyspark_value)",
             "    __sas2pyspark_merge_selection.append(__sas2pyspark_value.alias(__sas2pyspark_column))",
+            *in_selection,
+            "__sas2pyspark_merge_selection.append(F.col('__sas2pyspark_k'))",
             f"{target_frame} = __sas2pyspark_merge_joined.select(*__sas2pyspark_merge_selection).orderBy("
             + ", ".join(
                 f"F.col({key!r}).{'asc' if ascending else 'desc'}()"
                 for key, ascending in zip(keys, directions)
             )
-            + ")",
+            + ", F.col('__sas2pyspark_k').asc()).drop('__sas2pyspark_k')",
             "",
         ]
 
@@ -1571,6 +1860,9 @@ class SasToPySparkConverter:
         target: str | None = None
         keys: list[tuple[str, bool]] = []
         nodupkey = False
+        nodup = False
+        dupout: str | None = None
+        where_filters: list[str] = []
         header_options = statements[start].text[len("proc sort") :].strip().split()
         for option in header_options:
             lower_option = option.lower()
@@ -1578,8 +1870,12 @@ class SasToPySparkConverter:
                 data = _dataset_name(option[5:])
             elif lower_option.startswith("out="):
                 target = _dataset_name(option[4:])
+            elif lower_option.startswith("dupout="):
+                dupout = _dataset_name(option[7:])
             elif lower_option == "nodupkey":
                 nodupkey = True
+            elif lower_option in {"nodup", "noduprecs"}:
+                nodup = True
             else:
                 raise ConversionError(f"Unsupported PROC SORT option: {option!r}.")
         index = start + 1
@@ -1592,8 +1888,14 @@ class SasToPySparkConverter:
                     data = _dataset_name(statement[5:].strip())
                 elif lower.startswith("out="):
                     target = _dataset_name(statement[4:].strip())
+                elif lower.startswith("dupout="):
+                    dupout = _dataset_name(statement[7:].strip())
                 elif lower == "nodupkey":
                     nodupkey = True
+                elif lower in {"nodup", "noduprecs"}:
+                    nodup = True
+                elif lower.startswith("where "):
+                    where_filters.append(_expression(statement[6:]))
                 elif lower.startswith("by "):
                     descending = False
                     for token in statement[3:].split():
@@ -1623,6 +1925,12 @@ class SasToPySparkConverter:
             raise ConversionError("PROC SORT is missing RUN.")
         if data is None or not keys:
             raise ConversionError("PROC SORT requires DATA= and BY.")
+        if dupout is not None and not (nodupkey or nodup):
+            raise ConversionError("PROC SORT DUPOUT= requires NODUPKEY or NODUP.")
+        if dupout is not None and nodup and nodupkey:
+            raise ConversionError(
+                "PROC SORT DUPOUT= with both NODUPKEY and NODUP is unsupported."
+            )
         target = target or data
         frame = _python_name(data)
         target_frame = _python_name(target)
@@ -1632,26 +1940,53 @@ class SasToPySparkConverter:
         )
         lines: list[str] = []
         warnings: list[str] = []
+        source_frame = frame
+        if where_filters:
+            condition = " AND ".join(f"({item})" for item in where_filters)
+            source_frame = f"{target_frame}__filtered"
+            lines.append(f"{source_frame} = {frame}.filter(F.expr({condition!r}))")
         if nodupkey:
             partition = ", ".join(f"F.col({name!r})" for name in key_names)
             ordering = ", ".join(
                 f"F.col({name!r}).{'asc' if ascending else 'desc'}()"
                 for name, ascending in keys
             )
+            ranked = f"{target_frame}__ranked"
             lines.extend(
                 [
-                    f"{target_frame} = {frame}.withColumn("
+                    f"{ranked} = {source_frame}.withColumn("
                     "'__sas2pyspark_row_number', "
                     f"F.row_number().over(__sas2pyspark_window.partitionBy({partition}).orderBy({ordering}))"
                     ")",
-                    f"{target_frame} = {target_frame}.filter(F.col('__sas2pyspark_row_number') == 1).drop('__sas2pyspark_row_number')",
+                    f"{target_frame} = {ranked}.filter(F.col('__sas2pyspark_row_number') == 1).drop('__sas2pyspark_row_number')",
                 ]
             )
+            if dupout is not None:
+                lines.extend(
+                    [
+                        f"{_python_name(dupout)} = {ranked}.filter(F.col('__sas2pyspark_row_number') > 1).drop('__sas2pyspark_row_number').orderBy({order})",
+                        f"{_python_name(dupout)}.createOrReplaceTempView({_sql_name(dupout)!r})",
+                    ]
+                )
             warnings.append(
                 "PROC SORT NODUPKEY tie behavior may differ from SAS when BY keys tie."
             )
+        elif nodup:
+            lines.append(f"{target_frame} = {source_frame}.dropDuplicates()")
+            if dupout is not None:
+                lines.extend(
+                    [
+                        f"{_python_name(dupout)} = {source_frame}.exceptAll({target_frame})",
+                        f"{_python_name(dupout)}.createOrReplaceTempView({_sql_name(dupout)!r})",
+                    ]
+                )
+            warnings.append(
+                "PROC SORT NODUP removes only adjacent identical observations in "
+                "SAS; Spark removes all fully identical rows, which can differ when "
+                "duplicates are not adjacent after sorting."
+            )
         else:
-            lines.append(f"{target_frame} = {frame}")
+            lines.append(f"{target_frame} = {source_frame}")
         lines.append(f"{target_frame} = {target_frame}.orderBy({order})")
         lines.extend(
             [
@@ -1660,8 +1995,179 @@ class SasToPySparkConverter:
             ]
         )
         if nodupkey:
-            lines.insert(1, "from pyspark.sql import Window as __sas2pyspark_window")
+            lines.insert(0, "from pyspark.sql import Window as __sas2pyspark_window")
         return lines, index + 1, warnings
+
+    def _convert_format(
+        self, statements: list[_Statement], start: int
+    ) -> tuple[list[str], int]:
+        header = statements[start].text[len("proc format") :].strip()
+        if header:
+            raise ConversionError(f"Unsupported PROC FORMAT option: {header!r}.")
+        names: list[str] = []
+        index = start + 1
+        while index < len(statements):
+            source_statement = statements[index]
+            lower = source_statement.text.lower().strip()
+            if lower in {"run", "quit"}:
+                break
+            try:
+                if lower.startswith("value "):
+                    try:
+                        names.append(register_value(source_statement.text).name)
+                    except FormatError as error:
+                        raise ConversionError(str(error)) from error
+                else:
+                    raise ConversionError(
+                        f"Unsupported PROC FORMAT statement: {source_statement.text[:60]!r}."
+                    )
+            except ConversionError as error:
+                raise ConversionError(
+                    error.message,
+                    line=source_statement.line,
+                    statement=source_statement.text,
+                ) from error
+            index += 1
+        else:
+            raise ConversionError("PROC FORMAT is missing RUN.")
+        return [f"# PROC FORMAT: defined {', '.join(names)}; applied where PUT() uses them.", ""], index + 1
+
+    def _parse_libname(self, text: str) -> str:
+        match = re.fullmatch(
+            r"libname\s+([A-Za-z_]\w{0,7})\s+(?:clear|(?:[A-Za-z]\w*\s+)?(?:'[^']*'|\"[^\"]*\")(?:\s+[\w=\-./\\]+)*)",
+            text.strip(),
+            re.I,
+        )
+        if not match:
+            raise ConversionError(f"Unsupported LIBNAME statement: {text!r}.")
+        return match.group(1).lower()
+
+    def _append_lines(
+        self, base: str, data: str, force: bool
+    ) -> tuple[list[str], list[str]]:
+        base_frame = _python_name(base)
+        data_frame = _python_name(data)
+        lines = [
+            f"{base_frame} = {base_frame}.unionByName({data_frame}, allowMissingColumns={force})",
+            f"{base_frame}.createOrReplaceTempView({_sql_name(base)!r})",
+        ]
+        warnings = []
+        if force:
+            warnings.append(
+                "PROC APPEND FORCE fills columns missing on either side with null; "
+                "SAS truncates or drops mismatched variables instead."
+            )
+        return lines, warnings
+
+    def _convert_append(
+        self, statements: list[_Statement], start: int
+    ) -> tuple[list[str], int, list[str]]:
+        base: str | None = None
+        data: str | None = None
+        force = False
+        for option in statements[start].text[len("proc append") :].split():
+            lower_option = option.lower()
+            if lower_option.startswith("base="):
+                base = _dataset_name(option[5:])
+            elif lower_option.startswith("data="):
+                data = _dataset_name(option[5:])
+            elif lower_option == "force":
+                force = True
+            else:
+                raise ConversionError(f"Unsupported PROC APPEND option: {option!r}.")
+        if base is None or data is None:
+            raise ConversionError("PROC APPEND requires BASE= and DATA=.")
+        index = start + 1
+        if index < len(statements) and statements[index].text.lower() in {"run", "quit"}:
+            index += 1
+        lines, warnings = self._append_lines(base, data, force)
+        lines.append("")
+        return lines, index, warnings
+
+    def _convert_datasets(
+        self, statements: list[_Statement], start: int
+    ) -> tuple[list[str], int]:
+        library = "work"
+        for option in statements[start].text[len("proc datasets") :].split():
+            lower_option = option.lower()
+            if lower_option.startswith(("lib=", "library=")):
+                library = option.split("=", 1)[1].lower()
+            elif lower_option in {"nolist", "nodetails", "nowarn"}:
+                continue
+            else:
+                raise ConversionError(f"Unsupported PROC DATASETS option: {option!r}.")
+        lines: list[str] = []
+        index = start + 1
+        terminated = False
+        while index < len(statements):
+            source_statement = statements[index]
+            statement = source_statement.text.strip()
+            lower = statement.lower()
+            if lower in {"run", "quit"}:
+                terminated = True
+                index += 1
+                if lower == "run" and index < len(statements) and statements[index].text.lower() == "quit":
+                    index += 1
+                break
+            try:
+                if lower.startswith("delete "):
+                    for name in statement[7:].split():
+                        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+                            raise ConversionError(f"Unsupported DELETE member: {name!r}.")
+                        qualified = _dataset_name(f"{library}.{name}")
+                        lines.extend(
+                            [
+                                f"{_python_name(qualified)} = None",
+                                f"spark.catalog.dropTempView({_sql_name(qualified)!r})",
+                            ]
+                        )
+                elif lower.startswith("change "):
+                    pairs = re.findall(r"(\w+)\s*=\s*(\w+)", statement[7:])
+                    if not pairs:
+                        raise ConversionError("Malformed CHANGE statement.")
+                    for old, new in pairs:
+                        old_name = _dataset_name(f"{library}.{old}")
+                        new_name = _dataset_name(f"{library}.{new}")
+                        lines.extend(
+                            [
+                                f"{_python_name(new_name)} = {_python_name(old_name)}",
+                                f"{_python_name(new_name)}.createOrReplaceTempView({_sql_name(new_name)!r})",
+                                f"spark.catalog.dropTempView({_sql_name(old_name)!r})",
+                                f"{_python_name(old_name)} = None",
+                            ]
+                        )
+                elif lower.startswith("append "):
+                    base = data = None
+                    force = False
+                    for option in statement[7:].split():
+                        lower_option = option.lower()
+                        if lower_option.startswith("base="):
+                            base = _dataset_name(option[5:])
+                        elif lower_option.startswith("data="):
+                            data = _dataset_name(option[5:])
+                        elif lower_option == "force":
+                            force = True
+                        else:
+                            raise ConversionError(f"Unsupported APPEND option: {option!r}.")
+                    if base is None or data is None:
+                        raise ConversionError("APPEND requires BASE= and DATA=.")
+                    append_lines, _ = self._append_lines(base, data, force)
+                    lines.extend(append_lines)
+                else:
+                    raise ConversionError(
+                        f"Unsupported PROC DATASETS statement: {statement!r}."
+                    )
+            except ConversionError as error:
+                raise ConversionError(
+                    error.message,
+                    line=source_statement.line,
+                    statement=source_statement.text,
+                ) from error
+            index += 1
+        if not terminated:
+            raise ConversionError("PROC DATASETS is missing RUN or QUIT.")
+        lines.append("")
+        return lines, index
 
     def _convert_freq(
         self, statements: list[_Statement], start: int, freq_count: int
@@ -1798,6 +2304,7 @@ class SasToPySparkConverter:
         data: str | None = None
         statistics: list[str] = []
         include_missing_class = False
+        default_statistics_used = False
         supported_statistics = {
             "n",
             "nmiss",
@@ -1809,6 +2316,8 @@ class SasToPySparkConverter:
             "cv",
             "min",
             "max",
+            "median",
+            "range",
         }
         for option in header_options:
             if option.lower().startswith("data="):
@@ -1920,10 +2429,8 @@ class SasToPySparkConverter:
         if data is None:
             raise ConversionError("PROC MEANS/SUMMARY requires DATA=.")
         if not statistics:
-            raise ConversionError(
-                "PROC MEANS/SUMMARY requires at least one supported statistic "
-                "option: N, SUM, MEAN, STD, MIN, or MAX."
-            )
+            statistics = ["n", "mean", "std", "min", "max"]
+            default_statistics_used = True
         if var_columns is None:
             raise ConversionError("PROC MEANS/SUMMARY requires one VAR statement.")
 
@@ -1977,11 +2484,14 @@ class SasToPySparkConverter:
             "cv": "cv",
             "min": "min",
             "max": "max",
+            "median": "median",
         }
         for statistic, names in zip(statistics, output_columns):
             for column, output_name in zip(var_columns, names):
                 column_ref = f"F.col({column!r})"
-                if statistic == "nmiss":
+                if statistic == "range":
+                    aggregate = f"(F.max({column_ref}) - F.min({column_ref}))"
+                elif statistic == "nmiss":
                     aggregate = f"F.count(F.when({column_ref}.isNull(), F.lit(1)))"
                 elif statistic == "stderr":
                     aggregate = (
@@ -1999,6 +2509,10 @@ class SasToPySparkConverter:
                 aggregates.append(f"{aggregate}.alias({output_name!r})")
 
         lines: list[str] = []
+        if default_statistics_used:
+            lines.append(
+                "# PROC MEANS/SUMMARY defaulted to N, MEAN, STD, MIN and MAX."
+            )
         if class_columns:
             class_selection = ", ".join(
                 f"F.col({column!r})" for column in class_columns
@@ -2484,6 +2998,16 @@ class SasToPySparkConverter:
     def _normalize_sql(query: str) -> str:
         """Normalize common SAS SQL table references and SAS comparison words."""
         normalized = _expression(query)
+        try:
+            normalized = rewrite_calculated(normalized)
+        except ValueError as error:
+            raise ConversionError(str(error)) from error
+        if re.search(r"\binto\s+:", normalized, re.I):
+            raise ConversionError(
+                "PROC SQL SELECT ... INTO :macro is unsupported because macro "
+                "variables are resolved at conversion time; read the value in "
+                "PySpark with spark.sql(...).collect() instead."
+            )
         return _map_unquoted(
             normalized,
             lambda part: re.sub(

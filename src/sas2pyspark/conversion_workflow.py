@@ -259,7 +259,12 @@ def convert_project(
             record_failure("Registered source program must have a .sas extension.")
             continue
         try:
-            result = converter.convert(source, sas_version=sas_version)
+            result = converter.convert(
+                source,
+                sas_version=sas_version,
+                include_dir=source_path.parent,
+                include_root=root,
+            )
         except ConversionError as error:
             record_failure(str(error))
             continue

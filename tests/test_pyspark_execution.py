@@ -123,6 +123,36 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual(summaries["sales"], (2, 70.0))
         self.assertEqual(summaries["engineering"], (1, 90.0))
 
+    def test_set_concatenates_datasets_and_fills_missing_columns(self):
+        source = """
+        data work.all_records;
+          set work.first_records work.second_records;
+        run;
+        """
+        df_first_records = self.spark.createDataFrame(
+            [(1, "first")], ["id", "first_value"]
+        )
+        df_second_records = self.spark.createDataFrame(
+            [(2, "second")], ["id", "second_value"]
+        )
+        namespace = {
+            "spark": self.spark,
+            "df_first_records": df_first_records,
+            "df_second_records": df_second_records,
+        }
+
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        actual = {
+            (row.id, row.first_value, row.second_value)
+            for row in namespace["df_all_records"].collect()
+        }
+        self.assertEqual(
+            actual,
+            {(1, "first", None), (2, None, "second")},
+        )
+
     def test_simple_macro_variables_execute_in_generated_data_step(self):
         source = """
         %let source=work.people;
@@ -143,6 +173,298 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual(
             [(row.name, row.age) for row in namespace["df_adults"].collect()],
             [("B", 18), ("C", 25)],
+        )
+
+    def test_if_without_else_and_else_if_chains_execute(self):
+        source = """
+        data out;
+          set people;
+          if age ge 60 then band = 'SENIOR';
+          else if age ge 40 then band = 'MID';
+          if age lt 20 then flag = 1;
+          if age ge 60 then label = 'old';
+        run;
+        """
+        df_people = self.spark.createDataFrame(
+            [("A", 17, "x"), ("B", 45, "y"), ("C", 70, "z")],
+            ["name", "age", "label"],
+        )
+        namespace = {"spark": self.spark, "df_people": df_people}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = {
+            row.name: (row.band, row.flag, row.label)
+            for row in namespace["df_out"].collect()
+        }
+        self.assertEqual(
+            rows,
+            {"A": (None, 1, "x"), "B": ("MID", None, "y"), "C": ("SENIOR", None, "old")},
+        )
+
+    def test_date_functions_formats_and_literals_execute(self):
+        source = """
+        data out;
+          set events;
+          format event_date date9.;
+          d = input(raw, yymmdd10.);
+          year_part = year(d);
+          qtr_part = qtr(d);
+          wk = weekday(d);
+          months_since = intck('month', '15JAN2024'd, d);
+          days_since = intck('day', '01JAN2024'd, d);
+          years_since = intck('year', '15JAN2024'd, d);
+          weeks_since = intck('week', '01JAN2024'd, d);
+          qtrs_since = intck('qtr', '01JAN2024'd, d);
+          m_begin = intnx('month', d, 1);
+          m_end = intnx('month', d, 0, 'end');
+          m_same = intnx('month', d, 1, 'same');
+          q_begin = intnx('qtr', d, 0);
+          y_end = intnx('year', d, 0, 'e');
+          w_begin = intnx('week', d, 0);
+          built = mdy(2, 30, 2024);
+          built_ok = mdy(2, 29, 2024);
+          shown = put(d, date9.);
+          shown_iso = put(d, yymmdd10.);
+          padded = put(num, z5.);
+          fixed = put(amt, 8.2);
+          parsed = input(txt, 8.);
+          diff = datdif('01JAN2024'd, d, 'act/act');
+          keep raw year_part qtr_part wk months_since days_since years_since weeks_since qtrs_since m_begin m_end m_same q_begin y_end w_begin built built_ok shown shown_iso padded fixed parsed diff;
+        run;
+        """
+        df_events = self.spark.createDataFrame(
+            [("2024-03-31", 42, 1234.567, " 12.5 "), ("2024-11-05", 7, None, "abc")],
+            "raw string, num int, amt double, txt string",
+        )
+        namespace = {"spark": self.spark, "df_events": df_events}
+        generated = SasToPySparkConverter().convert(source)
+        self.assertTrue(any("FORMAT statement" in w for w in generated.warnings))
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = {row.raw: row.asDict() for row in namespace["df_out"].collect()}
+        first, second = rows["2024-03-31"], rows["2024-11-05"]
+        self.assertEqual(
+            (first["year_part"], first["qtr_part"], first["wk"]), (2024, 1, 1)
+        )
+        self.assertEqual(
+            (first["months_since"], first["days_since"], first["years_since"]),
+            (2, 90, 0),
+        )
+        self.assertEqual((first["weeks_since"], first["qtrs_since"]), (13, 0))
+        self.assertEqual(str(first["m_begin"]), "2024-04-01")
+        self.assertEqual(str(first["m_end"]), "2024-03-31")
+        self.assertEqual(str(first["m_same"]), "2024-04-30")
+        self.assertEqual(str(first["q_begin"]), "2024-01-01")
+        self.assertEqual(str(first["y_end"]), "2024-12-31")
+        self.assertEqual(str(first["w_begin"]), "2024-03-31")
+        self.assertIsNone(first["built"])
+        self.assertEqual(str(first["built_ok"]), "2024-02-29")
+        self.assertEqual(first["shown"], "31MAR2024")
+        self.assertEqual(first["shown_iso"], "2024-03-31")
+        self.assertEqual(first["padded"], "00042")
+        self.assertEqual(first["fixed"], " 1234.57")
+        self.assertEqual(first["parsed"], 12.5)
+        self.assertEqual(first["diff"], 90)
+        self.assertEqual(second["fixed"], "       .")
+        self.assertIsNone(second["parsed"])
+        self.assertEqual(str(second["w_begin"]), "2024-11-03")
+
+    def test_proc_sort_dupout_nodup_and_where_execute(self):
+        source = """
+        proc sort data=people out=unique dupout=dups nodupkey;
+          where score ge 10;
+          by name;
+        run;
+        proc sort data=people out=distinct nodup;
+          by name;
+        run;
+        """
+        df_people = self.spark.createDataFrame(
+            [("A", 50), ("A", 60), ("B", 20), ("B", 20), ("C", 5)],
+            "name string, score int",
+        )
+        namespace = {"spark": self.spark, "df_people": df_people}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        self.assertEqual(
+            [row.name for row in namespace["df_unique"].collect()], ["A", "B"]
+        )
+        self.assertEqual(
+            sorted((r.name, r.score) for r in namespace["df_dups"].collect()),
+            [("A", 50), ("B", 20)]
+            if namespace["df_unique"].filter("name = 'A'").first().score == 60
+            else [("A", 60), ("B", 20)],
+        )
+        self.assertEqual(namespace["df_distinct"].count(), 4)
+
+    def test_proc_append_and_datasets_execute(self):
+        source = """
+        proc append base=big data=small force;
+        run;
+        proc datasets lib=work nolist;
+          change small=tiny;
+        quit;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_big": self.spark.createDataFrame([(1, "a")], "id int, x string"),
+            "df_small": self.spark.createDataFrame([(2,)], "id int"),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        self.assertEqual(
+            sorted((r.id, r.x) for r in namespace["df_big"].collect()),
+            [(1, "a"), (2, None)],
+        )
+        self.assertEqual(namespace["df_tiny"].count(), 1)
+        self.assertIsNone(namespace["df_small"])
+
+    def test_proc_format_executes(self):
+        source = """
+        proc format;
+          value agegrp low-<18='Minor' 18-64='Adult' 65-high='Senior' .='Unknown';
+          value $region 'N','S'='Ns' other='Other';
+          value score 1=one 2=two;
+        run;
+        """
+        source = source.replace("1=one 2=two", "1='one' 2='two'")
+        source += """
+        data out;
+          set people;
+          grp = put(age, agegrp.);
+          reg = put(code, $region.);
+          sc = put(age, score.);
+        run;
+        """
+        df_people = self.spark.createDataFrame(
+            [(10, "N"), (18, "S"), (65, "E"), (None, "W"), (1, "N")],
+            "age int, code string",
+        )
+        namespace = {"spark": self.spark, "df_people": df_people}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = [(r.age, r.grp, r.reg, r.sc) for r in namespace["df_out"].collect()]
+        self.assertEqual(
+            sorted(rows, key=lambda r: (r[0] is None, r[0])),
+            [
+                (1, "Minor", "Ns", "one"),
+                (10, "Minor", "Ns", "10"),
+                (18, "Adult", "Ns", "18"),
+                (65, "Senior", "Other", "65"),
+                (None, "Unknown", "Other", "."),
+            ],
+        )
+
+    def test_multi_output_routing_executes(self):
+        source = """
+        data high mid low;
+          set scores;
+          if score >= 80 then output high;
+          else if score >= 50 then output mid;
+          else output low;
+        run;
+        data both_a both_b;
+          set scores;
+          output;
+        run;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_scores": self.spark.createDataFrame(
+                [(1, 90), (2, 50), (3, 10), (4, None)], "id int, score int"
+            ),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        ids = lambda name: sorted(r.id for r in namespace[name].collect())
+        self.assertEqual(ids("df_high"), [1])
+        self.assertEqual(ids("df_mid"), [2])
+        self.assertEqual(ids("df_low"), [3, 4])
+        self.assertEqual(ids("df_both_a"), [1, 2, 3, 4])
+        self.assertEqual(ids("df_both_b"), [1, 2, 3, 4])
+
+    def test_means_median_range_default_execute(self):
+        source = """
+        proc means data=t;
+          var x;
+        run;
+        proc summary data=t median range;
+          class g;
+          var x;
+          output out=s median=med range=rng;
+        run;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_t": self.spark.createDataFrame(
+                [("a", 1), ("a", 3), ("a", 8), ("b", 2), ("b", 4)], "g string, x int"
+            ),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        row = namespace["df_means_1"].first()
+        self.assertEqual((row.n_x, row.min_x, row.max_x), (5, 1, 8))
+        self.assertAlmostEqual(row.mean_x, 3.6)
+        groups = {r.g: (r.med, r.rng) for r in namespace["df_s"].collect()}
+        self.assertEqual(groups, {"a": (3.0, 7), "b": (3.0, 2)})
+
+    def test_sql_calculated_joins_and_case_execute(self):
+        source = """
+        proc sql noprint;
+          create table o as
+          select a.id, a.x * 2 as dbl, calculated dbl + 1 as d2,
+                 case when b.v is null then 'none' else 'yes' end as flag
+          from a left join b on a.id = b.id
+          where calculated dbl > 2
+          order by a.id;
+        quit;
+        """
+        self.spark.createDataFrame([(1, 1), (2, 5), (3, 7)], "id int, x int"
+            ).createOrReplaceTempView("a")
+        self.spark.createDataFrame([(2, "p")], "id int, v string"
+            ).createOrReplaceTempView("b")
+        namespace = {"spark": self.spark}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = [(r.id, r.dbl, r.d2, r.flag) for r in namespace["df_o"].collect()]
+        self.assertEqual(rows, [(2, 10, 11, "yes"), (3, 14, 15, "none")])
+
+    def test_if_then_do_blocks_and_delete_execute(self):
+        source = """
+        data out;
+          set people;
+          if age ge 60 then do;
+            band = 'SENIOR';
+            bonus = 10;
+          end;
+          else if age ge 40 then do;
+            band = 'MID';
+            bonus = 5;
+          end;
+          else do;
+            band = 'JUNIOR';
+            bonus = 0;
+          end;
+          if name = 'D' then delete;
+        run;
+        """
+        df_people = self.spark.createDataFrame(
+            [("A", 17), ("B", 45), ("C", 70), ("D", 50), ("E", None)],
+            "name string, age int",
+        )
+        namespace = {"spark": self.spark, "df_people": df_people}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = {
+            row.name: (row.band, row.bonus) for row in namespace["df_out"].collect()
+        }
+        self.assertEqual(
+            rows,
+            {
+                "A": ("JUNIOR", 0),
+                "B": ("MID", 5),
+                "C": ("SENIOR", 10),
+                "E": ("JUNIOR", 0),
+            },
         )
 
     def test_proc_import_csv_executes_with_header_and_delimiter(self):
@@ -248,6 +570,45 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             for row in namespace["df_running"].orderBy("row_id").collect()
         }
         self.assertEqual(totals, {1: 2, 2: 5, 3: 4, 4: 5, 5: 11})
+
+    def test_retain_multiple_variables_execute(self):
+        source = """
+        data work.multi;
+          retain total count 0 bonus 100;
+          set work.amounts;
+          total = total + amount;
+          count = count + 1;
+          bonus = bonus + 5;
+          avg = total / count;
+        run;
+        data work.grouped;
+          retain total 0 count 0;
+          set work.amounts;
+          by region;
+          if first.region then total = 0;
+          if first.region then count = 0;
+          total = total + amount;
+          count = count + 1;
+        run;
+        """
+        df_amounts = self.spark.createDataFrame(
+            [(1, "A", 2), (2, "A", 4), (3, "B", 6)],
+            ["row_id", "region", "amount"],
+        )
+        namespace = {"spark": self.spark, "df_amounts": df_amounts}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        multi = {
+            r.row_id: (r.total, r["count"], r.bonus, r.avg)
+            for r in namespace["df_multi"].collect()
+        }
+        self.assertEqual(
+            multi, {1: (2, 1, 105, 2.0), 2: (6, 2, 110, 3.0), 3: (12, 3, 115, 4.0)}
+        )
+        grouped = {
+            r.row_id: (r.total, r["count"]) for r in namespace["df_grouped"].collect()
+        }
+        self.assertEqual(grouped, {1: (2, 1), 2: (6, 2), 3: (6, 1)})
 
     def test_retain_rejects_missing_accumulator_input(self):
         source = """
@@ -726,26 +1087,53 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             [3, 1],
         )
 
-    def test_merge_by_rejects_duplicate_keys_at_runtime(self):
+    def test_merge_by_handles_duplicate_keys_and_in_flags(self):
         source = """
-        data work.merged_duplicates;
-          merge work.duplicate_left work.unique_right;
+        data work.one_to_many;
+          merge work.dup_left(in=inl) work.single_right(in=inr);
+          by id;
+          if inl;
+        run;
+        data work.many_to_many;
+          merge work.dup_left work.dup_right;
           by id;
         run;
+        data work.only_right;
+          merge work.dup_left(in=inl) work.single_right(in=inr);
+          by id;
+          if inr and not inl;
+        run;
         """
-        df_duplicate_left = self.spark.createDataFrame(
-            [(1, "first"), (1, "second")],
-            ["id", "value"],
-        )
-        df_unique_right = self.spark.createDataFrame([(1,)], ["id"])
         namespace = {
             "spark": self.spark,
-            "df_duplicate_left": df_duplicate_left,
-            "df_unique_right": df_unique_right,
+            "df_dup_left": self.spark.createDataFrame(
+                [(1, "a1"), (1, "a2"), (2, "b1")], ["id", "lv"]
+            ),
+            "df_single_right": self.spark.createDataFrame(
+                [(1, "r1"), (3, "r3")], ["id", "rv"]
+            ),
+            "df_dup_right": self.spark.createDataFrame(
+                [(1, "x1"), (1, "x2"), (1, "x3"), (2, "y1")], ["id", "xv"]
+            ),
         }
         generated = SasToPySparkConverter().convert(source)
-        with self.assertRaisesRegex(ValueError, "requires unique keys"):
-            exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        one = sorted(
+            (r.id, r.lv, r.rv) for r in namespace["df_one_to_many"].collect()
+        )
+        self.assertEqual(one, [(1, "a1", "r1"), (1, "a2", "r1"), (2, "b1", None)])
+        many = sorted(
+            (r.id, r.lv, r.xv) for r in namespace["df_many_to_many"].collect()
+        )
+        self.assertEqual(
+            many,
+            [(1, "a1", "x1"), (1, "a2", "x2"), (1, "a2", "x3"), (2, "b1", "y1")],
+        )
+        self.assertEqual(
+            [(r.id, r.rv) for r in namespace["df_only_right"].collect()],
+            [(3, "r3")],
+        )
+        self.assertNotIn("inl", namespace["df_one_to_many"].columns)
 
     def test_common_sas_functions_execute_with_expected_values(self):
         source = """

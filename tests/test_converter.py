@@ -33,6 +33,32 @@ class ConverterTests(unittest.TestCase):
         )
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_set_concatenates_multiple_datasets_with_missing_columns(self):
+        result = self.converter.convert(
+            """
+            data work.all_records;
+              set work.first_records second_records;
+            run;
+            """
+        )
+
+        self.assertIn("df_all_records = df_first_records", result.code)
+        self.assertIn(
+            "df_all_records = df_all_records.unionByName("
+            "df_second_records, allowMissingColumns=True)",
+            result.code,
+        )
+        self.assertTrue(
+            any("Multiple SET inputs" in warning for warning in result.warnings)
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_set_rejects_duplicate_dataset_references(self):
+        with self.assertRaises(ConversionError) as context:
+            self.converter.convert("data out; set source work.source; run;")
+
+        self.assertIn("SET input datasets must have distinct names", str(context.exception))
+
     def test_sas_version_marker_selects_legacy_profile(self):
         result = self.converter.convert(
             "/* sas2pyspark: sas-version=9.4M8 */ "
@@ -137,12 +163,24 @@ class ConverterTests(unittest.TestCase):
                 "%DO block is missing %END",
             ),
             (
-                "%let source=people; data out; set &&source; run;",
-                "Indirect or repeated ampersand",
+                "%let source=people; data out; set &&missing&source; run;",
+                "Undefined macro variable",
             ),
             (
-                "%let source=%upcase(people); data out; set &source; run;",
-                "Macro calls and macro-language expressions",
+                "%let source=%substr(people,1); data out; set &source; run;",
+                "Macro calls and macro-language statements",
+            ),
+            (
+                "%let n=%eval(1.5+1); data out; set input; run;",
+                "integer arithmetic only",
+            ),
+            (
+                "%let n=%sysfunc(today()); data out; set input; run;",
+                "unsupported",
+            ),
+            (
+                "%let i=0; %do %while (&i lt 1); %end; data out; set input; run;",
+                "iteration limit",
             ),
             (
                 "%let =people; data out; set input; run;",
@@ -242,6 +280,37 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("F.expr('2')", result.code)
         self.assertIn("df_fallback = df_people", fallback.code)
         self.assertNotIn("df_output1", fallback.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_macro_eval_sysfunc_while_until_and_indirect_references(self):
+        result = self.converter.convert(
+            """
+            %let base=work.people;
+            %let count=%eval(2 * (3 + 1) - 5);
+            %let name=%sysfunc(upcase(adults));
+            %let part1=alpha;
+            %let part2=beta;
+            %let i=1;
+            %let total=0;
+            %do %while (&i le 3);
+              %let total=%eval(&total + &i);
+              %let i=%eval(&i + 1);
+            %end;
+            %let j=1;
+            %do %until (&j ge 2);
+              %let j=%eval(&j + 1);
+            %end;
+            %do k=1 %to 2;
+              data work.&&part&k;
+                set &base;
+                tag = &count + &total + &j + %sysfunc(max(1, 7)) + %sysfunc(round(3.6));
+              run;
+            %end;
+            """
+        )
+        self.assertIn("df_alpha = df_people", result.code)
+        self.assertIn("df_beta = df_people", result.code)
+        self.assertIn("F.expr('3 + 6 + 2 + 7 + 4')", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_macro_if_simple_actions_and_else_branch(self):
@@ -344,6 +413,23 @@ class ConverterTests(unittest.TestCase):
         self.assertTrue(any("row order is unspecified" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_retain_multiple_declarations_and_rejections(self):
+        result = self.converter.convert(
+            "data o; retain a b 0; retain c 5; set s; a = a + x; b = b + 1; c = c + x; run;"
+        )
+        self.assertEqual(result.code.count("F.sum("), 3)
+        compile(result.code, "<generated-pyspark>", "exec")
+        for source, message in (
+            ("data o; retain a 0 a 1; set s; a = a + 1; run;", "more than once"),
+            ("data o; retain a b 0; set s; a = a + 1; run;", "accumulator assignment: b"),
+            ("data o; retain 0; set s; run;", "must follow a variable"),
+            ("data o; retain a 0 b; set s; a = a + 1; run;", "numeric literal initial"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(message, str(context.exception))
+
     def test_retain_rejects_unmodeled_state(self):
         unsupported_sources = (
             (
@@ -356,7 +442,7 @@ class ConverterTests(unittest.TestCase):
             ),
             (
                 "data out; retain total 0; set source; total=total+amount; if active; run;",
-                "one accumulator assignment",
+                "accumulator and simple assignment",
             ),
             (
                 "data out; retain total 0; set source; run;",
@@ -521,6 +607,184 @@ class ConverterTests(unittest.TestCase):
         )
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_proc_sort_dupout_nodup_and_where(self):
+        result = self.converter.convert(
+            """
+            proc sort data=work.people out=work.unique dupout=work.dups nodupkey;
+              where score ge 10;
+              by name;
+            run;
+            proc sort data=work.people out=work.distinct noduprecs;
+              by name;
+            run;
+            """
+        )
+        self.assertIn("filter(F.expr('(score >= 10)'))", result.code)
+        self.assertIn("df_dups = df_unique__ranked.filter(", result.code)
+        self.assertIn("dropDuplicates()", result.code)
+        self.assertTrue(
+            any("removes only adjacent" in warning for warning in result.warnings)
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+        for source, message in (
+            ("proc sort data=a dupout=b; by x; run;", "requires NODUPKEY or NODUP"),
+            ("proc sort data=a nodup nodupkey dupout=b; by x; run;", "both NODUPKEY and NODUP"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(message, str(context.exception))
+
+    def test_proc_append_and_datasets(self):
+        result = self.converter.convert(
+            """
+            proc append base=work.big data=work.small force;
+            run;
+            proc datasets lib=work nolist;
+              change tmp=final;
+              delete scratch;
+              append base=big data=small;
+            quit;
+            """
+        )
+        self.assertIn("df_big = df_big.unionByName(df_small, allowMissingColumns=True)", result.code)
+        self.assertIn("df_final = df_tmp", result.code)
+        self.assertIn("dropTempView('scratch')", result.code)
+        self.assertIn("allowMissingColumns=False", result.code)
+        self.assertTrue(any("APPEND FORCE" in w for w in result.warnings))
+        compile(result.code, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc append data=a; run;")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc datasets lib=work; modify a; run;")
+
+    def test_libname_is_accepted_and_include_is_inlined(self):
+        import tempfile
+        from pathlib import Path
+
+        result = self.converter.convert(
+            "libname mylib 'C:/data';\nlibname old clear;\n"
+            "data mylib.b; set mylib.a; run;"
+        )
+        self.assertIn("# LIBNAME mylib", result.code)
+        self.assertIn("df_b = df_a", result.code)
+        self.assertTrue(any("LIBNAME mylib" in w for w in result.warnings))
+        with self.assertRaises(ConversionError):
+            self.converter.convert("libname bad;")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sub").mkdir()
+            (root / "sub" / "inner.sas").write_text("data c; set a; run;\n", encoding="utf-8")
+            (root / "part.sas").write_text("%include 'sub/inner.sas';\n", encoding="utf-8")
+            (root / "loop.sas").write_text("%include 'loop.sas';\n", encoding="utf-8")
+            result = self.converter.convert("%include 'part.sas';\n", include_dir=root)
+            self.assertIn("df_c = df_a", result.code)
+            with self.assertRaises(ConversionError) as ctx:
+                self.converter.convert("%include '../x.sas';", include_dir=root / "sub", include_root=root / "sub")
+            self.assertIn("escapes", str(ctx.exception))
+            with self.assertRaises(ConversionError) as ctx:
+                self.converter.convert("%include 'loop.sas';", include_dir=root)
+            self.assertIn("Circular", str(ctx.exception))
+            with self.assertRaises(ConversionError):
+                self.converter.convert("%include 'missing.sas';", include_dir=root)
+        with self.assertRaises(ConversionError):
+            self.converter.convert("%include 'x.sas';")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("%let f=x; %include &f;", include_dir=".")
+
+    def test_proc_format_value_and_put(self):
+        result = self.converter.convert(
+            """
+            proc format;
+              value agegrp low-<18='Minor' 18-64='Adult' 65-high='Senior' .='Unknown';
+              value $region 'N','S'='Ns' other='Other';
+            run;
+            data work.out;
+              set work.people;
+              grp = put(age, agegrp.);
+              reg = put(code, $region.);
+              format age agegrp.;
+            run;
+            """
+        )
+        self.assertIn("'Minor'", result.code)
+        self.assertIn("(age) >= 65", result.code)
+        self.assertIn("(code) = 'N' OR (code) = 'S'", result.code)
+        self.assertIn("ELSE 'Other'", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc format; picture p low-high='9'; run;")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc format; value f 'a'=1; run;")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc format library=x; run;")
+
+    def test_multi_output_data_step_is_split_per_target(self):
+        result = self.converter.convert(
+            """
+            data work.high work.mid work.low;
+              set work.scores;
+              band = score / 10;
+              if score >= 80 then output high;
+              else if score >= 50 then output mid;
+              else output low;
+            run;
+            data work.copy_a work.copy_b;
+              set work.scores;
+              output;
+            run;
+            data work.only;
+              set work.scores;
+              if score > 1 then output;
+            run;
+            """
+        )
+        self.assertIn("df_high = df_scores", result.code)
+        self.assertIn("df_low = df_scores", result.code)
+        self.assertIn("coalesce(NOT (score >= 80), true)", result.code)
+        self.assertIn("df_copy_b = df_scores", result.code)
+        self.assertIn("createOrReplaceTempView('only')", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+        for source, message in (
+            ("data a b; set s; if x then output a; y = 1; run;", "last statements"),
+            ("data a b; set s; if x then output a; run;", "never written"),
+            ("data a b; set s; if x then output c; run;", "not listed"),
+            (
+                "data a b; set s; if x then output a b; if y then output a; run;",
+                "more than one OUTPUT",
+            ),
+            ("data a; set s; else output a; run;", "no preceding IF"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(message, str(context.exception))
+
+    def test_means_defaults_median_range_and_univariate(self):
+        result = self.converter.convert(
+            """
+            proc means data=work.t;
+              var x;
+            run;
+            proc summary data=work.t median range;
+              class g;
+              var x;
+              output out=work.s median=med range=rng;
+            run;
+            proc univariate data=work.t;
+              var x y;
+            run;
+            """
+        )
+        self.assertIn("defaulted to N, MEAN", result.code)
+        self.assertIn("F.median(F.col('x')).alias('med')", result.code)
+        self.assertIn("(F.max(F.col('x')) - F.min(F.col('x'))).alias('rng')", result.code)
+        self.assertIn("F.median(F.col('y')).alias('median_y')", result.code)
+        self.assertTrue(any("UNIVARIATE" in w for w in result.warnings))
+        compile(result.code, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc univariate data=t normal; var x; run;")
+
     def test_proc_freq_generates_one_way_and_two_way_tables(self):
         result = self.converter.convert(
             """
@@ -644,12 +908,56 @@ class ConverterTests(unittest.TestCase):
         self.assertNotIn(".isNotNull()", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_sql_calculated_and_into_macro(self):
+        code = SasToPySparkConverter().convert(
+            "proc sql; create table o as select x*2 as dbl, "
+            "calculated dbl + 1 as d2 from a where calculated dbl > 3; quit;"
+        ).code
+        self.assertIn("(x*2) + 1 as d2", code)
+        self.assertIn("(x*2) > 3", code)
+        with self.assertRaises(ConversionError):
+            SasToPySparkConverter().convert(
+                "proc sql; create table o as select calculated nope from a; quit;"
+            )
+        with self.assertRaises(ConversionError) as caught:
+            SasToPySparkConverter().convert(
+                "proc sql noprint; select max(x) into :mx from a; quit;"
+            )
+        self.assertIn("INTO :macro", caught.exception.message)
+
+    def test_macro_upcase_str_global_local(self):
+        source = """
+%macro setup();
+  %global region;
+  %local tmp;
+  %let tmp = x;
+  %let region = %upcase(west);
+  %let hidden = %str(a b);
+%mend;
+%setup();
+data out;
+  set sales;
+  where region = "&region";
+  label2 = "%lowcase(ABC)";
+run;
+"""
+        result = SasToPySparkConverter().convert(source)
+        self.assertIn('region = "WEST"', result.code)
+        self.assertIn('"abc"', result.code)
+        with self.assertRaises(ConversionError):
+            SasToPySparkConverter().convert(
+                source.replace('"&region"', '"&hidden"')
+            )
+        with self.assertRaises(ConversionError):
+            SasToPySparkConverter().convert(
+                "data a; set b; call symput('x', y); run;"
+            )
+
     def test_proc_means_and_summary_reject_unsupported_forms(self):
         unsupported_sources = (
             ("proc means; var amount; run;", "requires DATA="),
-            ("proc means data=sales; var amount; run;", "requires at least one"),
             ("proc means data=sales n;", "is missing RUN"),
-            ("proc means data=sales median; var amount; run;", "Unsupported"),
+            ("proc means data=sales skew; var amount; run;", "Unsupported"),
             (
                 "proc means data=sales n; class region; run;",
                 "requires one VAR statement",
@@ -939,16 +1247,113 @@ class ConverterTests(unittest.TestCase):
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
 
-    def test_conditional_assignment_rejects_unsupported_forms(self):
+    def test_if_without_else_and_else_if_chains(self):
+        no_else = self.converter.convert(
+            "data out; set source; if score gt 0 then grade = 'A'; run;"
+        )
+        self.assertIn("'grade' in df_out.columns", no_else.code)
+        chain = self.converter.convert(
+            "data out; set source; if score gt 90 then g = 'A'; "
+            "else if score gt 80 then g = 'B'; else g = 'C'; run;"
+        )
+        self.assertIn("F.when(F.expr('score > 90')", chain.code)
+        self.assertIn("F.when(F.expr('score > 80')", chain.code)
+        partial = self.converter.convert(
+            "data out; set source; if a gt 1 then g = 1; else if a gt 0 then g = 2; run;"
+        )
+        for result in (no_else, chain, partial):
+            compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_date_functions_and_literals_translate(self):
+        result = self.converter.convert(
+            """
+            data out;
+              set source;
+              format d date9.;
+              when_made = mdy(month, day, year);
+              gap = intck('month', '01JAN2024'd, d);
+              nxt = intnx('month', d, 1, 'end');
+              text = put(d, yymmdd10.);
+              back = input(text, yymmdd10.);
+            run;
+            """
+        )
+        self.assertIn("DATE'2024-01-01'", result.code)
+        self.assertIn("last_day(add_months(", result.code)
+        self.assertIn("date_format(CAST(d AS DATE), 'yyyy-MM-dd')", result.code)
+        self.assertTrue(any("FORMAT statement" in w for w in result.warnings))
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_date_functions_reject_unsupported_forms(self):
+        unsupported_sources = (
+            ("data o; set s; x = intck(unit, a, b); run;", "must be a quoted literal"),
+            ("data o; set s; x = intck('hour', a, b); run;", "interval 'HOUR' is unsupported"),
+            ("data o; set s; x = intnx('month', a, 1, 'middle'); run;", "alignment"),
+            ("data o; set s; x = put(a, comma12.2); run;", "unsupported"),
+            ("data o; set s; x = input(a, anydtdte.); run;", "unsupported"),
+            ("data o; set s; x = datdif(a, b, '30/360'); run;", "ACT/ACT"),
+            ("data o; set s; x = '31FOO2024'd; run;", "Invalid SAS date literal"),
+            ("data o; set s; format d comma12.; run;", "unsupported"),
+            ("data o; set s; format d; run;", "FORMAT supports"),
+        )
+        for source, expected_message in unsupported_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(expected_message, str(context.exception))
+
+    def test_if_then_do_blocks_and_delete_rewrite_to_conditionals(self):
+        result = self.converter.convert(
+            """
+            data out;
+              set source;
+              if score ge 90 then do;
+                grade = 'A';
+                bonus = 10;
+              end;
+              else if score ge 80 then do;
+                grade = 'B';
+                bonus = 5;
+              end;
+              else do;
+                grade = 'C';
+                bonus = 0;
+              end;
+              if status = 'X' then delete;
+            run;
+            """
+        )
+        self.assertIn("F.when(F.expr('(score >= 90)')", result.code)
+        self.assertIn("coalesce", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_if_then_do_rejects_unsafe_forms(self):
         unsupported_sources = (
             (
-                "data out; set source; if score gt 0 then grade = 'A'; run;",
-                "requires a following ELSE assignment",
+                "data out; set s; if a gt 1 then do; if b gt 1 then c = 1; end; run;",
+                "nested DO, SELECT and IF/ELSE",
             ),
             (
-                "data out; set source; if score gt 0 then output; else output; run;",
-                "branches must each be a simple assignment",
+                "data out; set s; if a gt 1 then do; a = 2; b = 3; end; run;",
+                "references 'a'",
             ),
+            (
+                "data out; set s; if a gt 1 then do; c = 2;",
+                "missing END",
+            ),
+            (
+                "data out; set s; if a gt 1 then do; output; end; run;",
+                "simple assignment",
+            ),
+        )
+        for source, expected_message in unsupported_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(expected_message, str(context.exception))
+
+    def test_conditional_assignment_rejects_unsupported_forms(self):
+        unsupported_sources = (
             (
                 "data out; set source; if score gt 0 then grade = 'A'; else level = 'B'; run;",
                 "must assign the same column",
@@ -1012,10 +1417,6 @@ class ConverterTests(unittest.TestCase):
                 "exactly one OUTPUT",
             ),
             (
-                "data out; set source; output; run;",
-                "OUTPUT is supported only",
-            ),
-            (
                 "data out; set source; do index = 1 to 5; output; end; value = index; run;",
                 "must be the final data-processing statement",
             ),
@@ -1037,11 +1438,12 @@ class ConverterTests(unittest.TestCase):
             """
         )
         self.assertIn("__sas2pyspark_merge_inputs = [df_left_data, df_right_data]", result.code)
-        self.assertIn("requires unique keys in every input DataFrame", result.code)
+        self.assertIn("F.row_number().over(", result.code)
+        self.assertIn("F.least(", result.code)
         self.assertIn(".eqNullSafe(", result.code)
-        self.assertIn("'full_outer'", result.code)
+        self.assertIn("'left'", result.code)
         self.assertIn("otherwise(__sas2pyspark_value)", result.code)
-        self.assertIn(".orderBy(F.col('customer_id').asc())", result.code)
+        self.assertIn(".orderBy(F.col('customer_id').asc(), F.col('__sas2pyspark_k').asc())", result.code)
         self.assertIn("createOrReplaceTempView('combined')", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
@@ -1055,10 +1457,28 @@ class ConverterTests(unittest.TestCase):
             """
         )
         self.assertIn(
-            ".orderBy(F.col('period').desc(), F.col('region').asc())",
+            ".orderBy(F.col('period').desc(), F.col('region').asc(), F.col('__sas2pyspark_k').asc())",
             result.code,
         )
         compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_merge_in_flags_are_parsed_and_dropped(self):
+        result = self.converter.convert(
+            """
+            data out;
+              merge left(in=a) right (in = b);
+              by id;
+              if a and b=1;
+            run;
+            """
+        )
+        self.assertIn("alias('a')", result.code)
+        self.assertIn("alias('b')", result.code)
+        self.assertIn("a AND b", result.code)
+        self.assertIn(".drop(*['a', 'b'])", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("data o; merge l(in=a) r(in=a); by id; run;")
 
     def test_merge_by_rejects_unsupported_forms(self):
         unsupported_sources = (
@@ -1091,7 +1511,7 @@ class ConverterTests(unittest.TestCase):
                 "MERGE and BY must appear before",
             ),
             (
-                "data out; merge left(in=a) right; by id; run;",
+                "data out; merge left(keep=a) right; by id; run;",
                 "Unsupported SAS dataset reference",
             ),
         )
@@ -1216,10 +1636,10 @@ class ConverterTests(unittest.TestCase):
     def test_unsupported_data_step_statement_reports_its_line(self):
         with self.assertRaises(ConversionError) as context:
             self.converter.convert(
-                "data output;\n  set input;\n  output;\nrun;"
+                "data output;\n  set input;\n  put x;\nrun;"
             )
         self.assertIn("SAS line 3:", str(context.exception))
-        self.assertIn("> output", str(context.exception))
+        self.assertIn("> put x", str(context.exception))
 
     def test_missing_block_terminator_fails_explicitly(self):
         with self.assertRaises(ConversionError) as context:

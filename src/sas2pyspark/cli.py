@@ -864,7 +864,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         source = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
         result = SasToPySparkConverter().convert(
-            source, sas_version=args.sas_version
+            source,
+            sas_version=args.sas_version,
+            include_dir=None if args.input == "-" else Path(args.input).resolve().parent,
         )
     except (OSError, UnicodeError, ConversionError) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)
