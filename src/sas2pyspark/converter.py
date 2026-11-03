@@ -11,6 +11,7 @@ from .macro_processor import (
     MacroStatement as _Statement,
     expand_macros,
 )
+from .sas_parser import SasParseError, parse_program
 
 
 class ConversionError(ValueError):
@@ -33,6 +34,106 @@ class ConversionResult:
 
     code: str
     warnings: tuple[str, ...] = ()
+    source_version: str = "Viya"
+    version_source: str = "default"
+
+
+_SAS_VERSION_PROFILES = {"9.4m8": "9.4M8", "viya": "Viya"}
+_SAS_VERSION_MARKER = re.compile(
+    r"^\s*sas2pyspark\s*:\s*sas-version\s*=\s*([^*\s]+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _sas_version_markers(source: str) -> list[str]:
+    markers: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if quote is not None:
+            if char == quote:
+                if index + 1 < len(source) and source[index + 1] == quote:
+                    index += 1
+                else:
+                    quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end < 0:
+                break
+            body = source[index + 2 : end]
+            if "sas2pyspark" in body.casefold() and "sas-version" in body.casefold():
+                match = _SAS_VERSION_MARKER.fullmatch(body)
+                if match is None:
+                    raise ConversionError("Malformed sas2pyspark SAS version marker.")
+                markers.append(match.group(1).casefold())
+            index = end + 1
+        index += 1
+    return markers
+
+
+def _resolve_sas_version(
+    source: str, requested_version: str
+) -> tuple[str, str, str | None]:
+    if not isinstance(requested_version, str):
+        raise ConversionError("SAS version selection must be a string.")
+    requested_key = requested_version.casefold()
+    if requested_key != "auto" and requested_key not in _SAS_VERSION_PROFILES:
+        supported = ", ".join(("auto", *_SAS_VERSION_PROFILES.values()))
+        raise ConversionError(
+            f"Unsupported SAS source version {requested_version!r}; "
+            f"choose one of {supported}."
+        )
+
+    marker_values = _sas_version_markers(source)
+    marker_versions = {
+        _SAS_VERSION_PROFILES.get(value) for value in marker_values
+    }
+    if None in marker_versions:
+        invalid_value = next(
+            value for value in marker_values if value not in _SAS_VERSION_PROFILES
+        )
+        raise ConversionError(
+            f"Unsupported SAS version in sas2pyspark source marker: "
+            f"{invalid_value!r}."
+        )
+    if len(marker_versions) > 1:
+        raise ConversionError(
+            "SAS source contains conflicting sas2pyspark version markers."
+        )
+
+    marker_version = next(iter(marker_versions), None)
+    if requested_key != "auto":
+        selected_version = _SAS_VERSION_PROFILES[requested_key]
+        if marker_version is not None and marker_version != selected_version:
+            raise ConversionError(
+                f"Requested SAS version {selected_version} conflicts with source "
+                f"marker {marker_version}."
+            )
+        return (
+            selected_version,
+            "override",
+            f"SAS version profile: {selected_version} selected by override. "
+            "Per-release syntax and semantic gates are not implemented yet; "
+            "the selection records the asserted source release only.",
+        )
+    if marker_version is not None:
+        return (
+            marker_version,
+            "marker",
+            f"SAS version profile: {marker_version} selected by source marker. "
+            "Per-release syntax and semantic gates are not implemented yet; "
+            "the marker records the asserted source release only.",
+        )
+    return (
+        "Viya",
+        "default",
+        "SAS version profile: source version was not declared; selected the "
+        "Viya compatibility profile. Per-release syntax and semantic gates "
+        "are not implemented yet.",
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +149,7 @@ class _DataAction:
     loop_assignments: tuple[tuple[str, str], ...] = ()
     merge_sources: tuple[str, ...] = ()
     merge_keys: tuple[str, ...] = ()
+    merge_directions: tuple[bool, ...] = ()
     branches: tuple[tuple[str, str], ...] = ()
     retain_initial: str | None = None
     retain_partition: tuple[str, ...] = ()
@@ -75,113 +177,6 @@ _PROC_IMPORT_TOKEN = re.compile(
     r"([A-Za-z_]\w*)\s*=\s*(\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[^\s]+)"
     r"|([A-Za-z_]\w*)"
 )
-
-
-def _strip_comments(source: str) -> str:
-    """Remove SAS block and statement comments without changing quoted text."""
-    output: list[str] = []
-    index = 0
-    quote: str | None = None
-    quote_line: int | None = None
-    statement_start = True
-    line = 1
-    while index < len(source):
-        char = source[index]
-        if quote:
-            output.append(char)
-            if char == quote:
-                if index + 1 < len(source) and source[index + 1] == quote:
-                    output.append(source[index + 1])
-                    index += 1
-                else:
-                    quote = None
-                    quote_line = None
-        elif char in ("'", '"'):
-            quote = char
-            quote_line = line
-            output.append(char)
-            statement_start = False
-        elif source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            if end < 0:
-                raise ConversionError(
-                    "Unterminated SAS block comment.",
-                    line=source.count("\n", 0, index) + 1,
-                )
-            comment = source[index : end + 2]
-            output.append(" " + "\n" * comment.count("\n"))
-            line += comment.count("\n")
-            index = end + 1
-        elif char == "*" and statement_start:
-            end = source.find(";", index + 1)
-            if end < 0:
-                raise ConversionError(
-                    "Unterminated SAS statement comment.",
-                    line=source.count("\n", 0, index) + 1,
-                )
-            comment = source[index : end + 1]
-            output.append(" " + "\n" * comment.count("\n"))
-            line += comment.count("\n")
-            index = end
-        else:
-            output.append(char)
-            if char == ";":
-                statement_start = True
-            elif not char.isspace():
-                statement_start = False
-        if char == "\n":
-            line += 1
-        index += 1
-    if quote:
-        raise ConversionError(
-            "Unterminated quoted string.",
-            line=quote_line,
-        )
-    return "".join(output)
-
-
-def _statements(source: str) -> list[_Statement]:
-    """Split SAS source at semicolons outside quoted strings."""
-    source = _strip_comments(source)
-    result: list[_Statement] = []
-    current: list[str] = []
-    quote: str | None = None
-    index = 0
-    line = 1
-    statement_line = 1
-    while index < len(source):
-        char = source[index]
-        if quote:
-            current.append(char)
-            if char == quote:
-                if index + 1 < len(source) and source[index + 1] == quote:
-                    current.append(source[index + 1])
-                    index += 1
-                else:
-                    quote = None
-        elif char in ("'", '"'):
-            quote = char
-            current.append(char)
-        elif char == ";":
-            statement = "".join(current).strip()
-            if statement:
-                result.append(_Statement(statement, statement_line))
-            current = []
-            statement_line = line
-        else:
-            current.append(char)
-        if char == "\n":
-            line += 1
-            if not "".join(current).strip():
-                statement_line = line
-        index += 1
-    if "".join(current).strip():
-        raise ConversionError(
-            "Every SAS statement must end with a semicolon.",
-            line=statement_line,
-            statement="".join(current).strip(),
-        )
-    return result
 
 
 def _dataset_name(value: str) -> str:
@@ -536,9 +531,24 @@ def _render_function(name: str, arguments: list[str]) -> str:
 class SasToPySparkConverter:
     """Convert supported SAS DATA steps and procedures into PySpark."""
 
-    def convert(self, source: str) -> ConversionResult:
+    def convert(self, source: str, *, sas_version: str = "auto") -> ConversionResult:
+        selected_version, version_source, version_warning = _resolve_sas_version(
+            source, sas_version
+        )
         try:
-            statements = expand_macros(_statements(source))
+            parsed_program = parse_program(source)
+            statements = expand_macros(
+                [
+                    _Statement(statement.text, statement.span.start_line)
+                    for statement in parsed_program.statements
+                ]
+            )
+        except SasParseError as error:
+            raise ConversionError(
+                error.message,
+                line=error.line,
+                statement=error.statement,
+            ) from error
         except MacroExpansionError as error:
             raise ConversionError(
                 error.message,
@@ -551,6 +561,8 @@ class SasToPySparkConverter:
             "",
         ]
         warnings: list[str] = []
+        if version_warning:
+            warnings.append(version_warning)
         index = 0
         sql_count = 0
         freq_count = 0
@@ -611,7 +623,12 @@ class SasToPySparkConverter:
                     error.message, line=statement.line, statement=statement.text
                 ) from error
 
-        return ConversionResult("\n".join(output).rstrip() + "\n", tuple(warnings))
+        return ConversionResult(
+            "\n".join(output).rstrip() + "\n",
+            tuple(warnings),
+            source_version=selected_version,
+            version_source=version_source,
+        )
 
     def _convert_data_step(
         self, statements: list[_Statement], start: int
@@ -624,6 +641,7 @@ class SasToPySparkConverter:
         source: str | None = None
         merge_sources: tuple[str, ...] | None = None
         merge_keys: tuple[str, ...] | None = None
+        merge_directions: tuple[bool, ...] | None = None
         where_filters: list[str] = []
         actions: list[_DataAction] = []
         keep: list[str] | None = None
@@ -759,34 +777,52 @@ class SasToPySparkConverter:
                             "MERGE input datasets must have distinct names."
                         )
                 elif lower.startswith("by "):
-                    keys = statement[3:].split()
-                    if not keys or any(
-                        not re.fullmatch(r"[A-Za-z_]\w*", key) for key in keys
-                    ):
-                        raise ConversionError("BY requires simple column names.")
-                    if any(key.lower() in {"ascending", "descending"} for key in keys):
+                    tokens = statement[3:].split()
+                    keys: list[tuple[str, bool]] = []
+                    descending = False
+                    direction_pending = False
+                    for token in tokens:
+                        if token.lower() in {"ascending", "descending"}:
+                            if direction_pending:
+                                raise ConversionError(
+                                    "BY order direction must be followed by one column."
+                                )
+                            descending = token.lower() == "descending"
+                            direction_pending = True
+                            continue
+                        if not re.fullmatch(r"[A-Za-z_]\w*", token):
+                            raise ConversionError("BY requires simple column names.")
+                        keys.append((token, not descending))
+                        descending = False
+                        direction_pending = False
+                    if direction_pending:
                         raise ConversionError(
-                            "BY ascending/descending order specifications are "
-                            "unsupported."
+                            "BY order direction must be followed by one column."
                         )
-                    if len({key.lower() for key in keys}) != len(keys):
+                    if not keys:
+                        raise ConversionError("BY requires simple column names.")
+                    key_names = tuple(key for key, _ in keys)
+                    key_directions = tuple(ascending for _, ascending in keys)
+                    if len({key.lower() for key in key_names}) != len(keys):
                         raise ConversionError("BY column names must be distinct.")
                     if merge_sources is not None:
                         if merge_keys is not None:
                             raise ConversionError(
                                 "MERGE supports only one BY statement."
                             )
-                        merge_keys = tuple(keys)
+                        merge_keys = key_names
+                        merge_directions = key_directions
                         actions.append(
                             _DataAction(
                                 kind="merge",
                                 expression="",
                                 merge_sources=merge_sources,
                                 merge_keys=merge_keys,
+                                merge_directions=merge_directions,
                             )
                         )
                     elif source is not None and by_columns is None:
-                        by_columns = tuple(keys)
+                        by_columns = key_names
                     else:
                         raise ConversionError(
                             "BY is supported once after SET or MERGE."
@@ -1279,7 +1315,14 @@ class SasToPySparkConverter:
                     )
         for action in actions:
             if action.kind == "merge":
-                lines.extend(self._render_merge(target, action.merge_sources, action.merge_keys))
+                lines.extend(
+                    self._render_merge(
+                        target,
+                        action.merge_sources,
+                        action.merge_keys,
+                        action.merge_directions,
+                    )
+                )
             elif action.kind == "filter":
                 lines.append(
                     f"{_python_name(target)} = {_python_name(target)}.filter(F.expr({action.expression!r}))"
@@ -1437,7 +1480,10 @@ class SasToPySparkConverter:
 
     @staticmethod
     def _render_merge(
-        target: str, sources: tuple[str, ...], keys: tuple[str, ...]
+        target: str,
+        sources: tuple[str, ...],
+        keys: tuple[str, ...],
+        directions: tuple[bool, ...],
     ) -> list[str]:
         """Generate a guarded full-outer merge for unique SAS BY keys."""
         target_frame = _python_name(target)
@@ -1510,7 +1556,10 @@ class SasToPySparkConverter:
             "            __sas2pyspark_value = F.when(__sas2pyspark_present, __sas2pyspark_source_value).otherwise(__sas2pyspark_value)",
             "    __sas2pyspark_merge_selection.append(__sas2pyspark_value.alias(__sas2pyspark_column))",
             f"{target_frame} = __sas2pyspark_merge_joined.select(*__sas2pyspark_merge_selection).orderBy("
-            + ", ".join(f"F.col({key!r}).asc()" for key in keys)
+            + ", ".join(
+                f"F.col({key!r}).{'asc' if ascending else 'desc'}()"
+                for key, ascending in zip(keys, directions)
+            )
             + ")",
             "",
         ]
@@ -1618,10 +1667,13 @@ class SasToPySparkConverter:
         self, statements: list[_Statement], start: int, freq_count: int
     ) -> tuple[list[str], int, int]:
         data: str | None = None
+        include_missing = False
         header_options = statements[start].text[len("proc freq") :].strip().split()
         for option in header_options:
             if option.lower().startswith("data="):
                 data = _dataset_name(option[5:])
+            elif option.lower() == "missing":
+                include_missing = True
             else:
                 raise ConversionError(f"Unsupported PROC FREQ option: {option!r}.")
 
@@ -1690,14 +1742,21 @@ class SasToPySparkConverter:
         order = ", ".join(
             f"F.col({column!r}).asc()" for column in table_columns
         )
-        nonmissing = " & ".join(
-            f"F.col({column!r}).isNotNull()" for column in table_columns
-        )
+        input_frame = frame
+        if not include_missing:
+            nonmissing = " & ".join(
+                f"F.col({column!r}).isNotNull()" for column in table_columns
+            )
+            input_frame = f"__sas2pyspark_freq_input_{freq_count}"
         lines = [
             "from pyspark.sql import Window as __sas2pyspark_window",
-            f"__sas2pyspark_freq_counts = {frame}.filter({nonmissing}).groupBy("
-            f"{column_selection}).agg(F.count(F.lit(1)).alias('COUNT'))",
         ]
+        if not include_missing:
+            lines.append(f"{input_frame} = {frame}.filter({nonmissing})")
+        lines.append(
+            f"__sas2pyspark_freq_counts = {input_frame}.groupBy("
+            f"{column_selection}).agg(F.count(F.lit(1)).alias('COUNT'))",
+        )
         total = "F.sum(F.col('COUNT')).over(__sas2pyspark_window.partitionBy())"
         lines.append(
             f"{frequency_frame} = __sas2pyspark_freq_counts.withColumn("
@@ -1738,6 +1797,7 @@ class SasToPySparkConverter:
         header_options = statements[start].text.split()[2:]
         data: str | None = None
         statistics: list[str] = []
+        include_missing_class = False
         supported_statistics = {
             "n",
             "nmiss",
@@ -1755,6 +1815,8 @@ class SasToPySparkConverter:
                 if data is not None:
                     raise ConversionError("PROC MEANS/SUMMARY accepts DATA= only once.")
                 data = _dataset_name(option[5:])
+            elif option.lower() == "missing":
+                include_missing_class = True
             elif option.lower() in supported_statistics:
                 statistic = option.lower()
                 if statistic in statistics:
@@ -1938,13 +2000,18 @@ class SasToPySparkConverter:
 
         lines: list[str] = []
         if class_columns:
-            class_filter = " & ".join(
-                f"F.col({column!r}).isNotNull()" for column in class_columns
-            )
             class_selection = ", ".join(
                 f"F.col({column!r})" for column in class_columns
             )
-            lines.append(f"__sas2pyspark_means_input = {frame}.filter({class_filter})")
+            if include_missing_class:
+                lines.append(f"__sas2pyspark_means_input = {frame}")
+            else:
+                class_filter = " & ".join(
+                    f"F.col({column!r}).isNotNull()" for column in class_columns
+                )
+                lines.append(
+                    f"__sas2pyspark_means_input = {frame}.filter({class_filter})"
+                )
             lines.append(
                 f"{target_frame} = __sas2pyspark_means_input.groupBy("
                 f"{class_selection}).agg({', '.join(aggregates)})"
@@ -2428,6 +2495,6 @@ class SasToPySparkConverter:
         ).strip()
 
 
-def convert_sas(source: str) -> ConversionResult:
+def convert_sas(source: str, *, sas_version: str = "auto") -> ConversionResult:
     """Convenience function for converting SAS source text."""
-    return SasToPySparkConverter().convert(source)
+    return SasToPySparkConverter().convert(source, sas_version=sas_version)

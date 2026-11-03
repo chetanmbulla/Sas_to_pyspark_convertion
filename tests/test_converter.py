@@ -25,7 +25,86 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("F.expr('upper(first)')", result.code)
         self.assertIn(".select(*['full_name', 'age'])", result.code)
         self.assertIn("createOrReplaceTempView('adults')", result.code)
+        self.assertTrue(
+            any(
+                "source version was not declared" in warning
+                for warning in result.warnings
+            )
+        )
         compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_sas_version_marker_selects_legacy_profile(self):
+        result = self.converter.convert(
+            "/* sas2pyspark: sas-version=9.4M8 */ "
+            "data out; set source; run;"
+        )
+        self.assertEqual(result.source_version, "9.4M8")
+        self.assertEqual(result.version_source, "marker")
+        self.assertTrue(
+            any("selected by source marker" in warning for warning in result.warnings)
+        )
+
+    def test_sas_version_marker_text_inside_a_string_is_ignored(self):
+        result = self.converter.convert(
+            "data out; set source; note='/* sas2pyspark: sas-version=9.4M8 */'; run;"
+        )
+        self.assertEqual(result.source_version, "Viya")
+        self.assertEqual(result.version_source, "default")
+
+    def test_sas_version_override_and_default_are_reported(self):
+        overridden = self.converter.convert(
+            "data out; set source; run;", sas_version="9.4m8"
+        )
+        self.assertEqual(overridden.source_version, "9.4M8")
+        self.assertEqual(overridden.version_source, "override")
+
+        defaulted = self.converter.convert("data out; set source; run;")
+        self.assertEqual(defaulted.source_version, "Viya")
+        self.assertEqual(defaulted.version_source, "default")
+        self.assertTrue(
+            any(
+                "source version was not declared" in warning
+                for warning in defaulted.warnings
+            )
+        )
+
+    def test_sas_version_marker_conflicts_and_unknown_profiles_are_rejected(self):
+        invalid_sources = (
+            (
+                "/* sas2pyspark: sas-version=9.4M8 */ "
+                "data out; set source; run;",
+                {"sas_version": "Viya"},
+                "conflicts with source marker",
+            ),
+            (
+                "/* sas2pyspark: sas-version=unknown */ "
+                "data out; set source; run;",
+                {},
+                "Unsupported SAS version in sas2pyspark source marker",
+            ),
+            (
+                "/* sas2pyspark: sas-version=9.4M8 */ "
+                "/* sas2pyspark: sas-version=Viya */ "
+                "data out; set source; run;",
+                {},
+                "conflicting sas2pyspark version markers",
+            ),
+            (
+                "/* sas2pyspark: sas-version= */ data out; set source; run;",
+                {},
+                "Malformed sas2pyspark SAS version marker",
+            ),
+            (
+                "data out; set source; run;",
+                {"sas_version": "9.3"},
+                "Unsupported SAS source version",
+            ),
+        )
+        for source, options, expected_message in invalid_sources:
+            with self.subTest(source=source, options=options):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source, **options)
+                self.assertIn(expected_message, str(context.exception))
 
     def test_simple_macro_variables_expand_sequentially(self):
         result = self.converter.convert(
@@ -218,8 +297,19 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("F.monotonically_increasing_id()", result.code)
         self.assertIn("F.sum(F.col('__sas2pyspark_retain_delta')).over(", result.code)
         self.assertIn("F.lit(10.0)", result.code)
-        self.assertEqual(len(result.warnings), 1)
-        self.assertIn("Spark does not guarantee SAS observation order", result.warnings[0])
+        self.assertEqual(
+            sum(
+                not warning.startswith("SAS version profile:")
+                for warning in result.warnings
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                "Spark does not guarantee SAS observation order" in warning
+                for warning in result.warnings
+            )
+        )
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_retain_generates_by_group_reset_running_total(self):
@@ -243,7 +333,13 @@ class ConverterTests(unittest.TestCase):
             "F.sum(F.col('__sas2pyspark_retain_delta')).over(",
             result.code,
         )
-        self.assertEqual(len(result.warnings), 2)
+        self.assertEqual(
+            sum(
+                not warning.startswith("SAS version profile:")
+                for warning in result.warnings
+            ),
+            2,
+        )
         self.assertTrue(any("SAS observation order" in warning for warning in result.warnings))
         self.assertTrue(any("row order is unspecified" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
@@ -361,8 +457,9 @@ class ConverterTests(unittest.TestCase):
         )
         self.assertIn("'__sas2pyspark_first_region'", result.code)
         self.assertIn("'__sas2pyspark_last_department'", result.code)
-        self.assertEqual(len(result.warnings), 1)
-        self.assertIn("row order is unspecified", result.warnings[0])
+        self.assertTrue(
+            any("row order is unspecified" in warning for warning in result.warnings)
+        )
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_by_first_and_last_require_a_matching_by_statement(self):
@@ -375,16 +472,37 @@ class ConverterTests(unittest.TestCase):
                 "data out; set source; by group; value=first.other; run;",
                 "is not a variable in the BY statement",
             ),
-            (
-                "data out; set source; by descending group; value=first.group; run;",
-                "BY ascending/descending order specifications are unsupported",
-            ),
+            ("data out; set source; by descending; run;", "must be followed by one column"),
         )
         for source, expected_message in unsupported_sources:
             with self.subTest(source=source):
                 with self.assertRaises(ConversionError) as context:
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
+
+    def test_by_first_and_last_accept_ascending_and_descending_keys(self):
+        result = self.converter.convert(
+            """
+            data out;
+              set source;
+              by descending region ascending department;
+              is_first = first.region;
+              is_last = last.department;
+            run;
+            """
+        )
+        self.assertIn("partitionBy(F.col('region')).orderBy(", result.code)
+        self.assertIn(
+            "partitionBy(F.col('region'), F.col('department')).orderBy(",
+            result.code,
+        )
+        self.assertTrue(
+            any(
+                "best-effort observation order" in warning
+                for warning in result.warnings
+            )
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
 
     def test_proc_sort_and_nodupkey(self):
         result = self.converter.convert(
@@ -398,7 +516,9 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("partitionBy(F.col('score'), F.col('name'))", result.code)
         self.assertIn("F.col('score').desc()", result.code)
         self.assertIn("orderBy(F.col('score').desc(), F.col('name').asc())", result.code)
-        self.assertEqual(len(result.warnings), 1)
+        self.assertTrue(
+            any("tie behavior may differ" in warning for warning in result.warnings)
+        )
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_proc_freq_generates_one_way_and_two_way_tables(self):
@@ -419,6 +539,17 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("'COL_PERCENT'", result.code)
         self.assertIn("F.col('team').isNotNull()", result.code)
         self.assertIn("F.col('status').isNotNull()", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_proc_freq_missing_option_keeps_null_table_values(self):
+        result = self.converter.convert(
+            "proc freq data=work.people missing; tables team; run;"
+        )
+        self.assertIn(
+            "__sas2pyspark_freq_counts = df_people.groupBy(F.col('team'))",
+            result.code,
+        )
+        self.assertNotIn(".isNotNull()", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_proc_freq_rejects_unsupported_forms(self):
@@ -498,6 +629,19 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("F.when(F.avg(F.col('amount')) != F.lit(0)", result.code)
         self.assertIn("F.count(F.col('amount')).alias('valid_amount')", result.code)
         self.assertIn("F.avg(F.col('amount')).alias('avg_amount')", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_proc_means_missing_option_keeps_null_class_groups(self):
+        result = self.converter.convert(
+            "proc means data=work.sales n missing; "
+            "class region; var amount; run;"
+        )
+        self.assertIn("__sas2pyspark_means_input = df_sales", result.code)
+        self.assertIn(
+            "groupBy(F.col('region')).agg(F.count(F.col('amount'))",
+            result.code,
+        )
+        self.assertNotIn(".isNotNull()", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_proc_means_and_summary_reject_unsupported_forms(self):
@@ -899,6 +1043,21 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("otherwise(__sas2pyspark_value)", result.code)
         self.assertIn(".orderBy(F.col('customer_id').asc())", result.code)
         self.assertIn("createOrReplaceTempView('combined')", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_merge_by_respects_descending_key_order(self):
+        result = self.converter.convert(
+            """
+            data combined;
+              merge work.left_data work.right_data;
+              by descending period region;
+            run;
+            """
+        )
+        self.assertIn(
+            ".orderBy(F.col('period').desc(), F.col('region').asc())",
+            result.code,
+        )
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_merge_by_rejects_unsupported_forms(self):

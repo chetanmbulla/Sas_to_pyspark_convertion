@@ -19,7 +19,10 @@ gui = ["streamlit>=1.30", "pyspark>=3.5"]
 sas2pyspark = "sas2pyspark.cli:main"
 
 [tool.setuptools]
-packages = ["sas2pyspark"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

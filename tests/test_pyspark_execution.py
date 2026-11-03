@@ -346,6 +346,9 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         proc freq data=work.people;
           tables team * status / out=work.team_status_frequency;
         run;
+        proc freq data=work.people missing;
+          tables team / out=work.team_frequency_missing;
+        run;
         """
         df_people = self.spark.createDataFrame(
             [
@@ -388,6 +391,12 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual(two_way[("B", "no")][0], 1)
         self.assertAlmostEqual(two_way[("B", "no")][2], 50.0)
         self.assertAlmostEqual(two_way[("B", "no")][3], 50.0)
+        missing_rows = {
+            row.team: row.COUNT
+            for row in namespace["df_team_frequency_missing"].collect()
+        }
+        self.assertEqual(missing_rows[None], 1)
+        self.assertEqual(sum(missing_rows.values()), 7)
 
     def test_proc_means_and_summary_execute_with_and_without_class(self):
         source = """
@@ -398,6 +407,11 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         run;
         proc summary data=work.sales sum mean;
           var amount;
+        run;
+        proc means data=work.sales n missing;
+          class region;
+          var amount;
+          output out=work.missing_class_summary;
         run;
         """
         df_sales = self.spark.createDataFrame(
@@ -432,6 +446,11 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         overall = namespace["df_means_2"].first()
         self.assertEqual(overall.sum_amount, 134.0)
         self.assertAlmostEqual(overall.mean_amount, 33.5)
+        missing_class = {
+            row.region: row.n_amount
+            for row in namespace["df_missing_class_summary"].collect()
+        }
+        self.assertEqual(missing_class[None], 1)
 
     def test_proc_means_additional_statistics_and_output_names_execute(self):
         source = """
@@ -679,6 +698,32 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
                 (3, None, "right-3", "right"),
                 (4, None, None, "final-only"),
             ],
+        )
+
+    def test_merge_by_orders_output_using_descending_modifiers(self):
+        source = """
+        data work.merged_descending;
+          merge work.left_data work.right_data;
+          by descending period region;
+        run;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_left_data": self.spark.createDataFrame(
+                [(1, "A", "left-1"), (3, "A", "left-3")],
+                ["period", "region", "left_value"],
+            ),
+            "df_right_data": self.spark.createDataFrame(
+                [(1, "A", "right-1"), (3, "A", "right-3")],
+                ["period", "region", "right_value"],
+            ),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        self.assertEqual(
+            [row.period for row in namespace["df_merged_descending"].collect()],
+            [3, 1],
         )
 
     def test_merge_by_rejects_duplicate_keys_at_runtime(self):

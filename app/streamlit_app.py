@@ -31,6 +31,8 @@ if "pyspark_code" not in st.session_state:
     st.session_state.pyspark_code = ""
 if "conversion_warnings" not in st.session_state:
     st.session_state.conversion_warnings = ()
+if "conversion_profile" not in st.session_state:
+    st.session_state.conversion_profile = ""
 
 load_col, _ = st.columns([1, 4])
 with load_col:
@@ -44,6 +46,7 @@ with load_col:
             st.session_state.sas_source = source_text
             st.session_state.pyspark_code = ""
             st.session_state.conversion_warnings = ()
+            st.session_state.conversion_profile = ""
             st.session_state.pop("pyspark_test_result", None)
 
 source = st.text_area(
@@ -53,23 +56,41 @@ source = st.text_area(
     placeholder="Paste your SAS program here...",
 )
 
+sas_version = st.selectbox(
+    "SAS source version",
+    ("auto", "9.4M8", "Viya"),
+    help=(
+        "Auto reads a sas2pyspark version marker; if absent, the Viya profile is "
+        "selected and a warning is shown. This profile does not yet gate every "
+        "language feature by SAS release."
+    ),
+)
+
 if st.button("Convert to PySpark", type="primary"):
     if not source.strip():
         st.session_state.pyspark_code = ""
         st.session_state.conversion_warnings = ()
+        st.session_state.conversion_profile = ""
         st.session_state.pop("pyspark_test_result", None)
         st.warning("Enter SAS source code before converting.")
     else:
         try:
-            result = convert_sas(source)
+            result = convert_sas(source, sas_version=sas_version)
             st.session_state.pyspark_code = result.code
             st.session_state.conversion_warnings = result.warnings
+            st.session_state.conversion_profile = (
+                f"{result.source_version} ({result.version_source})"
+            )
             st.session_state.pop("pyspark_test_result", None)
         except ConversionError as error:
             st.session_state.pyspark_code = ""
             st.session_state.conversion_warnings = ()
+            st.session_state.conversion_profile = ""
             st.session_state.pop("pyspark_test_result", None)
             st.error(f"Conversion failed: {error}")
+
+if st.session_state.conversion_profile:
+    st.info(f"SAS source profile: {st.session_state.conversion_profile}")
 
 if st.session_state.conversion_warnings:
     with st.expander("Conversion warnings", expanded=True):

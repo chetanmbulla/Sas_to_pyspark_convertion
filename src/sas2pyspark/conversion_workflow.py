@@ -138,6 +138,7 @@ def convert_project(
     output_directory: str = "pyspark",
     converter_version: str = "0.1.0",
     force: bool = False,
+    sas_version: str = "auto",
 ) -> BatchConversionReport:
     """Convert each registered program independently and record its outcome."""
     project.validate()
@@ -258,7 +259,7 @@ def convert_project(
             record_failure("Registered source program must have a .sas extension.")
             continue
         try:
-            result = converter.convert(source)
+            result = converter.convert(source, sas_version=sas_version)
         except ConversionError as error:
             record_failure(str(error))
             continue

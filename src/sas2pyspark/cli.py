@@ -115,6 +115,15 @@ def _project_main(argv: list[str]) -> int:
         help="Conversion report destination; defaults to <project-name>.conversion.json",
     )
     convert_parser.add_argument(
+        "--sas-version",
+        choices=("auto", "9.4M8", "Viya"),
+        default="auto",
+        help=(
+            "Source SAS release profile; auto reads the source marker or defaults "
+            "to Viya (default: auto)"
+        ),
+    )
+    convert_parser.add_argument(
         "--force",
         action="store_true",
         help="Replace existing generated files in --output-dir",
@@ -789,6 +798,7 @@ def _project_main(argv: list[str]) -> int:
                 repository_root,
                 output_directory=args.output_dir,
                 force=args.force,
+                sas_version=args.sas_version,
             )
             project.save(manifest_path)
             report.save(report_path)
@@ -840,11 +850,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("input", help="SAS source file, or '-' to read standard input")
     parser.add_argument("-o", "--output", help="Output Python file; defaults to standard output")
+    parser.add_argument(
+        "--sas-version",
+        choices=("auto", "9.4M8", "Viya"),
+        default="auto",
+        help=(
+            "Source SAS release profile; auto reads the source marker or defaults "
+            "to Viya (default: auto)"
+        ),
+    )
     args = parser.parse_args(arguments)
 
     try:
         source = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
-        result = SasToPySparkConverter().convert(source)
+        result = SasToPySparkConverter().convert(
+            source, sas_version=args.sas_version
+        )
     except (OSError, UnicodeError, ConversionError) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)
         return 2
@@ -857,6 +878,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     else:
         sys.stdout.write(result.code)
+    print(
+        f"sas2pyspark: SAS source profile: "
+        f"{result.source_version} ({result.version_source})",
+        file=sys.stderr,
+    )
     for warning in result.warnings:
         print(f"sas2pyspark: warning: {warning}", file=sys.stderr)
     return 0

@@ -14,7 +14,7 @@ reviewed and validated against representative data before production use.
 - [Use the command line](#use-the-command-line)
 - [Use the Streamlit GUI](#use-the-streamlit-gui)
 - [Use the Python API](#use-the-python-api)
-- [Conversion process](conversion_process.md)
+- [Conversion process](docs/conversion_process.md)
 - [Examples](#examples)
 - [Progressive SAS and CSV examples](#progressive-gui-test-programs)
 - [Supported syntax and limitations](#supported-syntax)
@@ -31,13 +31,22 @@ folder and run:
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[gui]"
-.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+.\.venv\Scripts\python.exe -m streamlit run app\streamlit_app.py
 ```
 
 Open the local URL printed by Streamlit (usually
 `http://localhost:8501`). Paste or upload SAS source, choose **Convert to
 PySpark**, review or edit the generated code, then upload its input CSV file(s)
 and choose **Run PySpark test**.
+
+## Project layout
+
+- `src/sas2pyspark/` — installable Python package and CLI.
+- `app/` — Streamlit GUI entry point.
+- `tests/` — unit and Spark integration tests.
+- `docs/` — workflow and implementation documentation.
+- `examples/` — sample SAS programs and input datasets.
+- `pyproject.toml` — package metadata and build configuration.
 
 ## Install
 
@@ -77,6 +86,27 @@ Convert a SAS file into a Python file:
 .\.venv\Scripts\sas2pyspark.exe input.sas --output output.py
 ```
 
+The compatibility target is the Base SAS language surface shared by current
+SAS Viya and legacy SAS 9.4M8 programs. The Viya profile follows the current
+language baseline; it is not pinned to a specific Viya deployment release and
+does not imply support for SAS/STAT, CAS, DS2, or other separately licensed
+products. Declare the source release in the SAS file when known:
+
+```sas
+/* sas2pyspark: sas-version=9.4M8 */
+```
+
+Or select a profile explicitly with `--sas-version 9.4M8` or
+`--sas-version Viya`. The default `auto` mode reads the marker; if absent, it
+selects Viya and emits a warning. The Python API accepts the same keyword
+(`convert_sas(source, sas_version="9.4M8")`), and the GUI and
+`project convert` command expose the same selection. If a marker and explicit
+override disagree, conversion fails. At this stage, the profile records
+release selection and validates marker consistency; it does not yet enforce a
+complete per-release syntax/semantic feature matrix. Every conversion warns
+about this limitation. Selecting 9.4M8 does not emulate SAS runtime
+differences.
+
 The command also works as `sas2pyspark input.sas -o output.py` when the
 environment's scripts directory is on `PATH`. To print generated code to the
 terminal instead of writing a file:
@@ -98,7 +128,7 @@ For a versioned, multi-program workflow, see
 Install the `gui` extra, then start the app from the project root:
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+.\.venv\Scripts\python.exe -m streamlit run app\streamlit_app.py
 ```
 
 In the app:
@@ -162,15 +192,24 @@ and execute it.
 - Compile-time `%IF`/`%THEN`/`%ELSE` branches with simple comparisons and `AND`/`OR`/`NOT`, plus bounded integer `%DO` loops.
 - Indexed integer `DO ... TO ... [BY ...]` loops when the loop ends with one `OUTPUT`, with simple assignments in the loop body.
 - `MERGE` of two or more datasets followed by `BY`, for inputs with unique BY keys.
-- `PROC SORT` with `DATA=`, optional `OUT=`, `BY`, and `NODUPKEY`.
-- `PROC FREQ` one-way and two-way `TABLES`, with counts, percentages, and optional `OUT=`.
-- `PROC MEANS` and `PROC SUMMARY` with `VAR`, optional `CLASS`, and selected `N`, `SUM`, `MEAN`, `STD`, `MIN`, and `MAX` statistics.
+- `PROC SORT` with `DATA=`, optional `OUT=`, `BY` keys with `ASCENDING` or
+  `DESCENDING` direction, and `NODUPKEY`.
+- `PROC FREQ` one-way and two-way `TABLES`, with counts, percentages,
+  optional `OUT=`, and the `MISSING` option.
+- `PROC MEANS` and `PROC SUMMARY` with `VAR`, optional `CLASS`, selected
+  `N`, `NMISS`, `SUM`, `MEAN`, `STD`, `STDERR`, `VAR`, `CV`, `MIN`, and `MAX`
+  statistics, and limited `OUTPUT` statistic-name overrides.
 - `PROC TRANSPOSE` with `DATA=`, optional `OUT=`, `VAR`, optional `BY`, and a required unique `ORDER=` column.
 - CSV-only `PROC IMPORT` with `DATAFILE=`, `OUT=`, `DBMS=CSV`, `GETNAMES=`, and one-character `DELIMITER=`.
 - CSV-only `PROC EXPORT` with `DATA=`, `OUTFILE=`, `DBMS=CSV`, `PUTNAMES=`, and one-character `DELIMITER=`.
 - `PROC SQL` with `CREATE TABLE ... AS SELECT ...` and standalone `SELECT`/`WITH` queries.
 - Common SAS comparison/logical words (`EQ`, `NE`, `GT`, `GE`, `LT`, `LE`, `AND`, `OR`, `NOT`), `MISSING(column)`, `UPCASE`, `LOWCASE`, `TODAY()`, `CAT`, `CATS`, `CATX`, `STRIP`, `COALESCE`, `COALESCEC`, `SUBSTR`, `COMPRESS`, and `ROUND`.
 - SAS block comments and statement comments.
+
+The source-aware parser preserves statement and token locations and recognizes
+basic SAS tokens and macro references. It currently provides a lexical and
+statement-parsing foundation only; it is not a complete SAS grammar, and
+DATA-step/PROC semantics remain limited to the constructs listed above.
 
 The converter fails with `ConversionError` on syntax outside this subset instead of silently generating a misleading translation. Errors identify the SAS source line and offending statement when available. `MERGE ... BY` uses a full outer join and therefore requires unique BY keys in every input; generated code checks this at runtime (an extra Spark aggregation per input), preserves later-dataset overwrite behavior, and orders output by BY keys. Null BY keys match each other; normalize blank/padded character keys consistently in Spark inputs to match SAS fixed-width character behavior. Duplicate-key match-merging, `IN=` dataset options, and `WHERE` on MERGE inputs are unsupported. Conditional branches must be simple assignments to the same column; other `IF ... THEN` forms, `ELSE IF`, and nested control flow are unsupported. Supported output-generating DO loops require integer literal bounds/step, a nonzero step, simple assignments, and exactly one final `OUTPUT`; stateful self-updating assignments, nested loops, and other OUTPUT patterns are rejected. `CAT` concatenates values without trimming and maps Spark `NULL` inputs to empty strings; `CATS` trims each input before concatenating. `CATX` trims values and skips missing/blank inputs. `STRIP` trims both ends and maps `NULL` to an empty string. `COALESCE` uses Spark null semantics for numeric values; `COALESCEC` treats `NULL` and whitespace-only strings as missing, returns the first non-missing value unchanged, and returns an empty string when all inputs are missing. These rules model character missing values as Spark `NULL`, empty, or whitespace-only strings. `COMPRESS` supports the optional character set but not SAS modifiers. `ROUND` supports a positive numeric literal as its rounding unit. `SUBSTR` uses Spark's one-based substring indexing; start positions and lengths must be positive for SAS-compatible results. Advanced macro processing, advanced array behavior, formats/informats, other SAS-specific functions, and most non-SQL procedures are not implemented.
 
@@ -225,7 +264,9 @@ unspecified; the generated code assigns a best-effort order using
 per relevant BY group for a given execution, but which row is first or last can
 differ from SAS or change across executions. Descending BY keys and
 `FIRST.`/`LAST.` processing with `RETAIN` beyond the single numeric reset
-pattern described above are not supported.
+pattern described above is not supported. DATA-step BY statements accept
+`ASCENDING` and `DESCENDING` modifiers, but Spark input order is still
+best-effort; the modifiers do not make observation order equivalent to SAS.
 
 `PROC MEANS` and `PROC SUMMARY` accept `DATA=` plus one or more statistic
 options (`N`, `NMISS`, `SUM`, `MEAN`, `STD`, `STDERR`, `VAR`, `CV`, `MIN`,
@@ -239,16 +280,18 @@ nulls per variable. `STD` and `STDERR` use sample standard deviation;
 `STDERR` divides it by the square root of the nonmissing count. `VAR` is sample
 variance, and `CV` is sample standard deviation divided by the mean times 100;
 `CV` is null when the mean is zero or undefined. `VAR` columns must be numeric.
-Missing (`NULL`) class values are excluded; analysis-column missing values are
-handled as nulls by Spark aggregates. Without `OUT=`, results are available as
+Missing (`NULL`) class values are excluded by default; the `MISSING` PROC option
+includes them as a class level. Analysis-column missing values are handled as
+nulls by Spark aggregates. Without `OUT=`, results are available as
 `df_means_1`, `df_means_2`, etc. Other procedure options, multiple `VAR` or
 `CLASS` statements, and other `OUTPUT` options are unsupported.
 
 `PROC FREQ` is limited to one `TABLES` specification per procedure, with one or
 two simple column names and the optional `OUT=` option. Missing (`NULL`) values
-in the table columns are excluded, matching the default SAS behavior; use of
-`MISSING`, multiple tables, formats, weights, and other `PROC FREQ` options is
-unsupported. The output contains `COUNT` and `PERCENT`; two-way tables also
+in the table columns are excluded by default, matching the default SAS
+behavior; the `MISSING` PROC option includes them as table levels. Multiple
+tables, formats, weights, table-level options, and other `PROC FREQ` options
+are unsupported. The output contains `COUNT` and `PERCENT`; two-way tables also
 contain `ROW_PERCENT` and `COL_PERCENT`. With `OUT=`, the result is available as
 the corresponding `df_<table>` DataFrame and Spark temp view. Without `OUT=`, it
 is available as `df_freq_1`, `df_freq_2`, etc. Cumulative percentages and SAS
@@ -326,6 +369,10 @@ sas2pyspark project discover migration.project.json --root .
 sas2pyspark project plan migration.project.json --root .
 sas2pyspark project convert migration.project.json --root .
 ```
+
+Use `--sas-version auto` to resolve each program from its in-source marker or
+default to the Viya profile. Pass `--sas-version 9.4M8` or `--sas-version Viya`
+to set one source profile for the batch.
 
 The JSON manifest uses schema version `1` and starts with empty `programs`,
 `datasets`, `dependencies`, `conversions`, and `reviews` collections. The
@@ -577,7 +624,9 @@ Get-Content input.sas -Raw | sas2pyspark -
 - Output datasets become DataFrames named `df_<table>` and are registered as Spark temporary views under `<table>`.
 - For two-level SAS references (`library.table`), the generated view name is the table component. Ensure table names are unique across libraries or adapt the naming convention.
 - `PROC SQL` queries are passed to `spark.sql`; SQL is not generally rewritten beyond SAS comparison words and removal of library qualifiers. Unsupported SAS SQL constructs may therefore fail when executed by Spark.
-- `PROC SORT NODUPKEY` uses a window to keep one row per BY key. Which tied row is retained can differ from SAS; the converter emits a warning.
+- `PROC SORT` supports `ASCENDING` and `DESCENDING` BY-key modifiers.
+`PROC SORT NODUPKEY` uses a window to keep one row per BY key. Which tied row
+is retained can differ from SAS; the converter emits a warning.
 - Generated programs assume that `spark` and referenced input DataFrames exist. Directly executing generated files requires you to provide them; `project run` creates a local Spark session and binds `--input` datasets. Generated programs import `pyspark.sql.functions as F`, so PySpark must be installed in the selected Python environment.
 
 ## Run tests

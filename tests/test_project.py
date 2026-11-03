@@ -132,6 +132,21 @@ class MigrationProjectTests(unittest.TestCase):
                 self.assertEqual(main([str(path)]), 0)
             self.assertIn("df_output = df_source", output.getvalue())
 
+    def test_existing_conversion_cli_accepts_a_sas_version_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory, "input.sas")
+                path.write_text(
+                    "/* sas2pyspark: sas-version=9.4M8 */ "
+                    "data output; set source; run;",
+                    encoding="utf-8",
+                )
+                output = io.StringIO()
+                errors = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    self.assertEqual(main([str(path), "--sas-version", "9.4M8"]), 0)
+                self.assertIn("df_output = df_source", output.getvalue())
+                self.assertIn("SAS source profile: 9.4M8 (override)", errors.getvalue())
+
     def test_discovery_inventories_sas_assets_and_skips_configured_directories(self):
         source = b"""/* proc ignored; */
 * proc also_ignored; ;
@@ -517,7 +532,9 @@ proc sql; select ';' as marker from output; quit;
             root = Path(directory, "repository")
             root.mkdir()
             (root / "good.sas").write_text(
-                "data result; set source; run;", encoding="utf-8"
+                "/* sas2pyspark: sas-version=9.4M8 */ "
+                "data result; set source; run;",
+                encoding="utf-8",
             )
             (root / "bad.sas").write_text(
                 "proc print data=source; run;", encoding="utf-8"
@@ -542,6 +559,8 @@ proc sql; select ';' as marker from output; quit;
                         "generated",
                         "--report",
                         str(report_path),
+                        "--sas-version",
+                        "9.4M8",
                     ]
                 )
             report = json.loads(report_path.read_text(encoding="utf-8"))

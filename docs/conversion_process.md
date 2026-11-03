@@ -12,7 +12,7 @@ that code.
 SAS source
    |
    v
-Remove comments and split into statements
+Lex source, retain spans, and split statements
    |
    v
 Expand supported sequential %LET variables
@@ -43,15 +43,33 @@ Translate expressions and render PySpark
 The converter receives SAS text from the CLI, Python API, or GUI. Before
 parsing:
 
-1. SAS block comments (`/* ... */`) and statement comments (`* ... ;`) are
-   removed while quoted text is preserved.
-2. The source is split at semicolons that occur outside quoted strings.
-   Original source line numbers are retained for conversion diagnostics.
-3. Every statement must be terminated with a semicolon, and quoted strings and
+1. Select the SAS source profile. A block comment of the form
+   `/* sas2pyspark: sas-version=9.4M8 */` or
+   `/* sas2pyspark: sas-version=Viya */` identifies the source profile.
+   `--sas-version` or the equivalent API/GUI option can provide an override;
+   conflicting markers and overrides fail explicitly. Without either, the
+   converter selects the Viya profile and warns that the source release is
+   unknown.
+2. The source-aware lexer masks SAS block comments (`/* ... */`) and statement
+   comments (`* ... ;`) while preserving source offsets and quoted text.
+3. It tokenizes identifiers, numbers, strings, operators, punctuation, and
+   macro references/directives, then splits statements at semicolons outside
+   quoted strings. Statement and token spans retain original line and column
+   positions for diagnostics.
+4. Every statement must be terminated with a semicolon, and quoted strings and
    comments must be closed.
+
+The version profile currently records source-version selection and checks
+marker/override consistency. It does not yet gate every syntax feature by
+release or reproduce version-specific SAS runtime behavior. Legacy syntax is
+accepted only where it matches the converter's implemented subset.
 
 An unterminated comment or quote, or a statement without a terminating
 semicolon, fails conversion rather than being silently ignored.
+
+This is a lexical and statement-parsing foundation, not a complete SAS grammar:
+DATA-step and PROC semantics are still parsed by the existing bounded
+construct-specific converters.
 
 ## 2. Expand supported macro variables
 
@@ -95,8 +113,9 @@ supported `DATA` steps and supported procedures, including `PROC SORT`,
 `PROC EXPORT`, and `PROC SQL`.
 
 Within a `DATA` step, the converter gathers its output dataset, input dataset or
-datasets, filters, `BY` keys, array declarations, assignments, conditionals,
-and supported `KEEP`/`DROP` rules. Conditional assignments and `SELECT/WHEN`
+datasets, filters, `BY` keys (including per-key `ASCENDING`/`DESCENDING`
+modifiers), array declarations, assignments, conditionals, and supported
+`KEEP`/`DROP` rules. Conditional assignments and `SELECT/WHEN`
 branches are checked against the supported simple-assignment patterns. A
 supported `DO` loop must use integer literal bounds and step, simple
 assignments, and one final `OUTPUT`.
@@ -162,7 +181,7 @@ the implemented subset, conversion raises `ConversionError`. When available,
 the error includes the SAS source line and statement context. Conversion
 errors are not replaced with guessed or pass-through translations.
 
-Check [Supported syntax](README.md#supported-syntax) and its limitations before
+Check [Supported syntax](../README.md#supported-syntax) and its limitations before
 reworking a failed statement. Simplify the SAS source into supported forms or
 manually review and translate the unsupported behavior; do not assume that
 similar-looking SAS syntax has identical Spark semantics.
@@ -198,7 +217,7 @@ to SAS or production-scale performance.
 For tracked projects, `sas2pyspark project run` similarly loads explicitly
 mapped inputs, executes selected current conversions in separate worker
 processes, and saves run reports, logs, and outputs beneath the repository's
-`runs/` directory. See the [migration project workflow](README.md#migration-project-foundation)
+`runs/` directory. See the [migration project workflow](../README.md#migration-project-foundation)
 for its configuration and security details.
 
 ## 8. Validate semantics and results
@@ -239,7 +258,7 @@ future framework versions.
 
 ## Related documentation
 
-- [Installation and usage](README.md#install)
-- [Supported SAS syntax and limitations](README.md#supported-syntax)
-- [Progressive SAS and CSV test examples](README.md#progressive-gui-test-programs)
-- [Project execution and reconciliation](README.md#migration-project-foundation)
+- [Installation and usage](../README.md#install)
+- [Supported SAS syntax and limitations](../README.md#supported-syntax)
+- [Progressive SAS and CSV test examples](../README.md#progressive-gui-test-programs)
+- [Project execution and reconciliation](../README.md#migration-project-foundation)
