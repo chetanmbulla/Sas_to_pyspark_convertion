@@ -247,14 +247,24 @@ by `%LET` inside `%IF`/`%DO` blocks are visible to later statements in the same
 macro (or program). Expansion is limited to 32 nested
 levels, 1,000 loop iterations per loop, and 10,000 emitted statements.
 
-`%UPCASE(text)`, `%LOWCASE(text)`, `%STR(text)` and `%NRSTR(text)` are
-supported (the quoting functions simply return their text; characters that
-would end a statement, such as `;`, are not protected). `%GLOBAL a b;` makes
+`%UPCASE(text)`, `%LOWCASE(text)`, `%STR`, `%NRSTR`, `%QUOTE`, `%NRQUOTE`,
+`%BQUOTE` and `%NRBQUOTE` are supported (the quoting functions simply return
+their text; characters that would end a statement, such as `;`, are not
+protected). `%SUBSTR(text, pos[, len])`, `%SCAN(text, n[, delimiters])`
+(negative `n` counts from the end), `%INDEX(source, excerpt)` and
+`%LENGTH(text)` operate on text resolved at conversion time. `%PUT` is
+accepted and ignored. `%GLOBAL a b;` makes
 variables assigned inside a macro visible to the caller afterwards, and
-`%LOCAL a;` keeps them private to the macro.
+`%LOCAL a;` keeps them private to the macro. `%SYSEVALF(expr[, conversion])`
+evaluates decimal arithmetic (conversions `BOOLEAN`, `CEIL`, `FLOOR`, `INTEGER`),
+and `%SYMEXIST(name)` returns `1` or `0` for the variables defined at that
+point. `%RETURN;` ends the current macro early. `%GOTO label;` jumps forward to
+a `%label:` in the same macro (including out of `%IF`/`%DO` blocks); backward
+jumps and missing labels are errors. `%ABORT` is rejected with an error when it
+is reached, because it would stop the SAS session.
 
-Other macro functions (such as `%SUBSTR` and other quoting functions),
-`%GOTO`, `%RETURN`, `CALL SYMPUT`/`SYMPUTX` (a run-time feature that cannot be
+Other macro functions (such as `%SYSGET`, which depends on the machine
+environment), `CALL SYMPUT`/`SYMPUTX` (a run-time feature that cannot be
 resolved at conversion time), and other macro-language features are
 not implemented. Without `%GLOBAL`, macro variables assigned during a macro call
 are scoped to that call and do not modify the caller's variables. Unsupported macro syntax

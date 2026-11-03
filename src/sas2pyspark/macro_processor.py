@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from decimal import (
     ROUND_CEILING,
+    Context,
     ROUND_DOWN,
     ROUND_FLOOR,
     ROUND_HALF_UP,
@@ -57,7 +58,13 @@ _MACRO_LOOP = re.compile(
 )
 _MACRO_CALL = re.compile(r"%([A-Za-z_]\w*)\s*\(")
 _MACRO_WHILE = re.compile(r"%do\s+%(while|until)\s*\((.*)\)\s*$", re.I | re.S)
-_MACRO_FUNCTIONS = {"eval", "sysfunc", "upcase", "lowcase", "str", "nrstr"}
+_MACRO_FUNCTIONS = {
+    "eval", "sysevalf", "symexist", "sysfunc", "upcase", "lowcase", "str", "nrstr",
+    "quote", "nrquote", "bquote", "nrbquote", "substr", "scan", "index", "length",
+}
+_MACRO_LABEL = re.compile(r"%([A-Za-z_]\w*)\s*:(.*)\Z", re.S)
+_QUOTING_FUNCTIONS = {"str", "nrstr", "quote", "nrquote", "bquote", "nrbquote"}
+_DEFAULT_SCAN_DELIMITERS = " <(+&!$*);^-/,%|"
 _MACRO_SCOPE = re.compile(
     r"%(global|local)\s+([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\Z", re.I
 )
@@ -216,8 +223,11 @@ class _EvalParser:
         "le": lambda a, b: a <= b,
     }
 
-    def __init__(self, expression: str, statement: MacroStatement) -> None:
+    def __init__(
+        self, expression: str, statement: MacroStatement, floating: bool = False
+    ) -> None:
         self.statement = statement
+        self.floating = floating
         self.tokens: list[str] = []
         position = 0
         expression = expression.strip()
@@ -291,7 +301,10 @@ class _EvalParser:
             else:
                 if right == 0:
                     self._error("Division by zero in %EVAL expression.")
-                value = abs(value) // abs(right) * (1 if (value >= 0) == (right > 0) else -1)
+                if self.floating:
+                    value = value / right
+                else:
+                    value = abs(value) // abs(right) * (1 if (value >= 0) == (right > 0) else -1)
         return value
 
     def _unary(self) -> int:
@@ -310,6 +323,15 @@ class _EvalParser:
         if self.index >= len(self.tokens):
             self._error("Incomplete %EVAL expression.")
         token = self.tokens[self.index]
+        if self.floating:
+            try:
+                number = Decimal(token)
+            except InvalidOperation:
+                self._error(f"%SYSEVALF supports numeric values only; found {token!r}.")
+            if not number.is_finite():
+                self._error(f"%SYSEVALF supports numeric values only; found {token!r}.")
+            self.index += 1
+            return number  # type: ignore[return-value]
         if not token.isdigit():
             self._error(
                 f"%EVAL supports integer arithmetic only; found {token!r}."
@@ -325,6 +347,29 @@ def _format_number(value: Decimal) -> str:
     if value == value.to_integral_value():
         return str(int(value))
     return format(value.normalize(), "f")
+
+
+def _sysevalf(inner: str, statement: MacroStatement) -> str:
+    arguments = _split_top_level(inner, statement)
+    if len(arguments) > 2:
+        raise MacroExpansionError("%SYSEVALF accepts an expression and one conversion.", statement)
+    value = Decimal(_EvalParser(arguments[0], statement, floating=True).evaluate())
+    conversion = arguments[1].strip().casefold() if len(arguments) == 2 else ""
+    if conversion == "boolean":
+        return "1" if value != 0 else "0"
+    if conversion == "ceil":
+        return str(int(value.to_integral_value(rounding=ROUND_CEILING)))
+    if conversion == "floor":
+        return str(int(value.to_integral_value(rounding=ROUND_FLOOR)))
+    if conversion == "integer":
+        return str(int(value.to_integral_value(rounding=ROUND_DOWN)))
+    if conversion:
+        raise MacroExpansionError(
+            f"%SYSEVALF conversion {conversion!r} is unsupported; use BOOLEAN, CEIL, "
+            "FLOOR or INTEGER.",
+            statement,
+        )
+    return _format_number(Context(prec=15).plus(value))
 
 
 def _sysfunc(call: str, statement: MacroStatement) -> str:
@@ -389,6 +434,57 @@ def _sysfunc(call: str, statement: MacroStatement) -> str:
     )
 
 
+def _text_function(name: str, inner: str, statement: MacroStatement) -> str:
+    """Evaluate %SUBSTR, %SCAN, %INDEX and %LENGTH on already-resolved text."""
+    arguments = [item.strip() for item in _split_top_level(inner, statement)]
+
+    def integer(text: str) -> int:
+        try:
+            return int(text)
+        except ValueError:
+            raise MacroExpansionError(
+                f"%{name.upper()} requires integer position arguments; found {text!r}.",
+                statement,
+            ) from None
+
+    def check(minimum: int, maximum: int) -> None:
+        if not minimum <= len(arguments) <= maximum:
+            raise MacroExpansionError(
+                f"%{name.upper()} has the wrong number of arguments.", statement
+            )
+
+    if name == "length":
+        check(1, 1)
+        return str(len(arguments[0]))
+    if name == "index":
+        check(2, 2)
+        return str(arguments[0].find(arguments[1]) + 1) if arguments[1] else "0"
+    if name == "substr":
+        check(2, 3)
+        start = integer(arguments[1])
+        if start < 1:
+            raise MacroExpansionError("%SUBSTR position must be at least 1.", statement)
+        if len(arguments) == 2:
+            return arguments[0][start - 1 :]
+        length = integer(arguments[2])
+        if length < 0:
+            raise MacroExpansionError("%SUBSTR length cannot be negative.", statement)
+        return arguments[0][start - 1 : start - 1 + length]
+    check(2, 3)
+    delimiters = (
+        arguments[2].strip("'\"") if len(arguments) == 3 else _DEFAULT_SCAN_DELIMITERS
+    )
+    words = [
+        word
+        for word in re.split("[" + re.escape(delimiters) + "]", arguments[0])
+        if word
+    ]
+    position = integer(arguments[1])
+    if position == 0 or abs(position) > len(words):
+        return ""
+    return words[position - 1] if position > 0 else words[position]
+
+
 def _split_top_level(arguments: str, statement: MacroStatement) -> list[str]:
     values: list[str] = []
     current: list[str] = []
@@ -423,12 +519,38 @@ class _MacroProcessor:
     def __init__(self, statements: list[MacroStatement]) -> None:
         self.macros: dict[str, _Macro] = {}
         self.statement_count = 0
+        self.returning = False
+        self.goto_label: str | None = None
+        self.goto_statement: MacroStatement | None = None
         self.global_names: set[str] = set()
         self.local_names: list[set[str]] = [set()]
         self.statements = self._extract_definitions(statements)
 
     def expand(self) -> list[MacroStatement]:
-        return self._process(self.statements, {}, (), 0)
+        result = self._process(self.statements, {}, (), 0)
+        self._check_goto_resolved()
+        return result
+
+    def _check_goto_resolved(self) -> None:
+        if self.goto_label is not None:
+            statement = self.goto_statement or MacroStatement("", 1)
+            raise MacroExpansionError(
+                f"%GOTO target %{self.goto_label}: was not found later in the "
+                "same macro; only forward jumps are supported.",
+                statement,
+            )
+
+    @staticmethod
+    def _find_label(
+        statements: list[MacroStatement] | tuple[MacroStatement, ...],
+        start: int,
+        label: str,
+    ) -> int | None:
+        for position in range(start, len(statements)):
+            match = _MACRO_LABEL.fullmatch(statements[position].text.strip())
+            if match is not None and match.group(1).casefold() == label:
+                return position
+        return None
 
     def _extract_definitions(
         self, statements: list[MacroStatement]
@@ -503,9 +625,53 @@ class _MacroProcessor:
         output: list[MacroStatement] = []
         index = 0
         while index < len(statements):
+            if self.returning:
+                break
+            if self.goto_label is not None:
+                target = self._find_label(statements, index, self.goto_label)
+                if target is None:
+                    break
+                self.goto_label = None
+                index = target
             statement = statements[index]
             text = statement.text.strip()
             lower = text.casefold()
+
+            label = _MACRO_LABEL.fullmatch(text)
+            if label is not None:
+                remainder = label.group(2).strip()
+                if not remainder:
+                    index += 1
+                    continue
+                statement = MacroStatement(remainder, statement.line)
+                text = remainder
+                lower = text.casefold()
+
+            if lower == "%return":
+                if not call_stack:
+                    raise MacroExpansionError(
+                        "%RETURN is only valid inside a macro.", statement
+                    )
+                self.returning = True
+                break
+
+            if lower.startswith("%abort"):
+                raise MacroExpansionError(
+                    "%ABORT stops the SAS session at this point; remove it or "
+                    "guard it with a condition that is false at conversion time.",
+                    statement,
+                )
+
+            goto = re.fullmatch(r"%go\s*to\s+([A-Za-z_]\w*)", text, re.I)
+            if goto is not None:
+                self.goto_label = goto.group(1).casefold()
+                self.goto_statement = statement
+                index += 1
+                continue
+
+            if lower.startswith("%put"):
+                index += 1
+                continue
 
             if lower.startswith(("%global", "%local")):
                 scope = _MACRO_SCOPE.fullmatch(text)
@@ -593,6 +759,8 @@ class _MacroProcessor:
                                 statement,
                             )
                         output.extend(self._process(body, variables, call_stack, depth + 1))
+                        if self.returning or self.goto_label is not None:
+                            break
                         if kind.casefold() == "until" and _ConditionParser(
                             self._substitute(raw_condition, variables, statement),
                             statement,
@@ -630,6 +798,8 @@ class _MacroProcessor:
                         output.extend(
                             self._process(body, variables, call_stack, depth + 1)
                         )
+                        if self.returning or self.goto_label is not None:
+                            break
                 index = end_index
                 continue
 
@@ -809,6 +979,8 @@ class _MacroProcessor:
             )
         finally:
             declared_local = self.local_names.pop()
+        self.returning = False
+        self._check_goto_resolved()
         for key in self.global_names - declared_local:
             if key in local_variables:
                 variables[key] = local_variables[key]
@@ -856,7 +1028,7 @@ class _MacroProcessor:
                     statement,
                 )
         return self._evaluate_functions(
-            self._resolve_variables(text, variables, statement), statement
+            self._resolve_variables(text, variables, statement), statement, variables
         )
 
     def _resolve_variables(
@@ -885,8 +1057,17 @@ class _MacroProcessor:
             "Indirect macro references exceeded the resolution limit.", statement
         )
 
-    def _evaluate_functions(self, text: str, statement: MacroStatement) -> str:
-        pattern = re.compile(r"%(eval|sysfunc|upcase|lowcase|str|nrstr)\s*\(", re.IGNORECASE)
+    def _evaluate_functions(
+        self,
+        text: str,
+        statement: MacroStatement,
+        variables: dict[str, str] | None = None,
+    ) -> str:
+        pattern = re.compile(
+            r"%(eval|sysevalf|symexist|sysfunc|upcase|lowcase|str|nrstr|quote|nrquote"
+            r"|bquote|nrbquote|substr|scan|index|length)\s*\(",
+            re.IGNORECASE,
+        )
         while True:
             matches = list(pattern.finditer(text))
             if not matches:
@@ -898,14 +1079,25 @@ class _MacroProcessor:
             function = match.group(1).casefold()
             if function == "eval":
                 value = str(_EvalParser(inner, statement).evaluate())
+            elif function == "sysevalf":
+                value = _sysevalf(inner, statement)
+            elif function == "symexist":
+                name = inner.strip().casefold()
+                if not re.fullmatch(r"[a-z_]\w*", name):
+                    raise MacroExpansionError(
+                        "%SYMEXIST requires a macro variable name.", statement
+                    )
+                value = "1" if variables is not None and name in variables else "0"
             elif function == "sysfunc":
                 value = _sysfunc(inner, statement)
             elif function == "upcase":
                 value = inner.strip().upper()
             elif function == "lowcase":
                 value = inner.strip().lower()
-            else:
+            elif function in _QUOTING_FUNCTIONS:
                 value = inner
+            else:
+                value = _text_function(function, inner, statement)
             text = text[: match.start()] + value + text[closing + 1 :]
 
     @staticmethod

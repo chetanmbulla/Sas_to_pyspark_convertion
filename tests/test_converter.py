@@ -167,7 +167,7 @@ class ConverterTests(unittest.TestCase):
                 "Undefined macro variable",
             ),
             (
-                "%let source=%substr(people,1); data out; set &source; run;",
+                "%let source=%sysget(HOME); data out; set &source; run;",
                 "Macro calls and macro-language statements",
             ),
             (
@@ -924,6 +924,81 @@ class ConverterTests(unittest.TestCase):
                 "proc sql noprint; select max(x) into :mx from a; quit;"
             )
         self.assertIn("INTO :macro", caught.exception.message)
+
+    def test_macro_text_functions(self):
+        source = """
+%let name = sales_2024_q1;
+%put name is &name;
+%let part = %scan(&name, 2, _);
+%let last = %scan(&name, -1, _);
+%let head = %substr(&name, 1, 5);
+%let tail = %substr(&name, 7);
+%let pos = %index(&name, 2024);
+%let len = %length(&name);
+data out;
+  set &head;
+  a = &part;
+  b = "&last";
+  c = "&tail";
+  d = &pos + &len;
+  e = "%quote(x y)";
+run;
+"""
+        code = SasToPySparkConverter().convert(source).code
+        self.assertIn("df_sales", code)
+        self.assertIn("F.expr('2024')", code)
+        self.assertIn('"q1"', code)
+        self.assertIn('"2024_q1"', code)
+        self.assertIn("7 + 13", code)
+        for bad in ("%substr(abc)", "%substr(abc,x)", "%scan(abc)", "%substr(abc,0)"):
+            with self.assertRaises(ConversionError):
+                SasToPySparkConverter().convert(f"%let v = {bad};")
+
+    def test_macro_sysevalf_symexist_return_goto_abort(self):
+        source = """
+%let ratio = %sysevalf(10 / 4);
+%let up = %sysevalf(10 / 4, ceil);
+%let down = %sysevalf(10 / 4, floor);
+%let flag = %sysevalf(0.5, boolean);
+%let known = %symexist(ratio);
+%let unknown = %symexist(nothere);
+%macro pick(mode=a);
+  %if &mode = a %then %return;
+  %if &mode = skip %then %goto done;
+  data skipped; set src; run;
+  %done:
+  data after; set src; run;
+%mend;
+%macro early();
+  data first; set src; run;
+  %return;
+  data never; set src; run;
+%mend;
+data out;
+  set src;
+  a = &ratio; b = &up; c = &down; d = &flag; e = &known; f = &unknown;
+run;
+%early();
+%pick(mode=skip);
+%pick();
+"""
+        code = SasToPySparkConverter().convert(source).code
+        for fragment in ("F.expr('2.5')", "F.expr('3')", "F.expr('2')", "F.expr('1')", "F.expr('0')"):
+            self.assertIn(fragment, code)
+        self.assertIn("df_first = df_src", code)
+        self.assertNotIn("never", code)
+        self.assertIn("df_after = df_src", code)
+        self.assertNotIn("skipped", code)
+        for bad in (
+            "%macro m(); %goto missing; data a; set b; run; %mend; %m();",
+            "%macro m(); %done: data a; set b; run; %goto done; %mend; %m();",
+            "%return;",
+            "%abort;",
+            "%let v = %sysevalf(1, weird);",
+            "%let v = %symexist(1x);",
+        ):
+            with self.assertRaises(ConversionError, msg=bad):
+                SasToPySparkConverter().convert(bad)
 
     def test_macro_upcase_str_global_local(self):
         source = """
