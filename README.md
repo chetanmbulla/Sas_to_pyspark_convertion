@@ -193,7 +193,7 @@ and execute it.
 
 ## Supported syntax
 
-- DATA steps with one or more `SET` inputs and the supported dataset options, filters, assignments, nested `IF`/`DO`/`SELECT`, numeric accumulator and character/conditional `RETAIN` subsets, static arrays and bounded loop unrolling, `BY` flags, `OUTPUT` routing, inline `DATALINES`, `_N_`, `LAG`/`DIF`, and the `ORDER BY` deterministic-order extension (see the detailed limitations below).
+- DATA steps with one or more `SET` inputs and the supported dataset options, filters, assignments, `CALL MISSING` for explicit variable names, nested `IF`/`DO`/`SELECT`, numeric accumulator and character/conditional `RETAIN` subsets, static arrays and bounded loop unrolling, `BY` flags, `OUTPUT` routing, inline `DATALINES`, `_N_`, `LAG`/`DIF`, and the `ORDER BY` deterministic-order extension (see the detailed limitations below).
 - Sequential `%LET name=value` definitions and `&name` substitution.
 - User-defined `%MACRO`/`%MEND` macros with positional and keyword parameters, defaults, nested calls (including calls inside arguments), bounded recursion, and inline calls that expand to one statement. `%SYSGET` is opt-in through the Python API; dynamic `%INCLUDE` paths may use preceding `%LET` values.
 - Compile-time `%IF`/`%THEN`/`%ELSE` branches with simple comparisons and `AND`/`OR`/`NOT`, plus bounded integer `%DO` loops.
@@ -317,15 +317,23 @@ are rewritten into guarded per-statement conditionals, like `IF ... THEN DO` blo
 condition of every enclosing branch. Conditions that read a column assigned inside the
 same chain, iterative `DO` loops inside blocks, and `OUTPUT` inside blocks are rejected.
 
+**`CALL MISSING`.** `CALL MISSING(var1, var2, ...);` sets the named columns to Spark
+`NULL`. Existing column data types are preserved; an absent variable is created as a
+numeric nullable column unless `LENGTH`/`ATTRIB` declares it character. Only explicit
+simple variable names are supported; `OF` lists, ranges, expressions and conditional
+`CALL MISSING` are rejected.
+
 **Character and conditional `RETAIN`.** A retained variable that is not the
 `v = v + expr` accumulator (for example `retain last ''; if x > 1 then last = name;`)
 keeps its previous value on rows where no assignment runs, with the `RETAIN` initial
 value (or missing) before the first assignment. It is computed with a window function
 over one Spark partition. Without the DATA-step `ORDER BY` extension it uses
 `monotonically_increasing_id()` and is best-effort on row order. The variable
-cannot appear in its own assignment, the step cannot use `BY` or `MERGE`, and
-the variable must be assigned before it is read. A retained variable that is
-never assigned is rejected.
+cannot appear in its own assignment, and the step cannot use `MERGE`. A `BY`
+statement is allowed; retained state carries across BY-group boundaries unless
+the program explicitly assigns a reset value. Use `ORDER BY` for deterministic
+row processing. The variable must be assigned before it is read. A retained
+variable that is never assigned is rejected.
 
 **`LENGTH` and `ATTRIB`.** `LENGTH v $ n` and `ATTRIB v LENGTH=$n` truncate assigned
 character variables with `substring(v, 1, n)` after the step's assignments. Numeric

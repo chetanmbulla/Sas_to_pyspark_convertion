@@ -120,12 +120,17 @@ supported `DATA` steps and supported procedures, including `PROC SORT`,
 
 Within a `DATA` step, the converter gathers its output dataset, input dataset or
 datasets, filters, `BY` keys (including per-key `ASCENDING`/`DESCENDING`
-modifiers), array declarations, assignments, conditionals, and supported
-`KEEP`/`DROP` rules. Conditional assignments and `SELECT/WHEN`
+modifiers), array declarations, assignments, `CALL MISSING`, conditionals, and
+supported `KEEP`/`DROP` rules. `CALL MISSING` accepts explicit simple variable
+names and emits nullable Spark columns while preserving existing column types.
+Conditional assignments and `SELECT/WHEN`
 branches are checked against the supported simple-assignment patterns. A
 supported output-generating `DO` loop may use integer literals or compile-time
 integer expressions for its bounds and step; it must have simple assignments
 and one final `OUTPUT`. Variable-dependent loop bounds remain unsupported.
+Character/conditional `RETAIN` may be combined with a single-input `SET` and
+`BY`; carried state continues across BY groups unless the source explicitly
+resets it. `MERGE` with this RETAIN form remains unsupported.
 
 For a `MERGE`, the converter requires multiple inputs and a `BY` statement.
 The generated program checks that each input has the BY columns before joining.

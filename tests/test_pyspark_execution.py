@@ -597,6 +597,63 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         small = sorted((r.x, r.scaled) for r in namespace["df_small"].collect())
         self.assertEqual(small, [(1, 31), (3, 33), (7, 37)])
 
+    def test_call_missing_preserves_existing_types_and_adds_numeric_missing(self):
+        source = """
+        data cleared;
+          set source;
+          length unset_text $ 4;
+          call missing(score, LABEL, unset_value, unset_text);
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 42, "alpha"), (2, 7, "beta")],
+            "id int, score int, label string",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        result = namespace["df_cleared"]
+        rows = result.orderBy("id").collect()
+        self.assertEqual(
+            [(row.score, row.label, row.unset_value) for row in rows],
+            [(None, None, None), (None, None, None)],
+        )
+        self.assertEqual(result.schema["score"].dataType, frame.schema["score"].dataType)
+        self.assertEqual(result.schema["label"].dataType, frame.schema["label"].dataType)
+        self.assertEqual(result.schema["unset_text"].dataType.simpleString(), "string")
+
+    def test_character_retain_carries_across_by_groups_in_explicit_order(self):
+        source = """
+        data carried;
+          set source;
+          by group;
+          retain last_label '';
+          if not missing(label) then last_label = label;
+          order by sequence;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, "A", "alpha"),
+                (2, "A", None),
+                (3, "B", None),
+                (4, "B", "beta"),
+                (5, "C", None),
+            ],
+            "sequence int, group string, label string",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        rows = namespace["df_carried"].orderBy("sequence").collect()
+        self.assertEqual(
+            [(row.group, row.last_label) for row in rows],
+            [("A", "alpha"), ("A", "alpha"), ("B", "alpha"),
+             ("B", "beta"), ("C", "beta")],
+        )
+
     def test_lag_dif_and_set_options_execute(self):
         source = """
         data b;

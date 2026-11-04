@@ -73,7 +73,7 @@ code { color: #0f456e; font: 0.94em Consolas, monospace; }
 <tbody>
 <tr><td>Entry points</td><td>Python API, <code>sas2pyspark</code> CLI, Streamlit conversion/testing UI, and project-oriented commands/workflows.</td></tr>
 <tr><td>Parser and diagnostics</td><td>Source-aware lexical/statement parser with line locations; conservative conversion errors and warnings.</td></tr>
-<tr><td>DATA steps</td><td>SET/WHERE, row filters, assignments, IF/ELSE, nested IF/DO and SELECT blocks, OUTPUT routing, MERGE BY and IN= flags, RETAIN variants, arrays, loops, inline DATALINES, _N_, LAG/DIF, and supported SET dataset options.</td></tr>
+<tr><td>DATA steps</td><td>SET/WHERE, row filters, assignments, CALL MISSING for explicit variable names, IF/ELSE, nested IF/DO and SELECT blocks, OUTPUT routing, MERGE BY and IN= flags, RETAIN variants, arrays, loops, inline DATALINES, _N_, LAG/DIF, and supported SET dataset options.</td></tr>
 <tr><td>Procedures</td><td>PROC SQL, SORT, FREQ, MEANS/SUMMARY, UNIVARIATE approximation, TRANSPOSE, FORMAT, APPEND, DATASETS, IMPORT/EXPORT, PRINT, CONTENTS, COPY, and COMPARE within documented options.</td></tr>
 <tr><td>Macros</td><td>%LET, macro variables, %MACRO calls and parameters, bounded nested/recursive expansion, compile-time %IF/%DO, text functions, %SYSFUNC subset, runtime variables, opt-in %SYSGET, and bounded dynamic %INCLUDE paths.</td></tr>
 <tr><td>Dates and formats</td><td>SAS date-day and datetime-second counts, date/datetime literals, common date functions, supported informats/formats, VALUE/INVALUE/PICTURE definitions, and CNTLIN conversion for standard control columns.</td></tr>
@@ -164,6 +164,7 @@ code { color: #0f456e; font: 0.94em Consolas, monospace; }
 <ul>
   <li>Simple SET sources union by name; supported dataset options apply WHERE, FIRSTOBS/OBS, KEEP/DROP, then RENAME. MERGE BY approximates SAS match-merge behavior with windows and joins; per-input <code>ORDER_BY=(...)</code> options provide deterministic duplicate-key pairing.</li>
   <li>Nested block statements are converted to guarded assignments. IF/SELECT conditions that are unsafe to model are rejected.</li>
+  <li>Character/conditional RETAIN is supported with a single-input SET and BY; retained values carry across BY groups unless source code resets them. Use the DATA-step ORDER BY extension to make observation order deterministic.</li>
   <li>Output-producing indexed loops accept integer literal or compile-time integer-expression bounds and steps. Statically bounded non-OUTPUT loops are unrolled under a statement cap.</li>
   <li>PROC PRINT maps to <code>DataFrame.show()</code>; CONTENTS displays a schema or column names and can emit Spark schema metadata with <code>OUT=</code>; COPY aliases views; COMPARE emits a limited summary.</li>
   <li>CSV IMPORT/EXPORT use Spark CSV readers/writers. PROC FORMAT supports documented static mappings and a bounded CNTLIN path.</li>

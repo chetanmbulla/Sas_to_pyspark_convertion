@@ -1194,6 +1194,36 @@ data b; set a; rownum = _n_; if _n_ <= 1; keep id rownum; run;
             with self.assertRaises(ConversionError, msg=bad):
                 SasToPySparkConverter().convert(bad)
 
+    def test_call_missing_clears_multiple_data_step_variables(self):
+        result = SasToPySparkConverter().convert(
+            "data out; set source; call missing(score, label); run;"
+        )
+        self.assertIn("F.lit(None).cast", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+        for source in (
+            "data out; set source; call missing(); run;",
+            "data out; set source; call missing(score + 1); run;",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError):
+                    SasToPySparkConverter().convert(source)
+
+    def test_character_retain_is_supported_with_by(self):
+        result = SasToPySparkConverter().convert(
+            """
+            data carried;
+              set source;
+              by group;
+              retain last_label '';
+              if not missing(label) then last_label = label;
+              order by sequence;
+            run;
+            """
+        )
+        self.assertIn("over (order by `sequence` asc", result.code)
+        self.assertIn("NOT label IS NULL", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
     def test_runtime_macro_variables_and_restrictions(self):
         prefix = "proc sql; select max(x) into :mx from a; quit;\n"
         code = SasToPySparkConverter().convert(

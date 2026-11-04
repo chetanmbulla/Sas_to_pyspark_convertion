@@ -128,6 +128,12 @@ def _rewrite_step(
         for item in kept
         if (match := re.match(r"(?:.*?\bthen\s+)?([A-Za-z_]\w*)\s*=(?!=)", item.text.strip(), re.I | re.S))
     }
+    for item in kept:
+        call = re.fullmatch(
+            r"call\s+missing\s*\(([^()]*)\)", item.text.strip(), re.I | re.S
+        )
+        if call is not None:
+            assigned.update(name.strip().casefold() for name in call.group(1).split(","))
     truncations = [
         MacroStatement(f"{name} = substr({name}, 1, {size})", closer.line if closer else 0)
         for name, size in lengths.items()

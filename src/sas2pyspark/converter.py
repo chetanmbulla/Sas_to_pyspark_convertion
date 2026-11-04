@@ -188,6 +188,7 @@ class _DataAction:
     kind: str
     expression: str
     column: str | None = None
+    columns: tuple[str, ...] = ()
     condition: str | None = None
     otherwise: str | None = None
     loop_start: int | None = None
@@ -1059,6 +1060,29 @@ class SasToPySparkConverter:
                             "Every RETAIN variable needs a numeric literal initial "
                             "value; character and uninitialized RETAIN are unsupported."
                         )
+                elif lower.startswith("call missing"):
+                    call = re.fullmatch(
+                        r"call\s+missing\s*\((.*)\)", statement, re.IGNORECASE | re.DOTALL
+                    )
+                    names = (
+                        [name.strip() for name in call.group(1).split(",")]
+                        if call is not None
+                        else []
+                    )
+                    if not names or any(
+                        not re.fullmatch(r"[A-Za-z_]\w*", name) for name in names
+                    ):
+                        raise ConversionError(
+                            "CALL MISSING supports one or more simple variable names, "
+                            "for example CALL MISSING(score, label)."
+                        )
+                    actions.append(
+                        _DataAction(
+                            kind="missing",
+                            expression="",
+                            columns=tuple(dict.fromkeys(names)),
+                        )
+                    )
                 elif lower.startswith("set "):
                     if sources is not None or merge_sources is not None:
                         raise ConversionError(
@@ -1836,7 +1860,7 @@ class SasToPySparkConverter:
                         f"__sas2pyspark_window.partitionBy({prefix}).orderBy("
                         f"{last_flag_order})) == 1)"
                     )
-        for action in actions:
+        for action_index, action in enumerate(actions):
             if action is row_number_action:
                 continue
             if action.kind == "merge":
@@ -1858,6 +1882,26 @@ class SasToPySparkConverter:
                 lines.append(
                     f"{_python_name(target)} = {_python_name(target)}.withColumn({action.column!r}, F.expr({action.expression!r}))"
                 )
+            elif action.kind == "missing" and action.columns:
+                frame = _python_name(target)
+                for column_index, column in enumerate(action.columns):
+                    matches = (
+                        f"__sas2pyspark_missing_matches_{action_index}_{column_index}"
+                    )
+                    lines.extend(
+                        [
+                            f"{matches} = [name for name in {frame}.columns "
+                            f"if name.casefold() == {column!r}.casefold()]",
+                            f"if len({matches}) > 1:",
+                            "    raise ValueError('CALL MISSING variable is "
+                            "ambiguous in the input DataFrame.')",
+                            f"{frame} = {frame}.withColumn("
+                            f"{matches}[0] if {matches} else {column!r}, "
+                            f"F.lit(None).cast("
+                            f"{frame}.schema[{matches}[0]].dataType "
+                            f"if {matches} else 'double'))",
+                        ]
+                    )
             elif (
                 action.kind == "retain_sum"
                 and action.column is not None

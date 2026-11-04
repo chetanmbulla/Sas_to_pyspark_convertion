@@ -147,10 +147,10 @@ def _rewrite_step(body: list[MacroStatement]) -> tuple[list[MacroStatement], lis
         if parts is not None and parts[1].casefold() in declared:
             assignments[parts[1].casefold()].append((position, parts[0], parts[2]))
     retain_items = [item for item in body if re.match(r"retain\s", item.text.strip(), re.I)]
-    if any(re.match(r"(?:by|merge)\s", item.text.strip(), re.I) for item in body):
+    if any(re.match(r"merge\s", item.text.strip(), re.I) for item in body):
         raise MacroExpansionError(
-            "Character or conditional RETAIN is supported only in single-SET steps "
-            "without BY or MERGE.",
+            "Character or conditional RETAIN is supported only in single-SET steps; "
+            "MERGE is unsupported.",
             retain_items[0],
         )
 
