@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .includes import IncludeError, inline_includes
-from .user_formats import FormatError, has_format, register_value, reset_formats
+from .user_formats import (
+    FormatError,
+    cntlin_dataset,
+    has_format,
+    register_invalue,
+    register_cntlin,
+    register_picture,
+    register_value,
+    reset_formats,
+)
 
 from .macro_processor import (
     MacroExpansionError,
@@ -16,7 +26,14 @@ from .macro_processor import (
     expand_macros,
 )
 from .data_blocks import rewrite_if_blocks
+from .data_length import rewrite_length
+from .data_retain import rewrite_retain
+from .data_unroll import rewrite_arrays_and_loops
 from .data_outputs import rewrite_outputs
+from .data_lines import DATALINES_MARKER, rewrite_datalines
+from .data_lag import rewrite_lag
+from .set_options import SETOPTS_MARKER, rewrite_set_options
+from .data_rownum import rewrite_row_number
 from .data_symput import SYMPUT_MARKER, VALUE_COLUMN, rewrite_symput
 from .date_functions import (
     DATE_FUNCTIONS,
@@ -27,6 +44,20 @@ from .date_functions import (
 )
 from .sas_parser import SasParseError, parse_program
 from .sql_calculated import rewrite_calculated
+
+# Source-to-source passes applied in order after macro expansion.
+_REWRITE_PASSES = (
+    rewrite_set_options,
+    rewrite_arrays_and_loops,
+    rewrite_lag,
+    rewrite_row_number,
+    rewrite_datalines,
+    rewrite_symput,
+    rewrite_outputs,
+    rewrite_if_blocks,
+    rewrite_retain,
+    rewrite_length,
+)
 
 
 class ConversionError(ValueError):
@@ -266,7 +297,7 @@ def _expression(value: str) -> str:
         (r"\bnot\b", "NOT"),
         (r"\bupcase\s*\(", "upper("),
         (r"\blowcase\s*\(", "lower("),
-        (r"\btoday\s*\(\s*\)", "current_date()"),
+        (r"\btoday\s*\(\s*\)", "datediff(current_date(), DATE'1960-01-01')"),
     )
 
     def translate_unquoted(part: str) -> str:
@@ -560,6 +591,9 @@ def _render_function(name: str, arguments: list[str]) -> str:
 class SasToPySparkConverter:
     """Convert supported SAS DATA steps and procedures into PySpark."""
 
+    def __init__(self, *, allow_sysget: bool = False) -> None:
+        self.allow_sysget = allow_sysget
+
     def convert(
         self,
         source: str,
@@ -578,18 +612,15 @@ class SasToPySparkConverter:
             raise ConversionError(error.message, line=error.line) from error
         try:
             parsed_program = parse_program(source)
-            statements = rewrite_if_blocks(
-                rewrite_outputs(
-                    rewrite_symput(
-                        expand_macros(
-                            [
-                                _Statement(statement.text, statement.span.start_line)
-                                for statement in parsed_program.statements
-                            ]
-                        )
-                    )
-                )
+            statements = expand_macros(
+                [
+                    _Statement(statement.text, statement.span.start_line)
+                    for statement in parsed_program.statements
+                ],
+                allow_sysget=self.allow_sysget,
             )
+            for rewrite in _REWRITE_PASSES:
+                statements = rewrite(statements)
         except SasParseError as error:
             raise ConversionError(
                 error.message,
@@ -620,7 +651,58 @@ class SasToPySparkConverter:
             statement = statements[index]
             lower = statement.text.lower()
             try:
-                if lower.startswith(SYMPUT_MARKER + " "):
+                if lower.startswith(SETOPTS_MARKER + " "):
+                    payload = json.loads(statement.text[len(SETOPTS_MARKER) + 1 :])
+                    frame = _python_name(payload["name"])
+                    lines = [f"{frame} = {_python_name(_dataset_name(payload['source']))}"]
+                    if payload["where"]:
+                        try:
+                            condition = _expression(payload["where"])
+                        except ConversionError as error:
+                            raise ConversionError(
+                                error.message,
+                                line=statement.line,
+                                statement=statement.text,
+                            ) from error
+                        lines.append(f"{frame} = {frame}.filter(F.expr({condition!r}))")
+                    first, last = payload["firstobs"], payload["obs"]
+                    if first is not None or last is not None:
+                        number = "__sas2pyspark_obs"
+                        bounds = []
+                        if first is not None:
+                            bounds.append(f"(F.col({number!r}) >= {first})")
+                        if last is not None:
+                            bounds.append(f"(F.col({number!r}) <= {last})")
+                        lines.append(
+                            f"{frame} = {frame}.withColumn({number!r}, F.expr("
+                            "'row_number() over (order by monotonically_increasing_id())'))"
+                            f".filter({' & '.join(bounds)}).drop({number!r})"
+                        )
+                    if payload["keep"]:
+                        lines.append(f"{frame} = {frame}.select(*{payload['keep']!r})")
+                    if payload["drop"]:
+                        lines.append(f"{frame} = {frame}.drop(*{payload['drop']!r})")
+                    for old, new in payload["rename"]:
+                        lines.append(f"{frame} = {frame}.withColumnRenamed({old!r}, {new!r})")
+                    output.extend([*lines, ""])
+                    index += 1
+                elif lower.startswith(DATALINES_MARKER + " "):
+                    payload = json.loads(statement.text[len(DATALINES_MARKER) + 1 :])
+                    name = _dataset_name(payload["name"])
+                    schema = ", ".join(
+                        f"{column} {'string' if kind == 'char' else 'double'}"
+                        for column, kind in payload["columns"]
+                    )
+                    output.extend(
+                        [
+                            f"{_python_name(name)} = spark.createDataFrame("
+                            f"{[tuple(row) for row in payload['rows']]!r}, {schema!r})",
+                            f"{_python_name(name)}.createOrReplaceTempView({_sql_name(name)!r})",
+                            "",
+                        ]
+                    )
+                    index += 1
+                elif lower.startswith(SYMPUT_MARKER + " "):
                     _, variable, derived = statement.text.split()
                     frame = _python_name(derived)
                     output.extend(
@@ -712,6 +794,22 @@ class SasToPySparkConverter:
                 elif lower == "proc export" or lower.startswith("proc export "):
                     block, index = self._convert_export(statements, index)
                     output.extend(block)
+                elif lower.split(None, 1)[0] in {"title", "footnote", "ods"} or re.match(
+                    r"(title|footnote)\d+(\s|$)", lower
+                ):
+                    output.extend([f"# Ignored report statement: {statement.text[:70]}", ""])
+                    if not any("TITLE/FOOTNOTE/ODS" in item for item in warnings):
+                        warnings.append(
+                            "TITLE/FOOTNOTE/ODS statements are ignored; no report "
+                            "formatting is generated."
+                        )
+                    index += 1
+                elif lower in {"proc print", "proc contents", "proc copy", "proc compare"} or lower.startswith(
+                    ("proc print ", "proc contents ", "proc copy ", "proc compare ")
+                ):
+                    block, index, block_warnings = self._convert_report_proc(statements, index)
+                    output.extend(block)
+                    warnings.extend(block_warnings)
                 else:
                     raise ConversionError(
                         f"Unsupported top-level statement: {statement.text[:80]!r}."
@@ -2022,8 +2120,16 @@ class SasToPySparkConverter:
         self, statements: list[_Statement], start: int
     ) -> tuple[list[str], int]:
         header = statements[start].text[len("proc format") :].strip()
-        if header:
+        cntlin_match = re.fullmatch(
+            r"cntlin\s*=\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)",
+            header,
+            re.I,
+        )
+        if header and cntlin_match is None:
             raise ConversionError(f"Unsupported PROC FORMAT option: {header!r}.")
+        if cntlin_match:
+            dataset = _dataset_name(cntlin_match.group(1))
+            register_cntlin(dataset)
         names: list[str] = []
         index = start + 1
         while index < len(statements):
@@ -2032,9 +2138,24 @@ class SasToPySparkConverter:
             if lower in {"run", "quit"}:
                 break
             try:
+                if cntlin_match:
+                    raise ConversionError(
+                        "PROC FORMAT CNTLIN= does not accept VALUE, INVALUE or PICTURE "
+                        "statements in the same step."
+                    )
                 if lower.startswith("value "):
                     try:
                         names.append(register_value(source_statement.text).name)
+                    except FormatError as error:
+                        raise ConversionError(str(error)) from error
+                elif lower.startswith("invalue "):
+                    try:
+                        names.append(register_invalue(source_statement.text).name)
+                    except FormatError as error:
+                        raise ConversionError(str(error)) from error
+                elif lower.startswith("picture "):
+                    try:
+                        names.append(register_picture(source_statement.text).name)
                     except FormatError as error:
                         raise ConversionError(str(error)) from error
                 else:
@@ -2050,6 +2171,46 @@ class SasToPySparkConverter:
             index += 1
         else:
             raise ConversionError("PROC FORMAT is missing RUN.")
+        if cntlin_match:
+            source = _python_name(dataset)
+            lines = [
+                "# PROC FORMAT CNTLIN: rows are collected to the driver; use a small control dataset.",
+                "from pyspark.sql.types import StringType as __sas2pyspark_format_string_type",
+                f"__sas2pyspark_cntlin_rows = {source}.select("
+                "'FMTNAME', 'TYPE', 'START', 'END', 'LABEL', 'HLO').collect()",
+                "__sas2pyspark_cntlin_formats = {}",
+                "for __row in __sas2pyspark_cntlin_rows:",
+                "    __name = str(__row['FMTNAME']).casefold().lstrip('$')",
+                "    __sas2pyspark_cntlin_formats.setdefault(__name, []).append((",
+                "        str(__row['TYPE']).upper(), __row['START'], __row['END'],",
+                "        __row['LABEL'], str(__row['HLO'] or '').upper()))",
+                "def __sas2pyspark_cntlin_apply(__name, __value):",
+                "    if __value is None:",
+                "        return None",
+                "    __entries = __sas2pyspark_cntlin_formats.get(str(__name).casefold().lstrip('$'))",
+                "    if __entries is None:",
+                "        raise ValueError(f'CNTLIN format {__name!r} is not defined.')",
+                "    __other = None",
+                "    for __kind, __start, __end, __label, __hlo in __entries:",
+                "        if 'O' in __hlo:",
+                "            __other = __label",
+                "            continue",
+                "        if __kind == 'N':",
+                "            __value_cmp = float(__value)",
+                "            __start_cmp = float(__start) if __start is not None else float('-inf')",
+                "            __end_cmp = float(__end) if __end is not None else __start_cmp",
+                "        else:",
+                "            __value_cmp = str(__value)",
+                "            __start_cmp = str(__start) if __start is not None else ''",
+                "            __end_cmp = str(__end) if __end is not None else __start_cmp",
+                "        if __start_cmp <= __value_cmp <= __end_cmp:",
+                "            return None if __label is None else str(__label)",
+                "    return None if __other is None else str(__other)",
+                "spark.udf.register('sas2pyspark_cntlin_format', "
+                "__sas2pyspark_cntlin_apply, __sas2pyspark_format_string_type())",
+                "",
+            ]
+            return lines, index + 1
         return [f"# PROC FORMAT: defined {', '.join(names)}; applied where PUT() uses them.", ""], index + 1
 
     def _parse_libname(self, text: str) -> str:
@@ -2188,6 +2349,141 @@ class SasToPySparkConverter:
             raise ConversionError("PROC DATASETS is missing RUN or QUIT.")
         lines.append("")
         return lines, index
+
+    def _convert_report_proc(
+        self, statements: list[_Statement], start: int
+    ) -> tuple[list[str], int, list[str]]:
+        header = statements[start].text
+        proc = header.split()[1].lower()
+        options: dict[str, str] = {}
+        flags: set[str] = set()
+        for token in re.findall(r"[\w.]+(?:\s*=\s*\(?[\w.]+\)?)?", header[len("proc " + proc) :]):
+            if "=" in token:
+                key, value = (part.strip() for part in token.split("=", 1))
+                options[key.lower()] = value.strip("()")
+            else:
+                flags.add(token.lower())
+        if re.search(r"=\s*[\w.]+\s*\(", header):
+            raise ConversionError(f"PROC {proc.upper()} does not support dataset options.")
+
+        body: list[_Statement] = []
+        index = start + 1
+        while index < len(statements):
+            lower = statements[index].text.strip().lower()
+            if lower in {"run", "quit"}:
+                index += 1
+                break
+            if lower.startswith(("proc ", "data ")):
+                break
+            body.append(statements[index])
+            index += 1
+
+        def frame(name: str) -> str:
+            if not re.fullmatch(r"(?:\w+\.)?\w+", name):
+                raise ConversionError(f"Unsupported dataset reference: {name!r}.")
+            return _python_name(_dataset_name(name))
+
+        def reject(item: _Statement) -> ConversionError:
+            return ConversionError(
+                f"Unsupported PROC {proc.upper()} statement: {item.text[:60]!r}.",
+                line=item.line,
+                statement=item.text,
+            )
+
+        lines: list[str] = []
+        warnings: list[str] = []
+        if proc == "print":
+            allowed_flags = {"noobs", "label", "n", "double", "uniform"}
+            if "data" not in options or not flags <= allowed_flags or set(options) - {"data", "obs"}:
+                raise ConversionError(
+                    "PROC PRINT supports DATA=, OBS=, NOOBS and the VAR and WHERE statements."
+                )
+            if "obs" in options and not options["obs"].isdigit():
+                raise ConversionError("PROC PRINT OBS= requires a positive integer.")
+            target = frame(options["data"])
+            columns: list[str] = []
+            conditions: list[str] = []
+            for item in body:
+                text = item.text.strip()
+                if re.match(r"var\s", text, re.I):
+                    columns = text.split()[1:]
+                    if any(not re.fullmatch(r"[A-Za-z_]\w*", name) for name in columns):
+                        raise reject(item)
+                elif re.match(r"where\s", text, re.I):
+                    try:
+                        conditions.append(_expression(text[6:].strip()))
+                    except ConversionError as error:
+                        raise ConversionError(
+                            error.message, line=item.line, statement=item.text
+                        ) from error
+                else:
+                    raise reject(item)
+            expression = target
+            for condition in conditions:
+                expression += f".filter(F.expr({condition!r}))"
+            if columns:
+                expression += f".select(*{columns!r})"
+            limit = int(options["obs"]) if "obs" in options else 1000
+            lines.append(f"{expression}.show({limit}, truncate=False)")
+            warnings.append(
+                "PROC PRINT is converted to DataFrame.show(); output is capped at "
+                f"{limit} rows and is not formatted like SAS listing output."
+            )
+        elif proc == "contents":
+            if "data" not in options or not flags <= {"noprint", "short", "varnum"} or set(options) - {"data"}:
+                raise ConversionError("PROC CONTENTS supports DATA=, NOPRINT, SHORT and VARNUM.")
+            if body:
+                raise reject(body[0])
+            if "noprint" not in flags:
+                lines.append(f"{frame(options['data'])}.printSchema()")
+            else:
+                lines.append("# PROC CONTENTS NOPRINT: nothing to display.")
+        elif proc == "copy":
+            if set(options) - {"in", "out"} or flags - {"memtype", "nolist"} or "in" not in options or "out" not in options:
+                raise ConversionError("PROC COPY requires IN= and OUT= and supports no other options.")
+            members: list[str] = []
+            for item in body:
+                text = item.text.strip()
+                if re.match(r"select\s", text, re.I):
+                    members.extend(text.split()[1:])
+                else:
+                    raise reject(item)
+            if not members:
+                raise ConversionError(
+                    "PROC COPY requires a SELECT statement; copying a whole library "
+                    "cannot be resolved at conversion time."
+                )
+            for member in members:
+                source = _dataset_name(f"{options['in']}.{member}")
+                destination = _dataset_name(f"{options['out']}.{member}")
+                lines.extend(
+                    [
+                        f"{_python_name(destination)} = {_python_name(source)}",
+                        f"{_python_name(destination)}.createOrReplaceTempView({_sql_name(destination)!r})",
+                    ]
+                )
+        else:
+            if "base" not in options or "compare" not in options or flags - {"noprint", "brief", "listall"} or set(options) - {"base", "compare"}:
+                raise ConversionError("PROC COMPARE supports BASE= and COMPARE= only.")
+            if body:
+                raise reject(body[0])
+            base, other = frame(options["base"]), frame(options["compare"])
+            lines.extend(
+                [
+                    f"__only_base = {base}.exceptAll({other}.select(*{base}.columns)).count() if set({base}.columns) <= set({other}.columns) else None",
+                    f"__only_compare = {other}.select(*{base}.columns).exceptAll({base}).count() if set({base}.columns) <= set({other}.columns) else None",
+                    f"print('PROC COMPARE: base rows', {base}.count(), 'compare rows', {other}.count(),",
+                    "      'only in base', __only_base, 'only in compare', __only_compare,",
+                    f"      'columns only in base', sorted(set({base}.columns) - set({other}.columns)),",
+                    f"      'columns only in compare', sorted(set({other}.columns) - set({base}.columns)))",
+                ]
+            )
+            warnings.append(
+                "PROC COMPARE prints a row and column difference summary only; "
+                "SAS's per-variable value comparison report is not generated."
+            )
+        lines.append("")
+        return lines, index, warnings
 
     def _convert_freq(
         self, statements: list[_Statement], start: int, freq_count: int
@@ -3057,6 +3353,10 @@ class SasToPySparkConverter:
         ).strip()
 
 
-def convert_sas(source: str, *, sas_version: str = "auto") -> ConversionResult:
+def convert_sas(
+    source: str, *, sas_version: str = "auto", allow_sysget: bool = False
+) -> ConversionResult:
     """Convenience function for converting SAS source text."""
-    return SasToPySparkConverter().convert(source, sas_version=sas_version)
+    return SasToPySparkConverter(allow_sysget=allow_sysget).convert(
+        source, sas_version=sas_version
+    )

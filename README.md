@@ -179,6 +179,13 @@ else:
         print(f"Warning: {warning}")
 ```
 
+`%SYSGET` is disabled by default because it reads the converter host's
+environment. To opt in explicitly, use
+`SasToPySparkConverter(allow_sysget=True).convert(source)` or
+`convert_sas(source, allow_sysget=True)`. It reads the named environment
+variable during conversion; missing variables raise an error. Do not use this
+option when environment values may contain secrets or untrusted code.
+
 `result.code` is generated PySpark source; it is not executed by the converter.
 To run it, provide a Spark session named `spark` and an input DataFrame named
 `df_people`, or use the GUI or `sas2pyspark project run` workflow to load files
@@ -186,9 +193,9 @@ and execute it.
 
 ## Supported syntax
 
-- DATA steps with one or more simple `SET` input datasets, `WHERE` and row-filtering `IF` conditions, simple assignments, same-column `IF ... THEN assignment; [ELSE IF ... THEN assignment;] [ELSE assignment;]` branches, bounded `SELECT; WHEN (...) assignment; ... OTHERWISE assignment; END;` branches, limited numeric `RETAIN` accumulators, explicit one-dimensional arrays with constant indexes, `BY`-group `FIRST.`/`LAST.` flags, and `KEEP` or `DROP`.
+- DATA steps with one or more `SET` inputs and the supported dataset options, filters, assignments, nested `IF`/`DO`/`SELECT`, numeric accumulator and character/conditional `RETAIN` subsets, static arrays and bounded loop unrolling, `BY` flags, `OUTPUT` routing, inline `DATALINES`, `_N_`, `LAG`/`DIF`, `KEEP` and `DROP` (see the detailed limitations below).
 - Sequential `%LET name=value` definitions and `&name` substitution.
-- User-defined `%MACRO`/`%MEND` macros with positional and keyword parameters, defaults, nested calls, and inline calls that expand to one statement.
+- User-defined `%MACRO`/`%MEND` macros with positional and keyword parameters, defaults, nested calls (including calls inside arguments), bounded recursion, and inline calls that expand to one statement. `%SYSGET` is opt-in through the Python API; dynamic `%INCLUDE` paths may use preceding `%LET` values.
 - Compile-time `%IF`/`%THEN`/`%ELSE` branches with simple comparisons and `AND`/`OR`/`NOT`, plus bounded integer `%DO` loops.
 - Indexed integer `DO ... TO ... [BY ...]` loops when the loop ends with one `OUTPUT`, with simple assignments in the loop body.
 - `MERGE` of two or more datasets followed by `BY`, including duplicate BY keys (one-to-many and many-to-many) and `IN=` dataset options.
@@ -200,12 +207,19 @@ and execute it.
   numeric and `$char` formats with single values, lists, ranges (`low`, `high`, `<`
   exclusions, `.` for missing) and `OTHER`; they apply through `PUT(x, name.)` and
   become `CASE` expressions. Unmatched values show as their own text (`.` for missing
-  numerics). `INVALUE`, `PICTURE`, `CNTLIN=` and format options are rejected. `LIBNAME lib 'path';` / `LIBNAME lib CLEAR;`
-  are accepted as no-ops with a warning (library prefixes are dropped). `%INCLUDE 'file';`
-  with a quoted literal path is inlined before parsing; paths resolve relative to the
-  including file, must stay inside the source directory (or repository root in batch
-  mode), and circular or dynamic includes are rejected. Line numbers in errors from
-  included code refer to the expanded source.
+  numerics). `INVALUE` supports exact input mappings and `OTHER`; numeric and `$`
+  character outputs are supported. `PICTURE` supports simple `0`/`9` masks with an
+  optional decimal and `PREFIX=`, `MULT=` and `ROUND`. `PROC FORMAT CNTLIN=` supports
+  standard `FMTNAME`, `TYPE`, `START`, `END`, `LABEL` and `HLO` columns; its rows are
+  collected to the driver and should remain small. `LIBNAME lib 'path';` / `LIBNAME lib CLEAR;`
+  are accepted as no-ops with a warning (library prefixes are dropped).
+  `%INCLUDE 'file';` with a quoted path is inlined before parsing; paths resolve
+  relative to the including file, must stay inside the source directory (or
+  repository root in batch mode), and circular includes are rejected. A quoted
+  path may contain macro variables set by preceding `%LET` statements. Unresolved
+  paths, paths outside the allowed root, and dynamic includes inside macro
+  definitions are rejected. Line numbers in errors from included code refer to
+  the expanded source.
 - `PROC FREQ` one-way and two-way `TABLES`, with counts, percentages,
   optional `OUT=`, and the `MISSING` option.
 - `PROC MEANS` and `PROC SUMMARY` with `VAR`, optional `CLASS`, selected
@@ -223,7 +237,7 @@ basic SAS tokens and macro references. It currently provides a lexical and
 statement-parsing foundation only; it is not a complete SAS grammar, and
 DATA-step/PROC semantics remain limited to the constructs listed above.
 
-The converter fails with `ConversionError` on syntax outside this subset instead of silently generating a misleading translation. Errors identify the SAS source line and offending statement when available. A `SET` statement with multiple simple datasets concatenates them with Spark `unionByName(allowMissingColumns=True)`; this fills columns absent from an input with `NULL`, but Spark row order is unspecified and type coercion may differ from SAS. Dataset options on `SET` remain unsupported. `MERGE ... BY` follows SAS match-merge semantics: within each BY group, output has as many rows as the largest input group, and an input with fewer rows repeats its last row (one-to-many and many-to-many). It uses window functions plus left joins, preserves later-dataset overwrite behavior, and orders output by BY keys. Row order inside a duplicated key group follows Spark's incidental order (not guaranteed), so many-to-many pairings are only reproducible when inputs carry a deterministic order. `IN=` flags (`merge a(in=ina) b(in=inb);`) become boolean columns usable in `IF ina and inb;` / `IF ina = 1;` and are dropped from the output. Null BY keys match each other; normalize blank/padded character keys consistently in Spark inputs to match SAS fixed-width character behavior. Other dataset options and `WHERE` on MERGE are unsupported. Conditional branches must be simple assignments to the same column. `IF cond THEN col = expr;` without `ELSE` keeps the existing value of `col` (or `NULL` when the column does not exist yet), and `ELSE IF` chains are supported; `IF cond THEN DO; ... END;` blocks (with `ELSE IF ... THEN DO;` / `ELSE DO;`) are rewritten into per-statement conditionals, and `IF cond THEN DELETE;` becomes a filter that keeps rows whose condition is false or missing. Blocks may contain only simple assignments and `DELETE`; nested `DO`/`SELECT`/`IF`, `OUTPUT`, and conditions that reference a column assigned inside the same block are rejected. Other `IF ... THEN` forms and nested control flow are unsupported. Multi-dataset DATA steps and `OUTPUT` routing are supported when the routing statements (`IF c THEN OUTPUT ds;`, `ELSE IF ... OUTPUT`, `ELSE OUTPUT`, `OUTPUT [ds ...];`, bare `OUTPUT;` for all datasets) are the final statements; each target dataset becomes its own DATA step with a subsetting filter (rows whose condition is missing fall through to `ELSE`), so shared upstream logic is recomputed per target. A dataset written by more than one routing group (which would create duplicate rows), a dataset never written, `OUTPUT` followed by more statements, and `OUTPUT` inside `DO` blocks are rejected. Supported output-generating DO loops require integer literal bounds/step, a nonzero step, simple assignments, and exactly one final `OUTPUT`; stateful self-updating assignments, nested loops, and other OUTPUT patterns are rejected. `CAT` concatenates values without trimming and maps Spark `NULL` inputs to empty strings; `CATS` trims each input before concatenating. `CATX` trims values and skips missing/blank inputs. `STRIP` trims both ends and maps `NULL` to an empty string. `COALESCE` uses Spark null semantics for numeric values; `COALESCEC` treats `NULL` and whitespace-only strings as missing, returns the first non-missing value unchanged, and returns an empty string when all inputs are missing. These rules model character missing values as Spark `NULL`, empty, or whitespace-only strings. `COMPRESS` supports the optional character set but not SAS modifiers. `ROUND` supports a positive numeric literal as its rounding unit. `SUBSTR` uses Spark's one-based substring indexing; start positions and lengths must be positive for SAS-compatible results. Date support treats SAS dates as Spark `DATE` values (not day counts since 1960): date literals such as `'01JAN2024'd`; `MDY` (invalid dates give missing), `QTR`, `WEEKDAY` (Sunday=1) and `DATDIF(...,'ACT/ACT')`; `INTCK` and `INTNX` for `DAY`, `WEEK` (Sunday start), `MONTH`, `QTR` and `YEAR` with a quoted literal interval, discrete boundary counting, and `INTNX` alignments `BEGINNING`/`END`/`SAME`; `YEAR`, `MONTH`, `DAY` and `TODAY()` pass through to Spark. `PUT(value, fmt)` supports `DATE9.`, `YYMMDD10.`, `YYMMDDN8.`, `MMDDYY10.`, `DDMMYY10.`, `Zw.` and `w.d` (missing numbers render as `.`); `INPUT(text, informat)` supports the same date informats and `w.` numeric parsing (invalid text gives missing; invalid dates raise a Spark error under ANSI mode). A `FORMAT var fmt.;` statement is accepted for those formats but is display-only: values are unchanged and a warning is emitted, so use `PUT` where formatted text is needed. Other formats, user-defined `PROC FORMAT`, datetime values, and character formats are not implemented. Advanced macro processing, advanced array behavior, other SAS-specific functions, and most non-SQL procedures are not implemented.
+The converter fails with `ConversionError` on syntax outside this subset instead of silently generating a misleading translation. Errors identify the SAS source line and offending statement when available. A `SET` statement with multiple simple datasets concatenates them with Spark `unionByName(allowMissingColumns=True)`; this fills columns absent from an input with `NULL`, but Spark row order is unspecified and type coercion may differ from SAS. Dataset options on `SET` are supported as described under "`LAG`/`DIF` and `SET` dataset options" below. `MERGE ... BY` follows SAS match-merge semantics: within each BY group, output has as many rows as the largest input group, and an input with fewer rows repeats its last row (one-to-many and many-to-many). It uses window functions plus left joins, preserves later-dataset overwrite behavior, and orders output by BY keys. Row order inside a duplicated key group follows Spark's incidental order (not guaranteed), so many-to-many pairings are only reproducible when inputs carry a deterministic order. `IN=` flags (`merge a(in=ina) b(in=inb);`) become boolean columns usable in `IF ina and inb;` / `IF ina = 1;` and are dropped from the output. Null BY keys match each other; normalize blank/padded character keys consistently in Spark inputs to match SAS fixed-width character behavior. Other dataset options and `WHERE` on MERGE are unsupported. Conditional branches must be simple assignments to the same column. `IF cond THEN col = expr;` without `ELSE` keeps the existing value of `col` (or `NULL` when the column does not exist yet), and `ELSE IF` chains are supported; `IF cond THEN DO; ... END;` blocks (with `ELSE IF ... THEN DO;` / `ELSE DO;`) are rewritten into per-statement conditionals, and `IF cond THEN DELETE;` becomes a filter that keeps rows whose condition is false or missing. Blocks may contain simple assignments, `DELETE`, nested `IF`/`ELSE` and nested `SELECT` (see "Nested blocks" below); `OUTPUT`, iterative `DO` loops and conditions that reference a column assigned inside the same block are rejected. Multi-dataset DATA steps and `OUTPUT` routing are supported when the routing statements (`IF c THEN OUTPUT ds;`, `ELSE IF ... OUTPUT`, `ELSE OUTPUT`, `OUTPUT [ds ...];`, bare `OUTPUT;` for all datasets) are the final statements; each target dataset becomes its own DATA step with a subsetting filter (rows whose condition is missing fall through to `ELSE`), so shared upstream logic is recomputed per target. A dataset written by more than one routing group (which would create duplicate rows), a dataset never written, `OUTPUT` followed by more statements, and `OUTPUT` inside `DO` blocks are rejected. Supported output-generating DO loops require integer literal bounds/step, a nonzero step, simple assignments, and exactly one final `OUTPUT`; stateful self-updating assignments, nested loops, and other OUTPUT patterns are rejected. `CAT` concatenates values without trimming and maps Spark `NULL` inputs to empty strings; `CATS` trims each input before concatenating. `CATX` trims values and skips missing/blank inputs. `STRIP` trims both ends and maps `NULL` to an empty string. `COALESCE` uses Spark null semantics for numeric values; `COALESCEC` treats `NULL` and whitespace-only strings as missing, returns the first non-missing value unchanged, and returns an empty string when all inputs are missing. These rules model character missing values as Spark `NULL`, empty, or whitespace-only strings. `COMPRESS` supports the optional character set but not SAS modifiers. `ROUND` supports a positive numeric literal as its rounding unit. `SUBSTR` uses Spark's one-based substring indexing; start positions and lengths must be positive for SAS-compatible results. Date values use SAS numeric day counts from 1960-01-01, and datetime values use numeric seconds from that date. Date literals such as `'01JAN2024'd` and datetime literals such as `'01JAN2024:12:34:56'dt` convert to those counts; invalid calendar dates/times are rejected. `MDY` (invalid dates give missing), `QTR`, `WEEKDAY` (Sunday=1), `DATDIF(...,'ACT/ACT')`, `DATEPART`, `TIMEPART`, `DHMS`, `DATE()`, `TODAY()`, `DATETIME()` and `TIME()` are supported. `INTCK` and `INTNX` support `DAY`, `WEEK` (Sunday start), `MONTH`, `QTR` and `YEAR` with a quoted literal interval, discrete boundary counting, and `INTNX` alignments `BEGINNING`/`END`/`SAME`. `YEAR`, `MONTH` and `DAY` accept SAS date counts. Date `PUT`/`INPUT` support `DATE9.`, `YYMMDD10.`, `YYMMDDN8.`, `MMDDYY10.`, `DDMMYY10.`; datetime `PUT`/`INPUT` support `DATETIME20.` and `E8601DT19.`; numeric `Zw.` and `w.d` formats/informats are also supported. User-defined `VALUE` formats work with `PUT`; simple exact-mapping `INVALUE` definitions work with `INPUT`; `PICTURE` supports simple digit masks with optional prefix/multiplier/rounding; `CNTLIN=` supports the standard control columns but collects rows to the driver and is only suitable for small tables. A `FORMAT var fmt.;` statement is display-only: values are unchanged and a warning is emitted, so use `PUT` where formatted text is needed. Date and datetime inputs remain numeric SAS values, not Spark `DATE`/`TIMESTAMP` columns. Advanced macro processing, advanced array behavior, other SAS-specific functions, and most non-SQL procedures are not implemented.
 
 Macro support is a bounded compile-time expansion, not a complete SAS macro
 processor. It supports sequential `%LET name=value` declarations, `&name`
@@ -278,21 +292,47 @@ dataset/column names (`SET &name`); these raise a conversion error. `SELECT ...
 INTO ... SEPARATED BY`, a non-literal `CALL SYMPUT` name, and `CALL SYMPUT`
 inside `DO`/`SELECT`/`ELSE` blocks are unsupported.
 
-Other macro functions (such as `%SYSGET`, which depends on the machine
-environment) and other macro-language features are
-not implemented. Without `%GLOBAL`, macro variables assigned during a macro call
+`%SYSGET(name)` can read an environment variable only when the converter is
+created with `allow_sysget=True`; it is evaluated at conversion time, is disabled
+by default, and errors if the name is not set. Macro recursion is supported up to
+the 32-level nesting limit; an unbounded recursive call is rejected at that
+limit. Nested macro calls inside arguments are supported when each call expands
+to one statement. Dynamic `%INCLUDE` paths may use macro variables assigned by
+preceding `%LET` statements, but not macro parameters or `%SYSFUNC` expressions.
+Without `%GLOBAL`, macro variables assigned during a macro call
 are scoped to that call and do not modify the caller's variables. Unsupported macro syntax
 raises a conversion error rather than being passed through to generated Python.
 
-The supported `SELECT` form requires a `WHEN` condition and simple assignment
-per branch, all branches must target the same column, and `OTHERWISE` is
-required to define the fallback. `SELECT` value-match syntax, nested blocks,
-and branches containing multiple statements are unsupported.
+The simple `SELECT;` form (a `WHEN` condition and one assignment per branch, all
+targeting the same column, with `OTHERWISE` required) converts to a single `F.when`
+chain. The `SELECT (expr)` value-match form, `WHEN (a, b)` lists, branches that are
+`DO ... END` blocks with several statements, and `SELECT` nested in `IF`/`DO` blocks
+are rewritten into guarded per-statement conditionals, like `IF ... THEN DO` blocks.
 
-`RETAIN` supports one or more numeric variables initialized with numeric
-literals (`retain a b 0 c 10;`, repeated `RETAIN` statements allowed), each
-updated exactly once using `variable = variable + expression`; simple
-assignments may be mixed in. With a `BY` statement, every retained variable
+**Nested blocks.** `IF ... THEN DO` blocks may contain assignments, `DELETE`, nested
+`IF`/`ELSE` and nested `SELECT`; each inner statement is guarded by the combined
+condition of every enclosing branch. Conditions that read a column assigned inside the
+same chain, iterative `DO` loops inside blocks, and `OUTPUT` inside blocks are rejected.
+
+**Character and conditional `RETAIN`.** A retained variable that is not the
+`v = v + expr` accumulator (for example `retain last ''; if x > 1 then last = name;`)
+keeps its previous value on rows where no assignment runs, with the `RETAIN` initial
+value (or missing) before the first assignment. It is computed with a window function
+over `monotonically_increasing_id()` with no partition, so it is best-effort on row
+order and runs on one Spark partition. The variable cannot appear in its own
+assignment, the step cannot use `BY` or `MERGE`, and the variable must be assigned
+before it is read. A retained variable that is never assigned is rejected.
+
+**`LENGTH` and `ATTRIB`.** `LENGTH v $ n` and `ATTRIB v LENGTH=$n` truncate assigned
+character variables with `substring(v, 1, n)` after the step's assignments. Numeric
+lengths, `LABEL=`, `FORMAT=`, `INFORMAT=` and `TRANSCODE=` are accepted and ignored.
+A variable that is never assigned in the step is not created.
+
+**Numeric accumulator `RETAIN`.** This supported form handles one or more numeric
+variables initialized with numeric literals (`retain a b 0 c 10;`, repeated
+`RETAIN` statements allowed), each updated exactly once using
+`variable = variable + expression`; simple assignments may be mixed in. With a
+`BY` statement, every accumulator variable
 needs its own preceding reset of the form
 `if first.key then variable = numeric-literal;`; each running total is
 partitioned by the BY keys through `key`. The increment must evaluate to a
@@ -300,15 +340,39 @@ nonmissing numeric value. Because Spark DataFrames do not preserve input row
 order, generated code uses `monotonically_increasing_id()` as a best-effort
 order and returns a warning; cumulative results are not guaranteed to match
 SAS or remain stable across executions. This is unsuitable when exact SAS
-observation order matters. Character or uninitialized `RETAIN`, other
-conditional updates/resets, and other retained state patterns are unsupported.
+observation order matters. Other numeric conditional updates/resets and
+retained-state patterns are unsupported. Character/conditional retention is
+limited to the narrower form described above (single SET, no BY/MERGE, no
+self-reference).
 
-DATA-step `ARRAY` declarations support one dimension with a positive literal
-size and an explicit list of element variables (including ascending numeric
-name ranges such as `score1-score3`). Array reads and assignment targets with
-positive integer literal indexes are translated to the corresponding Spark
-columns. Dynamic indexes, implicit element creation, multidimensional arrays,
-temporary arrays, and array-specific functions such as `DIM` are unsupported.
+**Report procedures.** `PROC PRINT` (`DATA=`, `OBS=`, `NOOBS`, `VAR`, `WHERE`) becomes `DataFrame.show()` (capped at 1000 rows when `OBS=` is absent; not SAS listing formatting). `PROC CONTENTS` becomes `printSchema()`. `PROC COPY IN= OUT=` requires a `SELECT` list and, because library prefixes are dropped, only aliases the views. `PROC COMPARE BASE= COMPARE=` prints row/column difference counts, not SAS's per-variable report. `TITLE`, `FOOTNOTE` and `ODS` are accepted and ignored with a warning. Dataset options and other statements on these procs are rejected.
+
+**`LAG`/`DIF` and `SET` dataset options.** `lag`/`lagN`/`dif`/`difN` (N up to 100, one argument) become window functions over `monotonically_increasing_id()` via helper columns that are dropped before `run`; calls inside conditionals do not reproduce SAS's lag-queue behaviour. `SET a(where=(...) firstobs=n obs=m keep=|drop= rename=(old=new))` is applied in this order: `WHERE`, `FIRSTOBS`/`OBS` (counted over the filtered rows; `OBS` is the last observation number), `KEEP`/`DROP`, `RENAME`. Other options are rejected. Row order is best effort.
+
+**Inline data and `_N_`.** `data name; [infile datalines dlm='c' [dsd] [missover|truncover];]
+input a b $ c; datalines; ... ; run;` (also `CARDS`) creates a DataFrame from the
+rows with `spark.createDataFrame`. Only list input is supported: names, with `$` for
+character variables; numbers become `double`, `.` or empty values become `NULL`, rows
+with fewer values than variables are padded with missing values, and rows with more
+are an error. Informats, column or pointer input (`@`, `:`, `1-10`), `INFILE` for
+external files, quoted values with spaces in whitespace-delimited data, and extra
+statements after `DATALINES` are unsupported. `data _null_;` with `DATALINES` produces
+nothing. The automatic variable `_N_` is available in `SET`/`MERGE` steps as a row
+number from `monotonically_increasing_id()`, so it is only as reliable as Spark's row
+order.
+
+DATA-step `ARRAY` declarations support `{n}`, `{*}` and multi-dimensional sizes such
+as `{2,3}` (stored row-major), character arrays (`$` with an optional length), implicit
+element names (`array s{3} $ 5;` creates `s1`-`s3`), and explicit element lists with
+ascending numeric ranges such as `score1-score3`. Constant indexes, including simple
+integer arithmetic such as `q{i+1}`, are translated to the corresponding Spark columns,
+and `DIM`, `HBOUND` and `LBOUND` of a declared array become integer literals.
+Iterative `DO i = a TO b [BY c]` loops without `OUTPUT` are unrolled when the bounds
+are integer constants or `DIM(array)`, so `do i = 1 to dim(q); q{i} = ...; end;` works;
+the index variable is left at its final SAS value. Unrolling is capped at 5000
+statements. Variable bounds, `DO WHILE`/`DO UNTIL`, run-time array indexes,
+`_TEMPORARY_` arrays and initial-value lists are rejected because they depend on
+run-time values.
 
 For a `SET` DATA step, one `BY` statement with simple column names enables
 `FIRST.key` and `LAST.key` flags in supported expressions. Spark input order is
@@ -688,6 +752,26 @@ Get-Content input.sas -Raw | sas2pyspark -
 `PROC SORT NODUPKEY` uses a window to keep one row per BY key. Which tied row
 is retained can differ from SAS; the converter emits a warning.
 - Generated programs assume that `spark` and referenced input DataFrames exist. Directly executing generated files requires you to provide them; `project run` creates a local Spark session and binds `--input` datasets. Generated programs import `pyspark.sql.functions as F`, so PySpark must be installed in the selected Python environment.
+
+## Performance check
+
+A local, synthetic Spark check exercised the generated filter/assignment/aggregation
+pipeline (filter `age >= 18`, derive `adult_flag` and `age_band`, then aggregate
+counts and flag sums). With Python 3.11.9, PySpark 4.3.0, Java 17.0.20.1,
+`local[2]`, and two shuffle partitions, cached `Spark.range` inputs were warmed
+and measured three times:
+
+| Input rows | Output rows | Median elapsed |
+|---:|---:|---:|
+| 100,000 | 79,992 | 0.429 s |
+| 1,000,000 | 799,992 | 0.310 s |
+
+Conversion took about 7.84 ms and generated 384 characters. This is a
+reproducibility snapshot, not a benchmark suite or a production throughput
+claim: the run is local, synthetic, cached, and sensitive to Spark startup,
+warm-up, scheduling, and host load. The lower median at the larger input size
+shows the measurements are noisy; benchmark representative uncached data and
+your target cluster before making capacity or scaling decisions.
 
 ## Run tests
 

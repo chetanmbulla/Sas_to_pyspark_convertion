@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from decimal import (
@@ -61,6 +62,7 @@ _MACRO_WHILE = re.compile(r"%do\s+%(while|until)\s*\((.*)\)\s*$", re.I | re.S)
 _MACRO_FUNCTIONS = {
     "eval", "sysevalf", "symexist", "sysfunc", "upcase", "lowcase", "str", "nrstr",
     "quote", "nrquote", "bquote", "nrbquote", "substr", "scan", "index", "length",
+    "sysget",
 }
 _MACRO_LABEL = re.compile(r"%([A-Za-z_]\w*)\s*:(.*)\Z", re.S)
 _RUNTIME_PREFIX = "sas_macro_"
@@ -89,6 +91,7 @@ class _ConditionParser:
         r"\s*(>=|<=|!=|~=|\^=|==|=|>|<|\(|\)|"
         r"\b(?:eq|ne|gt|ge|lt|le|and|or|not)\b|"
         r"\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[^\s()]+)",
+        # %SYSGET is intentionally evaluated only when explicitly enabled.
         re.IGNORECASE,
     )
     _COMPARISONS = {
@@ -526,8 +529,11 @@ def _split_top_level(arguments: str, statement: MacroStatement) -> list[str]:
 
 
 class _MacroProcessor:
-    def __init__(self, statements: list[MacroStatement]) -> None:
+    def __init__(
+        self, statements: list[MacroStatement], *, allow_sysget: bool = False
+    ) -> None:
         self.macros: dict[str, _Macro] = {}
+        self.allow_sysget = allow_sysget
         self.statement_count = 0
         self.returning = False
         self.runtime_names: set[str] = set()
@@ -947,8 +953,6 @@ class _MacroProcessor:
     ) -> list[MacroStatement]:
         if name not in self.macros:
             raise MacroExpansionError(f"Undefined macro %{name}.", statement)
-        if name in call_stack:
-            raise MacroExpansionError(f"Recursive macro call %{name} is unsupported.", statement)
         macro = self.macros[name]
         local_variables = dict(variables)
         positional: list[str] = []
@@ -991,8 +995,27 @@ class _MacroProcessor:
                     f"Missing required parameter {parameter.name!r} for macro %{name}.",
                     statement,
                 )
-            if self._has_unsupported_macro_text(value):
+            value = self._substitute(value, local_variables, statement)
+            unknown_macro_calls = {
+                item.casefold()
+                for item in re.findall(r"%([A-Za-z_]\w*)", value)
+                if item.casefold() not in _MACRO_FUNCTIONS
+                and item.casefold() not in self.macros
+            }
+            if unknown_macro_calls:
                 raise MacroExpansionError("Macro calls inside arguments are unsupported.", statement)
+            if any(
+                item.casefold() in self.macros
+                for item in re.findall(r"%([A-Za-z_]\w*)\s*\(", value)
+            ):
+                expanded_argument = self._expand_inline(
+                    value, local_variables, call_stack, depth, statement
+                )
+                if len(expanded_argument) != 1:
+                    raise MacroExpansionError(
+                        "A nested macro argument must expand to one value.", statement
+                    )
+                value = expanded_argument[0].text
             local_variables[parameter.name.casefold()] = self._substitute(
                 value, local_variables, statement
             )
@@ -1022,7 +1045,11 @@ class _MacroProcessor:
         statement: MacroStatement,
     ) -> list[MacroStatement]:
         expanded = self._substitute(text, variables, statement, allow_runtime=True)
-        matches = list(_MACRO_CALL.finditer(expanded))
+        matches = [
+            match
+            for match in _MACRO_CALL.finditer(expanded)
+            if match.group(1).casefold() in self.macros
+        ]
         for match in reversed(matches):
             name = match.group(1).casefold()
             if name not in self.macros:
@@ -1136,7 +1163,7 @@ class _MacroProcessor:
     ) -> str:
         pattern = re.compile(
             r"%(eval|sysevalf|symexist|sysfunc|upcase|lowcase|str|nrstr|quote|nrquote"
-            r"|bquote|nrbquote|substr|scan|index|length)\s*\(",
+            r"|bquote|nrbquote|substr|scan|index|length|sysget)\s*\(",
             re.IGNORECASE,
         )
         while True:
@@ -1159,6 +1186,24 @@ class _MacroProcessor:
                         "%SYMEXIST requires a macro variable name.", statement
                     )
                 value = "1" if variables is not None and name in variables else "0"
+            elif function == "sysget":
+                if not self.allow_sysget:
+                    raise MacroExpansionError(
+                        "%SYSGET is disabled. Pass allow_sysget=True to "
+                        "SasToPySparkConverter to enable environment-variable access.",
+                        statement,
+                    )
+                environment_name = inner.strip().strip("'\"")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", environment_name):
+                    raise MacroExpansionError(
+                        "%SYSGET requires one environment-variable name.", statement
+                    )
+                if environment_name not in os.environ:
+                    raise MacroExpansionError(
+                        f"%SYSGET environment variable {environment_name!r} is not set.",
+                        statement,
+                    )
+                value = os.environ[environment_name]
             elif function == "sysfunc":
                 value = _sysfunc(inner, statement)
             elif function == "upcase":
@@ -1246,5 +1291,7 @@ class _MacroProcessor:
         raise MacroExpansionError("Unterminated macro invocation.", statement)
 
 
-def expand_macros(statements: list[MacroStatement]) -> list[MacroStatement]:
-    return _MacroProcessor(statements).expand()
+def expand_macros(
+    statements: list[MacroStatement], *, allow_sysget: bool = False
+) -> list[MacroStatement]:
+    return _MacroProcessor(statements, allow_sysget=allow_sysget).expand()

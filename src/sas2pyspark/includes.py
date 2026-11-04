@@ -9,6 +9,11 @@ _INCLUDE = re.compile(
     r"^[ \t]*%include[ \t]+(['\"])(.*?)\1[ \t]*;[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
 _ANY_INCLUDE = re.compile(r"^[ \t]*%include\b", re.IGNORECASE | re.MULTILINE)
+_LET = re.compile(
+    r"^[ \t]*%let[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*([^;\r\n]*);",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VARIABLE = re.compile(r"&([A-Za-z_]\w*)\.?")
 _MAX_DEPTH = 10
 
 
@@ -35,40 +40,86 @@ def inline_includes(
         )
     base = Path(include_dir).resolve()
     root = Path(include_root).resolve() if include_root is not None else base
-    return _expand(source, base, root, (), 0)
+    return _expand(source, base, root, (), 0, {})
 
 
-def _expand(source: str, base: Path, root: Path, stack: tuple[Path, ...], depth: int) -> str:
+def _expand(
+    source: str,
+    base: Path,
+    root: Path,
+    stack: tuple[Path, ...],
+    depth: int,
+    variables: dict[str, str],
+) -> str:
     if depth > _MAX_DEPTH:
         raise IncludeError(f"%INCLUDE nesting is deeper than {_MAX_DEPTH} levels.")
-    literal_spans = {match.start() for match in _INCLUDE.finditer(source)}
+    output: list[str] = []
+    cursor = 0
     for match in _ANY_INCLUDE.finditer(source):
-        if match.start() not in literal_spans:
-            line = source.count("\n", 0, match.start()) + 1
-            raise IncludeError(
-                "%INCLUDE supports only a quoted literal file path.", line=line
+        for let in _LET.finditer(source, cursor, match.start()):
+            variables[let.group(1).casefold()] = _resolve_variables(
+                let.group(2).strip(), variables, let.start(), source
             )
-
-    def replace(match: re.Match[str]) -> str:
+        include = _INCLUDE.match(source, match.start())
         line = source.count("\n", 0, match.start()) + 1
-        target = (base / match.group(2)).resolve()
+        if include is None:
+            raise IncludeError(
+                "%INCLUDE requires a quoted path; dynamic paths must resolve from "
+                "preceding %LET statements.",
+                line=line,
+            )
+        try:
+            include_path = _resolve_variables(
+                include.group(2), variables, match.start(), source
+            )
+        except IncludeError as error:
+            raise IncludeError(error.message, line=line) from error
+        line = source.count("\n", 0, match.start()) + 1
+        target = (base / include_path).resolve()
         try:
             target.relative_to(root)
         except ValueError:
             raise IncludeError(
-                f"%INCLUDE path escapes the allowed directory: {match.group(2)!r}.",
+                f"%INCLUDE path escapes the allowed directory: {include_path!r}.",
                 line=line,
             ) from None
         if target in stack:
             raise IncludeError(
-                f"Circular %INCLUDE of {match.group(2)!r}.", line=line
+                f"Circular %INCLUDE of {include_path!r}.", line=line
             )
         try:
             text = target.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             raise IncludeError(
-                f"Cannot read %INCLUDE file {match.group(2)!r}: {error}", line=line
+                f"Cannot read %INCLUDE file {include_path!r}: {error}", line=line
             ) from error
-        return _expand(text, target.parent, root, stack + (target,), depth + 1)
+        output.append(source[cursor : match.start()])
+        output.append(
+            _expand(text, target.parent, root, stack + (target,), depth + 1, variables)
+        )
+        cursor = include.end()
+    output.append(source[cursor:])
+    return "".join(output)
 
-    return _INCLUDE.sub(replace, source)
+
+def _resolve_variables(
+    text: str,
+    variables: dict[str, str],
+    position: int,
+    source: str,
+) -> str:
+    for _ in range(10):
+        matches = list(_VARIABLE.finditer(text))
+        if not matches:
+            return text
+        for match in reversed(matches):
+            name = match.group(1).casefold()
+            if name not in variables:
+                line = source.count("\n", 0, position) + 1
+                raise IncludeError(
+                    f"Undefined macro variable &{match.group(1)} in %INCLUDE path.",
+                    line=line,
+                )
+            text = text[: match.start()] + variables[name] + text[match.end() :]
+    line = source.count("\n", 0, position) + 1
+    raise IncludeError("Indirect macro references in %INCLUDE exceeded the limit.", line)

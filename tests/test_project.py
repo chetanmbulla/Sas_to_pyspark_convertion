@@ -450,7 +450,7 @@ proc sql; select ';' as marker from output; quit;
                 "data running; retain total 0; set amounts; "
                 "total = total + amount; run;"
             ),
-            "unsupported.sas": "proc print data=source; run;",
+            "unsupported.sas": "proc iml; run;",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -537,7 +537,7 @@ proc sql; select ';' as marker from output; quit;
                 encoding="utf-8",
             )
             (root / "bad.sas").write_text(
-                "proc print data=source; run;", encoding="utf-8"
+                "proc iml; run;", encoding="utf-8"
             )
             manifest = Path(directory, "migration.project.json")
             report_path = Path(directory, "conversion.json")

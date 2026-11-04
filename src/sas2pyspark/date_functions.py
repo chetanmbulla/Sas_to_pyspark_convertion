@@ -3,10 +3,36 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
-from .user_formats import FormatError, has_format, render_user_format
+from .user_formats import (
+    FormatError,
+    has_cntlin,
+    has_format,
+    has_informat,
+    render_user_format,
+    render_user_informat,
+)
 DATE_FUNCTIONS = frozenset(
-    {"MDY", "INTCK", "INTNX", "DATDIF", "QTR", "WEEKDAY", "PUT", "INPUT"}
+    {
+        "MDY",
+        "INTCK",
+        "INTNX",
+        "DATDIF",
+        "QTR",
+        "WEEKDAY",
+        "PUT",
+        "INPUT",
+        "DATEPART",
+        "TIMEPART",
+        "DHMS",
+        "DATETIME",
+        "TIME",
+        "DATE",
+        "YEAR",
+        "MONTH",
+        "DAY",
+    }
 )
 
 _MONTHS = {
@@ -18,6 +44,10 @@ _MONTHS = {
 _DATE_LITERAL = re.compile(
     r"""(['"])(\d{1,2})([A-Za-z]{3})(\d{4})\1\s*d\b""", re.IGNORECASE
 )
+_DATETIME_LITERAL = re.compile(
+    r"""(['"])(\d{1,2})([A-Za-z]{3})(\d{4}):(\d{1,2}):(\d{1,2}):(\d{1,2})\1\s*dt\b""",
+    re.IGNORECASE,
+)
 
 # SAS format name -> (Spark datetime pattern, upper-case the result)
 _DATE_FORMATS = {
@@ -26,8 +56,11 @@ _DATE_FORMATS = {
     "YYMMDDN8": ("yyyyMMdd", False),
     "MMDDYY10": ("MM/dd/yyyy", False),
     "DDMMYY10": ("dd/MM/yyyy", False),
+    "DATETIME20": ("ddMMMyyyy:HH:mm:ss", True),
+    "E8601DT19": ("yyyy-MM-dd''T''HH:mm:ss", False),
 }
-_FORMAT_NAME = re.compile(r"([A-Za-z]*)(\d*)\.(\d*)")
+_FORMAT_NAME = re.compile(r"(\$?[A-Za-z]+(?:\d+[A-Za-z]+)*)?(\d*)\.(\d*)")
+_SAS_EPOCH = "DATE'1960-01-01'"
 _SAS_EPOCH_SUNDAY = "DATE'1960-01-03'"
 
 
@@ -36,15 +69,36 @@ class DateFunctionError(ValueError):
 
 
 def translate_date_literals(expression: str) -> str:
+    def replace_datetime(match: re.Match[str]) -> str:
+        day, month, year = int(match.group(2)), _MONTHS.get(match.group(3).upper()), int(match.group(4))
+        hour, minute, second = int(match.group(5)), int(match.group(6)), int(match.group(7))
+        try:
+            if month is None:
+                raise ValueError
+            value = datetime(year, month, day, hour, minute, second)
+        except ValueError as error:
+            raise DateFunctionError(
+                f"Invalid SAS datetime literal: {match.group(0)!r}."
+            ) from error
+        day_count = (value.date() - datetime(1960, 1, 1).date()).days
+        seconds = value.hour * 3600 + value.minute * 60 + value.second
+        return str(day_count * 86400 + seconds)
+
     def replace(match: re.Match[str]) -> str:
         day = int(match.group(2))
         month = _MONTHS.get(match.group(3).upper())
         year = int(match.group(4))
-        if month is None or not 1 <= day <= 31:
-            raise DateFunctionError(f"Invalid SAS date literal: {match.group(0)!r}.")
-        return f"DATE'{year:04d}-{month:02d}-{day:02d}'"
+        try:
+            if month is None:
+                raise ValueError
+            value = datetime(year, month, day)
+        except ValueError as error:
+            raise DateFunctionError(
+                f"Invalid SAS date literal: {match.group(0)!r}."
+            ) from error
+        return f"datediff(DATE'{value:%Y-%m-%d}', {_SAS_EPOCH})"
 
-    return _DATE_LITERAL.sub(replace, expression)
+    return _DATE_LITERAL.sub(replace, _DATETIME_LITERAL.sub(replace_datetime, expression))
 
 
 def _literal(argument: str, purpose: str) -> str:
@@ -55,7 +109,47 @@ def _literal(argument: str, purpose: str) -> str:
 
 
 def _as_date(argument: str) -> str:
-    return f"CAST({argument} AS DATE)"
+    return f"date_add({_SAS_EPOCH}, CAST(({argument}) AS INT))"
+
+
+def _date_count(argument: str) -> str:
+    return f"datediff({argument}, {_SAS_EPOCH})"
+
+
+def _datetime_format(value: str, pattern: str) -> str:
+    day_count = f"CAST(floor(({value}) / 86400) AS INT)"
+    second_of_day = f"pmod(CAST(({value}) AS BIGINT), 86400)"
+    date_pattern = (
+        "ddMMMyyyy" if pattern == "ddMMMyyyy:HH:mm:ss" else "yyyy-MM-dd"
+    )
+    date = f"date_format(date_add({_SAS_EPOCH}, {day_count}), '{date_pattern}')"
+    hour = f"lpad(CAST(floor({second_of_day} / 3600) AS STRING), 2, '0')"
+    minute = f"lpad(CAST(floor(pmod({second_of_day}, 3600) / 60) AS STRING), 2, '0')"
+    second = f"lpad(CAST(pmod({second_of_day}, 60) AS STRING), 2, '0')"
+    if pattern == "ddMMMyyyy:HH:mm:ss":
+        return f"concat(upper({date}), ':', {hour}, ':', {minute}, ':', {second})"
+    return f"concat({date}, 'T', {hour}, ':', {minute}, ':', {second})"
+
+
+def _datetime_input(value: str, pattern: str) -> str:
+    text = f"trim(CAST({value} AS STRING))"
+    if pattern == "ddMMMyyyy:HH:mm:ss":
+        date_text = f"substring({text}, 1, 9)"
+        hour_text, minute_text, second_text = (
+            f"substring({text}, {start}, 2)" for start in (11, 14, 17)
+        )
+        date_pattern = "ddMMMyyyy"
+    else:
+        date_text = f"substring({text}, 1, 10)"
+        hour_text, minute_text, second_text = (
+            f"substring({text}, {start}, 2)" for start in (12, 15, 18)
+        )
+        date_pattern = "yyyy-MM-dd"
+    days = _date_count(f"to_date({date_text}, '{date_pattern}')")
+    return (
+        f"({days} * 86400 + CAST({hour_text} AS INT) * 3600 + "
+        f"CAST({minute_text} AS INT) * 60 + CAST({second_text} AS INT))"
+    )
 
 
 def _interval(argument: str, function: str) -> str:
@@ -111,23 +205,23 @@ def _intnx(arguments: list[str]) -> str:
                 "INTNX alignment must be BEGINNING, END or SAME."
             )
     if unit == "DAY":
-        return f"date_add({date}, {count})"
+        return _date_count(f"date_add({date}, {count})")
     if unit == "WEEK":
         start = f"date_sub({date}, dayofweek({date}) - 1)"
         if alignment == "B":
-            return f"date_add({start}, 7 * {count})"
+            return _date_count(f"date_add({start}, 7 * {count})")
         if alignment == "E":
-            return f"date_add({start}, 7 * {count} + 6)"
-        return f"date_add({date}, 7 * {count})"
+            return _date_count(f"date_add({start}, 7 * {count} + 6)")
+        return _date_count(f"date_add({date}, 7 * {count})")
     months_per = {"MONTH": 1, "QTR": 3, "YEAR": 12}[unit]
     shift = f"{months_per} * {count}"
     if alignment == "S":
-        return f"add_months({date}, {shift})"
+        return _date_count(f"add_months({date}, {shift})")
     truncation = {"MONTH": "MM", "QTR": "quarter", "YEAR": "YEAR"}[unit]
     base = f"trunc({date}, '{truncation}')"
     if alignment == "B":
-        return f"add_months({base}, {shift})"
-    return f"last_day(add_months({base}, {shift} + {months_per - 1}))"
+        return _date_count(f"add_months({base}, {shift})")
+    return _date_count(f"last_day(add_months({base}, {shift} + {months_per - 1}))")
 
 
 def _format_spec(argument: str, function: str) -> tuple[str, int | None, int | None]:
@@ -139,7 +233,7 @@ def _format_spec(argument: str, function: str) -> tuple[str, int | None, int | N
         )
     name, width, decimals = match.groups()
     return (
-        name.upper(),
+        (name or "").upper(),
         int(width) if width else None,
         int(decimals) if decimals else None,
     )
@@ -150,7 +244,12 @@ def render_format(value: str, spec: str) -> str:
     key = f"{name}{width}" if width is not None else name
     if key in _DATE_FORMATS:
         pattern, upper = _DATE_FORMATS[key]
-        rendered = f"date_format({_as_date(value)}, '{pattern}')"
+        date_time = name in {"DATETIME", "E8601DT"}
+        rendered = (
+            _datetime_format(value, pattern)
+            if date_time
+            else f"date_format({_as_date(value)}, '{pattern}')"
+        )
         return f"upper({rendered})" if upper else rendered
     if name == "Z" and width and decimals is None:
         return (
@@ -171,7 +270,11 @@ def render_informat(value: str, spec: str) -> str:
     key = f"{name}{width}" if width is not None else name
     if key in _DATE_FORMATS:
         pattern, _ = _DATE_FORMATS[key]
-        return f"to_date(trim(CAST({value} AS STRING)), '{pattern}')"
+        if name in {"DATETIME", "E8601DT"}:
+            return _datetime_input(value, pattern)
+        return _date_count(
+            f"to_date(trim(CAST({value} AS STRING)), '{pattern}')"
+        )
     if name == "" and width:
         return f"try_cast(trim(CAST({value} AS STRING)) AS DOUBLE)"
     raise DateFunctionError(
@@ -191,7 +294,7 @@ def render_date_function(name: str, arguments: list[str]) -> str:
             f"CASE WHEN ({year}) BETWEEN 1 AND 9999 AND ({month}) BETWEEN 1 AND 12 "
             f"THEN CASE WHEN ({day}) >= 1 AND ({day}) <= "
             f"day(last_day(make_date({year}, {month}, 1))) "
-            f"THEN make_date({year}, {month}, {day}) END END"
+            f"THEN datediff(make_date({year}, {month}, {day}), {_SAS_EPOCH}) END END"
         )
     if name == "INTCK":
         return _intck(arguments)
@@ -209,6 +312,39 @@ def render_date_function(name: str, arguments: list[str]) -> str:
             raise DateFunctionError(f"{name} requires exactly one argument.")
         function = "quarter" if name == "QTR" else "dayofweek"
         return f"{function}({_as_date(arguments[0])})"
+    if name == "DATEPART":
+        if len(arguments) != 1:
+            raise DateFunctionError("DATEPART requires exactly one argument.")
+        return f"CAST(floor(({arguments[0]}) / 86400) AS INT)"
+    if name == "TIMEPART":
+        if len(arguments) != 1:
+            raise DateFunctionError("TIMEPART requires exactly one argument.")
+        return f"pmod(CAST(({arguments[0]}) AS BIGINT), 86400)"
+    if name == "DHMS":
+        if len(arguments) != 4:
+            raise DateFunctionError("DHMS requires a date, hour, minute and second.")
+        date, hour, minute, second = arguments
+        return f"(({date}) * 86400 + ({hour}) * 3600 + ({minute}) * 60 + ({second}))"
+    if name == "DATETIME":
+        if arguments:
+            raise DateFunctionError("DATETIME takes no arguments.")
+        return (
+            f"(datediff(current_date(), {_SAS_EPOCH}) * 86400 + "
+            "hour(current_timestamp()) * 3600 + minute(current_timestamp()) * 60 + "
+            "second(current_timestamp()))"
+        )
+    if name == "TIME":
+        if arguments:
+            raise DateFunctionError("TIME takes no arguments.")
+        return "CAST(date_format(current_timestamp(), 'HH') AS INT) * 3600 + CAST(date_format(current_timestamp(), 'mm') AS INT) * 60 + CAST(date_format(current_timestamp(), 'ss') AS INT)"
+    if name == "DATE":
+        if arguments:
+            raise DateFunctionError("DATE takes no arguments.")
+        return f"datediff(current_date(), {_SAS_EPOCH})"
+    if name in {"YEAR", "MONTH", "DAY"}:
+        if len(arguments) != 1:
+            raise DateFunctionError(f"{name} requires exactly one argument.")
+        return f"{name.lower()}({_as_date(arguments[0])})"
     if name in {"PUT", "INPUT"}:
         if len(arguments) != 2:
             raise DateFunctionError(f"{name} requires a value and a format.")
@@ -218,6 +354,27 @@ def render_date_function(name: str, arguments: list[str]) -> str:
                     return render_user_format(arguments[0], arguments[1])
                 except FormatError as error:
                     raise DateFunctionError(str(error)) from error
-            return render_format(arguments[0], arguments[1])
-        return render_informat(arguments[0], arguments[1])
+            try:
+                return render_format(arguments[0], arguments[1])
+            except DateFunctionError:
+                if has_cntlin():
+                    try:
+                        return render_user_format(arguments[0], arguments[1])
+                    except FormatError as error:
+                        raise DateFunctionError(str(error)) from error
+                raise
+        if has_informat(arguments[1]):
+            try:
+                return render_user_informat(arguments[0], arguments[1])
+            except FormatError as error:
+                raise DateFunctionError(str(error)) from error
+        try:
+            return render_informat(arguments[0], arguments[1])
+        except DateFunctionError:
+            if has_cntlin():
+                try:
+                    return render_user_informat(arguments[0], arguments[1])
+                except FormatError as error:
+                    raise DateFunctionError(str(error)) from error
+            raise
     raise AssertionError(f"Unknown date function: {name}")

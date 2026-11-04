@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import date
 from decimal import Decimal
 
 from sas2pyspark import SasToPySparkConverter
@@ -250,14 +251,14 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             (2, 90, 0),
         )
         self.assertEqual((first["weeks_since"], first["qtrs_since"]), (13, 0))
-        self.assertEqual(str(first["m_begin"]), "2024-04-01")
-        self.assertEqual(str(first["m_end"]), "2024-03-31")
-        self.assertEqual(str(first["m_same"]), "2024-04-30")
-        self.assertEqual(str(first["q_begin"]), "2024-01-01")
-        self.assertEqual(str(first["y_end"]), "2024-12-31")
-        self.assertEqual(str(first["w_begin"]), "2024-03-31")
+        sas_epoch = date(1960, 1, 1)
+        self.assertEqual(first["m_begin"], (date(2024, 4, 1) - sas_epoch).days)
+        self.assertEqual(first["m_end"], (date(2024, 3, 31) - sas_epoch).days)
+        self.assertEqual(first["m_same"], (date(2024, 4, 30) - sas_epoch).days)
+        self.assertEqual(first["q_begin"], (date(2024, 1, 1) - sas_epoch).days)
+        self.assertEqual(first["y_end"], (date(2024, 12, 31) - sas_epoch).days)
         self.assertIsNone(first["built"])
-        self.assertEqual(str(first["built_ok"]), "2024-02-29")
+        self.assertEqual(first["built_ok"], (date(2024, 2, 29) - sas_epoch).days)
         self.assertEqual(first["shown"], "31MAR2024")
         self.assertEqual(first["shown_iso"], "2024-03-31")
         self.assertEqual(first["padded"], "00042")
@@ -266,7 +267,98 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual(first["diff"], 90)
         self.assertEqual(second["fixed"], "       .")
         self.assertIsNone(second["parsed"])
-        self.assertEqual(str(second["w_begin"]), "2024-11-03")
+        self.assertEqual(
+            second["w_begin"], (date(2024, 11, 3) - sas_epoch).days
+        )
+
+    def test_sas_datetime_literals_and_functions_execute(self):
+        source = """
+        data out;
+          set events;
+          literal = '02JAN1960:01:02:03'dt;
+          date_literal = '02JAN1960'd;
+          date_part = datepart(literal);
+          time_part = timepart(literal);
+          built = dhms(date_literal, 1, 2, 3);
+          shown = put(literal, datetime20.);
+          parsed = input('02JAN1960:01:02:03', datetime20.);
+          iso = put(literal, e8601dt19.);
+          back = input(iso, e8601dt19.);
+          today_count = today();
+        run;
+        """
+        frame = self.spark.createDataFrame([(1,)], "id int")
+        namespace = {"spark": self.spark, "df_events": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        row = namespace["df_out"].first()
+        self.assertEqual(row.literal, 90123)
+        self.assertEqual(row.date_literal, 1)
+        self.assertEqual(row.date_part, 1)
+        self.assertEqual(row.time_part, 3723)
+        self.assertEqual(row.built, 90123)
+        self.assertEqual(row.shown, "02JAN1960:01:02:03")
+        self.assertEqual(row.parsed, 90123)
+        self.assertEqual(row.iso, "1960-01-02T01:02:03")
+        self.assertEqual(row.back, 90123)
+        self.assertIsInstance(row.today_count, int)
+
+    def test_invalue_picture_and_cntlin_formats_execute(self):
+        source = """
+        proc format;
+          invalue yn 'Y'=1 'N'=0 other=.;
+          invalue $yntext 'Y'='yes' 'N'='no';
+          picture dollars (prefix='$' round) low-high='000009.99';
+        run;
+        data out;
+          set events;
+          flag = input(answer, yn.);
+          text = input(answer, $yntext.);
+          amount_text = put(amount, dollars.);
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [("Y", 12.345), ("N", 5.5), ("?", None)],
+            "answer string, amount double",
+        )
+        namespace = {"spark": self.spark, "df_events": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = {row.answer: row for row in namespace["df_out"].collect()}
+        self.assertEqual((rows["Y"].flag, rows["Y"].text), (1.0, "yes"))
+        self.assertEqual(rows["Y"].amount_text, "$000012.35")
+        self.assertEqual((rows["N"].flag, rows["N"].text), (0.0, "no"))
+        self.assertEqual(rows["?"].flag, None)
+        self.assertEqual(rows["?"].amount_text, None)
+
+        cntlin = self.spark.createDataFrame(
+            [
+                ("band", "N", "1", "1", "Low", ""),
+                ("band", "N", "2", "4", "Medium", ""),
+                ("band", "N", "5", "9", "High", ""),
+                ("band", "N", None, None, "Other", "O"),
+            ],
+            "FMTNAME string, TYPE string, START string, END string, LABEL string, HLO string",
+        )
+        source_frame = self.spark.createDataFrame(
+            [(1,), (3,), (8,), (12,)], "score int"
+        )
+        namespace = {
+            "spark": self.spark,
+            "df_control": cntlin,
+            "df_source": source_frame,
+        }
+        generated = SasToPySparkConverter().convert(
+            "proc format cntlin=control; run;"
+            "data out; set source; label = put(score, band.); run;"
+        )
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        labels = {
+            row.score: row.label for row in namespace["df_out"].collect()
+        }
+        self.assertEqual(
+            labels, {1: "Low", 3: "Medium", 8: "High", 12: "Other"}
+        )
 
     def test_proc_sort_dupout_nodup_and_where_execute(self):
         source = """
@@ -460,6 +552,85 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual([(r.x, r.tag, r.missing_value) for r in hi], [(7, "a", None)])
         small = sorted((r.x, r.scaled) for r in namespace["df_small"].collect())
         self.assertEqual(small, [(1, 31), (3, 33), (7, 37)])
+
+    def test_lag_dif_and_set_options_execute(self):
+        source = """
+        data b;
+          set a(where=(x > 1) firstobs=2 obs=3 keep=id x rename=(x=amount));
+          prev = lag(amount);
+          change = dif(amount);
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1), (2, 5), (3, 7), (4, 2), (5, 9), (6, 4)], "id int, x int"
+        )
+        namespace = {"spark": self.spark, "df_a": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = sorted(
+            (r.id, r.amount, r.prev, r.change) for r in namespace["df_b"].collect()
+        )
+        self.assertEqual(rows, [(3, 7, None, None), (4, 2, 7, -5)])
+
+    def test_nested_blocks_select_arrays_retain_and_length_execute(self):
+        source = """
+        data b;
+          set a;
+          length tag $ 3;
+          retain carry '';
+          array q{*} q1-q3;
+          do i = 1 to dim(q); q{i} = x * i; end;
+          if x > 1 then do;
+            if x > 4 then size = 'big'; else size = 'mid';
+          end;
+          else size = 'low';
+          select (x);
+            when (2, 3) kind = 'a';
+            otherwise kind = 'b';
+          end;
+          if x > 1 then carry = name;
+          tag = name;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1, "alpha"), (2, 3, "beta"), (3, 5, "gamma"), (4, 1, "delta")],
+            "id int, x int, name string",
+        )
+        namespace = {"spark": self.spark, "df_a": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = {r.id: r for r in namespace["df_b"].collect()}
+        self.assertEqual([rows[i].carry for i in (1, 2, 3, 4)], ["", "beta", "gamma", "gamma"])
+        self.assertEqual([rows[i].size for i in (1, 2, 3, 4)], ["low", "mid", "big", "low"])
+        self.assertEqual([rows[i].kind for i in (1, 2, 3, 4)], ["b", "a", "b", "b"])
+        self.assertEqual([rows[i].tag for i in (1, 2, 3, 4)], ["alp", "bet", "gam", "del"])
+        self.assertEqual((rows[2].q1, rows[2].q2, rows[2].q3, rows[2].i), (3, 6, 9, 4))
+        self.assertNotIn("__sas2pyspark_retain_1", namespace["df_b"].columns)
+
+    def test_datalines_and_row_number_execute(self):
+        source = """
+        data a;
+          input id name $ score;
+          datalines;
+        1 Ann 90.5
+        2 Bob .
+        3 Cy 70
+        ;
+        run;
+        data b;
+          set a;
+          rownum = _n_;
+          if _n_ >= 2;
+          keep id name rownum;
+        run;
+        """
+        namespace = {"spark": self.spark}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        a = {r.id: (r.name, r.score) for r in namespace["df_a"].collect()}
+        self.assertEqual(a, {1.0: ("Ann", 90.5), 2.0: ("Bob", None), 3.0: ("Cy", 70.0)})
+        b = sorted((r.id, r.name, r.rownum) for r in namespace["df_b"].collect())
+        self.assertEqual(b, [(2.0, "Bob", 2), (3.0, "Cy", 3)])
 
     def test_if_then_do_blocks_and_delete_execute(self):
         source = """

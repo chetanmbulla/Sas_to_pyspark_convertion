@@ -34,15 +34,49 @@ class UserFormat:
     is_char: bool
     entries: tuple[_Entry, ...]
     other_label: str | None
+    picture: UserPicture | None = None
 
 
 _REGISTRY: ContextVar[dict[str, UserFormat] | None] = ContextVar(
     "sas2pyspark_user_formats", default=None
 )
+_INFORMAT_REGISTRY: ContextVar[dict[str, "UserInformat"] | None] = ContextVar(
+    "sas2pyspark_user_informats", default=None
+)
+_CNTLIN_DATASET: ContextVar[str | None] = ContextVar(
+    "sas2pyspark_cntlin_dataset", default=None
+)
+
+
+@dataclass(frozen=True)
+class UserInformat:
+    name: str
+    entries: tuple[tuple[str, str], ...]
+    other_value: str | None
+    is_char: bool
+
+
+@dataclass(frozen=True)
+class UserPicture:
+    name: str
+    mask: str
+    prefix: str
+    multiplier: float
+    round_value: bool
 
 
 def reset_formats() -> None:
     _REGISTRY.set({})
+    _INFORMAT_REGISTRY.set({})
+    _CNTLIN_DATASET.set(None)
+
+
+def register_cntlin(dataset: str) -> None:
+    _CNTLIN_DATASET.set(dataset.lower())
+
+
+def cntlin_dataset() -> str | None:
+    return _CNTLIN_DATASET.get()
 
 
 def _formats() -> dict[str, UserFormat]:
@@ -53,12 +87,28 @@ def _formats() -> dict[str, UserFormat]:
     return registry
 
 
+def _informats() -> dict[str, UserInformat]:
+    registry = _INFORMAT_REGISTRY.get()
+    if registry is None:
+        registry = {}
+        _INFORMAT_REGISTRY.set(registry)
+    return registry
+
+
 def format_key(spec: str) -> str:
     return spec.strip().rstrip(".").lower()
 
 
 def has_format(spec: str) -> bool:
     return format_key(spec) in _formats()
+
+
+def has_informat(spec: str) -> bool:
+    return format_key(spec) in _informats()
+
+
+def has_cntlin() -> bool:
+    return _CNTLIN_DATASET.get() is not None
 
 
 def _unquote(text: str) -> str:
@@ -139,6 +189,111 @@ def register_value(statement: str) -> UserFormat:
     return result
 
 
+def register_invalue(statement: str) -> UserInformat:
+    match = re.fullmatch(
+        r"invalue\s+(\$?[A-Za-z_]\w*)\s+(.+)",
+        statement.strip(),
+        re.I | re.S,
+    )
+    if match is None:
+        raise FormatError(f"Malformed INVALUE statement: {statement[:60]!r}.")
+    raw_name, body = match.groups()
+    entries: list[tuple[str, str]] = []
+    other_value: str | None = None
+    entry_pattern = re.compile(
+        rf"\s*(?P<key>{_QUOTED}|{_NUMBER}|other)\s*=\s*"
+        rf"(?P<value>{_NUMBER}|\.|{_QUOTED})\s*",
+        re.I,
+    )
+    position = 0
+    while position < len(body):
+        entry = entry_pattern.match(body, position)
+        if entry is None:
+            raise FormatError(
+                f"Unsupported INVALUE entry near {body[position:position + 40]!r}."
+            )
+        position = entry.end()
+        key, value = entry.group("key"), entry.group("value")
+        if key.casefold() == "other":
+            if other_value is not None:
+                raise FormatError("INVALUE OTHER appears more than once.")
+            other_value = value
+            continue
+        normalized_key = _unquote(key) if key[0] in "'\"" else key
+        if any(existing == normalized_key for existing, _ in entries):
+            raise FormatError(f"Duplicate INVALUE key {normalized_key!r}.")
+        normalized_value = (
+            "NULL"
+            if value == "."
+            else _sql_string(_unquote(value))
+            if value[0] in "'\""
+            else value
+        )
+        entries.append((normalized_key, normalized_value))
+    result = UserInformat(
+        raw_name.lower(),
+        tuple(entries),
+        (
+            "NULL"
+            if other_value == "."
+            else _sql_string(_unquote(other_value))
+            if other_value and other_value[0] in "'\""
+            else other_value
+        ),
+        raw_name.startswith("$"),
+    )
+    _informats()[result.name] = result
+    return result
+
+
+def register_picture(statement: str) -> UserFormat:
+    match = re.fullmatch(
+        rf"picture\s+([A-Za-z_]\w*)\s*(.*?)({_QUOTED})(?:\s*(\(.*\)))?",
+        statement.strip(),
+        re.I | re.S,
+    )
+    if match is None:
+        raise FormatError("PICTURE requires one supported numeric mask.")
+    name, before_mask, raw_mask, after_options = match.groups()
+    mask = _unquote(raw_mask)
+    before_mask = re.sub(r"low\s*-\s*high\s*=\s*$", "", before_mask, flags=re.I).strip()
+    options: list[str] = []
+    for text in (before_mask, after_options or ""):
+        if not text:
+            continue
+        if not (text.startswith("(") and text.endswith(")")):
+            raise FormatError("PICTURE supports only LOW-HIGH and option groups.")
+        options.extend(text[1:-1].split())
+    parsed: dict[str, str | None] = {}
+    for option in options:
+        key, separator, value = option.partition("=")
+        key = key.casefold()
+        if key not in {"round", "prefix", "mult"}:
+            raise FormatError(f"Unsupported PICTURE option {key.upper()!r}.")
+        if key == "round":
+            if separator:
+                raise FormatError("PICTURE ROUND is a flag.")
+            parsed[key] = None
+        elif not separator or key in parsed:
+            raise FormatError(f"PICTURE {key.upper()} option requires one value.")
+        else:
+            parsed[key] = value.strip("'\"")
+    if not re.fullmatch(r"[09]+(?:\.[09]+)?", mask):
+        raise FormatError(
+            "PICTURE supports only simple 0/9 digit masks with an optional decimal."
+        )
+    prefix = parsed.get("prefix") or ""
+    multiplier_text = parsed.get("mult", "1")
+    try:
+        multiplier = float(multiplier_text)
+    except (TypeError, ValueError) as error:
+        raise FormatError("PICTURE MULT= requires a numeric literal.") from error
+    picture = UserPicture(name.lower(), mask, prefix, multiplier, "round" in parsed)
+    result = UserFormat(name.lower(), False, (), None, picture)
+    _formats()[result.name] = result
+    return result
+
+
 def _condition(part: tuple, value: str) -> str:
     if part[0] == "eq":
         bound = part[1]
@@ -161,7 +316,26 @@ def _condition(part: tuple, value: str) -> str:
 
 
 def render_user_format(value: str, spec: str) -> str:
-    fmt = _formats()[format_key(spec)]
+    fmt = _formats().get(format_key(spec))
+    if fmt is None:
+        if _CNTLIN_DATASET.get() is None:
+            raise FormatError(f"Unknown user format {spec!r}.")
+        return (
+            "sas2pyspark_cntlin_format("
+            f"{_sql_string(format_key(spec))}, CAST({value} AS STRING))"
+        )
+    if fmt.picture is not None:
+        picture = fmt.picture
+        integer, _, decimals = picture.mask.partition(".")
+        width = len(picture.mask)
+        places = len(decimals)
+        number = f"CAST(({value}) AS DOUBLE) * {picture.multiplier}"
+        if picture.round_value:
+            number = f"round({number}, {places})"
+        rendered = f"format_string('%0{width}.{places}f', {number})"
+        if picture.prefix:
+            rendered = f"concat({_sql_string(picture.prefix)}, {rendered})"
+        return f"CASE WHEN ({value}) IS NULL THEN NULL ELSE {rendered} END"
     branches = []
     for entry in fmt.entries:
         condition = " OR ".join(_condition(part, value) for part in entry.condition_parts)
@@ -173,3 +347,22 @@ def render_user_format(value: str, spec: str) -> str:
     else:
         fallback = f"coalesce(CAST({value} AS STRING), '.')"
     return "CASE " + " ".join(branches) + f" ELSE {fallback} END"
+
+
+def render_user_informat(value: str, spec: str) -> str:
+    informat = _informats().get(format_key(spec))
+    if informat is None:
+        if _CNTLIN_DATASET.get() is None:
+            raise FormatError(f"Unknown user informat {spec!r}.")
+        return (
+            "try_cast(sas2pyspark_cntlin_format("
+            f"{_sql_string(format_key(spec))}, CAST({value} AS STRING)) AS DOUBLE)"
+        )
+    input_value = f"trim(CAST({value} AS STRING))"
+    branches = [
+        f"WHEN {input_value} = {_sql_string(key)} THEN {mapped}"
+        for key, mapped in informat.entries
+    ]
+    fallback = informat.other_value or "NULL"
+    expression = "CASE " + " ".join(branches) + f" ELSE {fallback} END"
+    return expression if informat.is_char else f"try_cast(({expression}) AS DOUBLE)"

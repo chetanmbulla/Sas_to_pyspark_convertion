@@ -75,12 +75,12 @@ construct-specific converters.
 
 `%LET name=value;` definitions are evaluated sequentially. User-defined
 `%MACRO`/`%MEND` definitions can declare positional or keyword parameters with
-defaults; a call expands the macro body with those arguments. Macro calls can
-be nested, and an inline call inside a SAS statement must expand to exactly one
-statement. Macro variables assigned during a macro call are scoped to that
-call. References such as `&name` are substituted with their value, including
-inside quoted strings. Names are case-insensitive, and a period can terminate
-a variable reference without becoming part of its value.
+defaults; calls support nested calls, including calls inside arguments, and
+bounded recursion. An inline call inside a SAS statement must expand to exactly
+one statement. Macro names and variables are case-insensitive, and a period
+can terminate a variable reference without becoming part of its value.
+`&name` substitution is supported, including inside quoted strings, and
+indirect references are repeatedly resolved up to a bounded pass count.
 
 For example:
 
@@ -91,19 +91,25 @@ where age ge &minimum_age;
 
 is parsed as if the filter were written `where age ge 18;`.
 
-The processor also evaluates simple compile-time `%IF`/`%THEN`/`%ELSE`
-conditions, including scalar comparisons and parenthesized `AND`/`OR`/`NOT`
-expressions. It supports unconditional `%DO; ... %END;` blocks and integer
-`%DO index=start %TO stop [%BY step]; ... %END;` loops. Loop bounds may use
-macro variables if they expand to integer literals. Expansion is limited to
-32 nested levels, 1,000 iterations per loop, and 10,000 emitted statements to
-prevent accidental expansion blowups.
+The processor evaluates compile-time `%IF`/`%THEN`/`%ELSE` conditions,
+including scalar comparisons and parenthesized `AND`/`OR`/`NOT`. `%DO` supports
+unconditional blocks, integer `%DO index=start %TO stop [%BY step]` loops, and
+`%DO %WHILE`/`%UNTIL` loops. `%EVAL`, `%SYSEVALF`, selected `%SYSFUNC`
+functions, text and quoting functions, `%SUBSTR`, `%SCAN`, `%INDEX`,
+`%LENGTH`, `%SYMEXIST`, `%GLOBAL`, `%LOCAL`, `%RETURN`, and forward `%GOTO`
+are supported within documented restrictions. `%PUT` is ignored;
+`%ABORT` raises an error when reached. `%LET` changes in conditional and loop
+blocks persist in their supported scope.
 
-This is not a full SAS macro processor. Macro arithmetic and macro functions
-(such as `%EVAL`, `%SYSFUNC`, `%UPCASE`, and quoting functions), indirect
-references, `%GLOBAL`/`%LOCAL`, `%GOTO`, `%RETURN`, and dynamic loop bounds are
-unsupported. Undefined variables and unsupported macro syntax raise a
-conversion error.
+Expansion is bounded to 32 nested levels, 1,000 iterations per loop, 10,000
+emitted statements, and 10 indirect-reference passes. `%SYSGET` is disabled
+unless explicitly enabled through the Python API. `PROC SQL SELECT ... INTO`
+and supported `CALL SYMPUT`/`SYMPUTX` create run-time variables requiring Spark
+4.0 or later; these cannot be used in compile-time macro contexts. Dynamic
+`%INCLUDE` paths may use preceding `%LET` values, but not macro parameters or
+`%SYSFUNC` expressions, and remain constrained by include-root and cycle
+checks. This is a bounded implementation, not a complete SAS macro processor:
+unsupported macro syntax and undefined variables raise conversion errors.
 
 ## 3. Identify and parse each statement block
 

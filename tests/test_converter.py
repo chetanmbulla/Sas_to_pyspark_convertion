@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from sas2pyspark import ConversionError, SasToPySparkConverter
 
@@ -168,7 +169,7 @@ class ConverterTests(unittest.TestCase):
             ),
             (
                 "%let source=%sysget(HOME); data out; set &source; run;",
-                "Macro calls and macro-language statements",
+                "%SYSGET is disabled",
             ),
             (
                 "%let n=%eval(1.5+1); data out; set input; run;",
@@ -229,6 +230,34 @@ class ConverterTests(unittest.TestCase):
 
         self.assertIn("df_adults = df_people", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_nested_macro_calls_in_arguments_and_bounded_recursion(self):
+        nested = self.converter.convert(
+            """
+            %macro identity(value);
+              &value;
+            %mend;
+            %macro make_table(source, target);
+              data work.&target; set work.&source; run;
+            %mend;
+            %make_table(%identity(people), adults);
+            """
+        )
+        self.assertIn("df_adults = df_people", nested.code)
+        recursive = self.converter.convert(
+            """
+            %macro countdown(value);
+              %if &value > 0 %then %do;
+                data work.step&value; set work.people; sequence=&value; run;
+                %countdown(%eval(&value - 1));
+              %end;
+            %mend;
+            %countdown(3);
+            """
+        )
+        for value in (1, 2, 3):
+            self.assertIn(f"df_step{value} = df_people", recursive.code)
+        compile(recursive.code, "<generated-pyspark>", "exec")
 
     def test_macro_if_else_blocks_and_integer_do_loops(self):
         result = self.converter.convert(
@@ -332,7 +361,7 @@ class ConverterTests(unittest.TestCase):
         unsupported_sources = (
             (
                 "%macro recursive(); %recursive(); %mend; %recursive();",
-                "Recursive macro call",
+                "nesting limit",
             ),
             (
                 "%macro loop(); %do i=1 %to 1001; data work.out; set input; run; %end; %mend; %loop();",
@@ -676,9 +705,20 @@ class ConverterTests(unittest.TestCase):
             (root / "sub").mkdir()
             (root / "sub" / "inner.sas").write_text("data c; set a; run;\n", encoding="utf-8")
             (root / "part.sas").write_text("%include 'sub/inner.sas';\n", encoding="utf-8")
+            (root / "dynamic.sas").write_text(
+                "%let folder=sub;\n%let include_file=&folder./inner.sas;\n"
+                "%include \"&include_file.\";\n",
+                encoding="utf-8",
+            )
             (root / "loop.sas").write_text("%include 'loop.sas';\n", encoding="utf-8")
             result = self.converter.convert("%include 'part.sas';\n", include_dir=root)
             self.assertIn("df_c = df_a", result.code)
+            dynamic = self.converter.convert(
+                "%let folder=sub;\n%let include_file=&folder./inner.sas;\n"
+                "%include \"&include_file.\";\n",
+                include_dir=root,
+            )
+            self.assertIn("df_c = df_a", dynamic.code)
             with self.assertRaises(ConversionError) as ctx:
                 self.converter.convert("%include '../x.sas';", include_dir=root / "sub", include_root=root / "sub")
             self.assertIn("escapes", str(ctx.exception))
@@ -691,6 +731,22 @@ class ConverterTests(unittest.TestCase):
             self.converter.convert("%include 'x.sas';")
         with self.assertRaises(ConversionError):
             self.converter.convert("%let f=x; %include &f;", include_dir=".")
+
+    def test_sysget_is_opt_in_and_expands_environment_values(self):
+        source = (
+            "%let source=%sysget(SAS2PYSPARK_TEST_SOURCE); "
+            "data out; set &source; run;"
+        )
+        with patch.dict("os.environ", {"SAS2PYSPARK_TEST_SOURCE": "people"}):
+            with self.assertRaises(ConversionError) as caught:
+                self.converter.convert(source)
+            self.assertIn("%SYSGET is disabled", caught.exception.message)
+            converted = SasToPySparkConverter(allow_sysget=True).convert(source)
+            self.assertIn("df_out = df_people", converted.code)
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ConversionError) as caught:
+                SasToPySparkConverter(allow_sysget=True).convert(source)
+            self.assertIn("is not set", caught.exception.message)
 
     def test_proc_format_value_and_put(self):
         result = self.converter.convert(
@@ -713,7 +769,7 @@ class ConverterTests(unittest.TestCase):
         self.assertIn("ELSE 'Other'", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
         with self.assertRaises(ConversionError):
-            self.converter.convert("proc format; picture p low-high='9'; run;")
+            self.converter.convert("proc format; picture p low-high='ABC'; run;")
         with self.assertRaises(ConversionError):
             self.converter.convert("proc format; value f 'a'=1; run;")
         with self.assertRaises(ConversionError):
@@ -948,6 +1004,115 @@ run;
         for bad in ("%substr(abc)", "%substr(abc,x)", "%scan(abc)", "%substr(abc,0)"):
             with self.assertRaises(ConversionError):
                 SasToPySparkConverter().convert(f"%let v = {bad};")
+
+    def test_lag_dif_and_set_options(self):
+        code = SasToPySparkConverter().convert(
+            "data b; set a(where=(x > 1) firstobs=2 obs=3 keep=id x rename=(x=amount)) c;"
+            " prev = lag(amount); d = dif2(amount); if lag(amount) > 1; run;"
+        ).code
+        self.assertIn("filter(F.expr('x > 1'))", code)
+        self.assertIn("(F.col('__sas2pyspark_obs') >= 2) & (F.col('__sas2pyspark_obs') <= 3)", code)
+        self.assertIn("withColumnRenamed('x', 'amount')", code)
+        self.assertIn("lag((amount), 1) over", code)
+        self.assertIn("lag((amount), 2) over", code)
+        self.assertIn(".drop(*['__sas2pyspark_lag_1'", code)
+        for bad in (
+            "data b; set a(index=x); run;",
+            "data b; set a(keep=x drop=y); run;",
+            "data b; set a(obs=0x); run;",
+            "data b; set a(firstobs=0); run;",
+            "data b; set a; y = lag(x, 1); run;",
+            "data b; set a; y = lag101(x); run;",
+        ):
+            with self.assertRaises(ConversionError, msg=bad):
+                SasToPySparkConverter().convert(bad)
+
+    def test_report_procs_and_ignored_statements(self):
+        result = SasToPySparkConverter().convert(
+            "title 'Report'; footnote1 'x'; ods html close;\n"
+            "proc print data=a obs=5 noobs; var id x; where x > 1; run;\n"
+            "proc contents data=a; run;\n"
+            "proc copy in=work out=lib; select a b; run;\n"
+            "proc compare base=a compare=b; run;"
+        )
+        code = result.code
+        self.assertIn("df_a.filter(F.expr('x > 1')).select(*['id', 'x']).show(5, truncate=False)", code)
+        self.assertIn("df_a.printSchema()", code)
+        self.assertIn("df_b.createOrReplaceTempView('b')", code)
+        self.assertIn("exceptAll", code)
+        self.assertTrue(any("TITLE/FOOTNOTE/ODS" in w for w in result.warnings))
+        for bad in (
+            "proc print data=a(obs=5); run;",
+            "proc print data=a; by x; run;",
+            "proc print; run;",
+            "proc contents data=a; modify x; run;",
+            "proc copy in=work out=lib; run;",
+            "proc compare base=a compare=b; id x; run;",
+        ):
+            with self.assertRaises(ConversionError, msg=bad):
+                SasToPySparkConverter().convert(bad)
+
+    def test_nested_blocks_select_arrays_retain_and_length(self):
+        converter = SasToPySparkConverter()
+        code = converter.convert(
+            "data b; set a; retain carry ''; length tag $ 3; array q{*} q1-q3;"
+            " array m{2,2} m1-m4;"
+            " do i = 1 to dim(q); q{i} = x * i; end; m{2,1} = 7;"
+            " if x > 1 then do; if x > 4 then size = 'big'; else size = 'mid'; end;"
+            " else size = 'low';"
+            " select (x); when (2, 3) do; kind = 'a'; end; otherwise kind = 'b'; end;"
+            " if x > 1 then carry = name; tag = name; run;"
+        ).code
+        self.assertIn("withColumn('q3', F.expr('x * 3'))", code)
+        self.assertIn("withColumn('m3', F.expr('7'))", code)
+        self.assertIn("withColumn('i', F.expr('4'))", code)
+        self.assertIn("(x > 4)", code)
+        self.assertIn("(x) in (2, 3)", code)
+        self.assertIn("named_struct('v', (name)) end, true) over", code)
+        self.assertIn("substring(tag, 1, 3)", code)
+        self.assertIn("drop(*['__sas2pyspark_retain_1'])", code)
+        compile(code, "<generated-pyspark>", "exec")
+
+        for bad, message in (
+            ("data b; set a; i = 0; do while (i < 3); i + 1; end; run;", "DO WHILE"),
+            ("data b; set a; do i = 1 to n; y = i; end; run;", "bounds must be integer"),
+            ("data b; set a; array q{2} q1 q2; y = q{3}; run;", "outside 1..2"),
+            ("data b; set a; array m{2,2} m1-m4; y = m{1}; run;", "subscript"),
+            ("data b; set a; retain c ''; c = c || 'x'; run;", "own assignment"),
+            ("data b; merge a c; by id; retain c ''; if x > 1 then c = 'y'; run;", "single-SET"),
+            ("data b; set a; length x $ 8 y; run;", "needs a size"),
+            ("data b; set a; attrib x length=$8 bogus=1; run;", "Unsupported ATTRIB option"),
+            ("data b; set a; select (x); when (1) do; if y then output; end; end; run;", "simple assignment"),
+        ):
+            with self.assertRaises(ConversionError, msg=bad) as caught:
+                converter.convert(bad)
+            self.assertIn(message, caught.exception.message, bad)
+
+    def test_datalines_and_row_number(self):
+        source = """
+data a;
+  infile datalines dlm=',' dsd;
+  input id name $ score;
+  datalines;
+1,Ann,90.5
+2,Bob,
+;
+run;
+data b; set a; rownum = _n_; if _n_ <= 1; keep id rownum; run;
+"""
+        code = SasToPySparkConverter().convert(source).code
+        self.assertIn("spark.createDataFrame([(1.0, 'Ann', 90.5), (2.0, 'Bob', None)]", code)
+        self.assertIn("'id double, name string, score double'", code)
+        self.assertIn("row_number() over", code)
+        for bad in (
+            "data a; input x : 8.; datalines;\n1\n;\nrun;",
+            "data a; infile 'f.txt'; input x; datalines;\n1\n;\nrun;",
+            "data a; input x; datalines;\nabc\n;\nrun;",
+            "data a; input x; datalines;\n1 2\n;\nrun;",
+            "data a; datalines;\n1\n;\nrun;",
+        ):
+            with self.assertRaises(ConversionError, msg=bad):
+                SasToPySparkConverter().convert(bad)
 
     def test_runtime_macro_variables_and_restrictions(self):
         prefix = "proc sql; select max(x) into :mx from a; quit;\n"
@@ -1372,9 +1537,9 @@ run;
             run;
             """
         )
-        self.assertIn("DATE'2024-01-01'", result.code)
+        self.assertIn("datediff(DATE'2024-01-01', DATE'1960-01-01')", result.code)
         self.assertIn("last_day(add_months(", result.code)
-        self.assertIn("date_format(CAST(d AS DATE), 'yyyy-MM-dd')", result.code)
+        self.assertIn("date_format(date_add(DATE'1960-01-01', CAST((d) AS INT)), 'yyyy-MM-dd')", result.code)
         self.assertTrue(any("FORMAT statement" in w for w in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
 
@@ -1387,6 +1552,8 @@ run;
             ("data o; set s; x = input(a, anydtdte.); run;", "unsupported"),
             ("data o; set s; x = datdif(a, b, '30/360'); run;", "ACT/ACT"),
             ("data o; set s; x = '31FOO2024'd; run;", "Invalid SAS date literal"),
+            ("data o; set s; x = '31FEB2024'd; run;", "Invalid SAS date literal"),
+            ("data o; set s; x = '31JAN2024:25:00:00'dt; run;", "Invalid SAS datetime literal"),
             ("data o; set s; format d comma12.; run;", "unsupported"),
             ("data o; set s; format d; run;", "FORMAT supports"),
         )
@@ -1395,6 +1562,42 @@ run;
                 with self.assertRaises(ConversionError) as context:
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
+
+    def test_datetime_informats_pictures_and_cntlin_translate(self):
+        code = self.converter.convert(
+            """
+            proc format;
+              invalue yn 'Y'=1 'N'=0 other=.;
+              invalue $yntext 'Y'='yes' 'N'='no';
+              picture dollars (prefix='$' round) low-high='000009.99';
+            run;
+            data out;
+              set source;
+              flag = input(answer, yn.);
+              text = input(answer, $yntext.);
+              amount_text = put(amount, dollars.);
+              dt = '01JAN1960:00:00:01'dt;
+              date = datepart(dt);
+              seconds = timepart(dt);
+            run;
+            """
+        ).code
+        self.assertIn("THEN 1 WHEN trim(CAST(answer AS STRING)) = 'N' THEN 0", code)
+        self.assertIn("THEN 'yes' WHEN trim(CAST(answer AS STRING)) = 'N' THEN 'no'", code)
+        self.assertIn("format_string('%09.2f'", code)
+        self.assertIn("floor((dt) / 86400)", code)
+        self.assertIn("withColumn('dt', F.expr('1'))", code)
+        compile(code, "<generated-pyspark>", "exec")
+
+        cntlin = self.converter.convert(
+            "proc format cntlin=control; run;"
+            "data out; set source; label = put(score, band.); date_label = put(dt, date9.); run;"
+        ).code
+        self.assertIn("df_control.select('FMTNAME', 'TYPE', 'START', 'END', 'LABEL', 'HLO')", cntlin)
+        self.assertIn("sas2pyspark_cntlin_format('band'", cntlin)
+        self.assertIn("date_format(date_add(DATE'1960-01-01', CAST((dt) AS INT)), 'ddMMMyyyy')", cntlin)
+        self.assertNotIn("sas2pyspark_cntlin_format('date9'", cntlin)
+        compile(cntlin, "<generated-pyspark>", "exec")
 
     def test_if_then_do_blocks_and_delete_rewrite_to_conditionals(self):
         result = self.converter.convert(
@@ -1424,8 +1627,8 @@ run;
     def test_if_then_do_rejects_unsafe_forms(self):
         unsupported_sources = (
             (
-                "data out; set s; if a gt 1 then do; if b gt 1 then c = 1; end; run;",
-                "nested DO, SELECT and IF/ELSE",
+                "data out; set s; if a gt 1 then do; when (1) c = 1; end; run;",
+                "Iterative DO loops",
             ),
             (
                 "data out; set s; if a gt 1 then do; a = 2; b = 3; end; run;",
@@ -1505,10 +1708,6 @@ run;
             (
                 "data out; set source; do index = 1 to 5; index = index + 1; output; end; run;",
                 "cannot reassign its index variable",
-            ),
-            (
-                "data out; set source; do index = 1 to 5; value = index + 1; end; run;",
-                "exactly one OUTPUT",
             ),
             (
                 "data out; set source; do index = 1 to 5; output; end; value = index; run;",

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SAS to PySpark Migration Framework Guide</title>
+<style>
+@page { size: A4; margin: 16mm 15mm 18mm; @bottom-right { content: "sas2pyspark  |  " counter(page); color: #64748b; font: 8pt Arial; } }
+* { box-sizing: border-box; }
+body { color: #172033; font: 10pt/1.48 Arial, Helvetica, sans-serif; margin: 0; }
+h1, h2, h3 { color: #12355b; page-break-after: avoid; }
+h1 { font-size: 30pt; line-height: 1.12; margin: 0 0 18pt; }
+h2 { border-bottom: 1px solid #cbd5e1; font-size: 18pt; margin-top: 25pt; padding-bottom: 5pt; }
+h3 { font-size: 12pt; margin: 15pt 0 5pt; }
+p { margin: 5pt 0 8pt; }
+ul, ol { margin: 5pt 0 10pt 18pt; padding: 0; }
+li { margin: 2pt 0; }
+table { border-collapse: collapse; font-size: 8.6pt; margin: 9pt 0 14pt; width: 100%; }
+th { background: #e7eef7; color: #12355b; text-align: left; }
+th, td { border: 1px solid #b8c5d6; padding: 5pt 6pt; vertical-align: top; }
+pre { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 3px; font: 8.3pt/1.4 Consolas, monospace; overflow-wrap: anywhere; padding: 8pt; white-space: pre-wrap; }
+code { color: #0f456e; font: 0.94em Consolas, monospace; }
+.cover { align-items: flex-start; background: linear-gradient(140deg, #12355b, #176b87); color: white; display: flex; flex-direction: column; height: 245mm; justify-content: center; margin: -16mm -15mm -18mm; padding: 25mm; page-break-after: always; }
+.cover h1, .cover h2 { border: 0; color: white; }
+.cover h1 { font-size: 34pt; max-width: 150mm; }
+.cover .subtitle { color: #d7ecf4; font-size: 15pt; max-width: 145mm; }
+.cover .meta { border-top: 1px solid #9fc2d3; margin-top: 25pt; padding-top: 12pt; }
+.note { background: #fff7dd; border-left: 4px solid #e4a11b; margin: 10pt 0; padding: 8pt 10pt; }
+.callout { background: #e9f4f8; border-left: 4px solid #1684a0; margin: 10pt 0; padding: 8pt 10pt; }
+.small { color: #536277; font-size: 8.5pt; }
+.diagram { margin: 10pt 0 14pt; page-break-inside: avoid; }
+.diagram svg { height: auto; max-width: 100%; }
+.page { page-break-before: always; }
+.tag { background: #dcecf2; border-radius: 9px; color: #12355b; display: inline-block; font-size: 8pt; font-weight: bold; margin-right: 4px; padding: 2px 7px; }
+.two-col { columns: 2; column-gap: 18pt; }
+@media screen { body { margin: 24px auto; max-width: 850px; padding: 0 25px; } .cover { margin: 0; height: 800px; } }
+</style>
+</head>
+<body>
+<section class="cover">
+  <div class="tag">TECHNICAL GUIDE</div>
+  <h1>SAS to PySpark Migration Framework</h1>
+  <p class="subtitle">Framework overview, supported conversion scope, design and architecture, algorithms, limitations, repository details, and validation examples.</p>
+  <div class="meta">
+    <p><strong>Repository:</strong> chetanmbulla/Sas_to_pyspark_convertion</p>
+    <p><strong>Documentation snapshot:</strong> 4 November 2026</p>
+    <p><strong>Framework version:</strong> 0.1.0</p>
+    <p><strong>Compatibility target:</strong> supported Base SAS subset to PySpark</p>
+  </div>
+</section>
+
+<h2>1. Framework overview</h2>
+<p><code>sas2pyspark</code> is a Python migration aid that translates a deliberately supported subset of SAS programs into reviewable PySpark source. It provides an installable Python package, command-line interface, Streamlit application, project inventory/conversion workflows, and optional Spark-based validation and reconciliation utilities.</p>
+<p>The converter is conservative: unsupported or ambiguous syntax should fail with a <code>ConversionError</code> that identifies the source line and statement when available, rather than silently emitting a misleading translation. A successful conversion is not proof of semantic equivalence. Generated code must be reviewed and compared with representative SAS outputs before production use.</p>
+<div class="callout"><strong>Primary objective:</strong> reduce repetitive translation work while making assumptions, approximations, warnings, and unsupported constructs visible to migration teams.</div>
+
+<h3>Scope and intended use</h3>
+<ul>
+  <li>Translate supported Base SAS data-step transformations, selected procedures, expressions, macro constructs, date/format operations, and CSV input/output to PySpark.</li>
+  <li>Support source-level conversion and a project workflow for discovering programs/data, recording conversions, reviewing outputs, and testing generated code.</li>
+  <li>Help engineers build a migration baseline and identify unsupported syntax requiring manual conversion.</li>
+  <li>Use Spark DataFrames and SQL temporary views as the generated runtime model.</li>
+</ul>
+<h3>Out of scope</h3>
+<ul>
+  <li>A complete SAS compiler, SAS runtime emulator, or automatic proof of business equivalence.</li>
+  <li>Products and languages outside the documented subset, such as SAS/STAT, CAS, DS2, PROC IML, and arbitrary SAS/CONNECT behavior.</li>
+  <li>Automatic access to SAS installations, licensed engines, SAS catalogs, or arbitrary <code>.sas7bdat</code> readers.</li>
+</ul>
+
+<h2>2. Functionality and capabilities</h2>
+<table>
+<thead><tr><th>Area</th><th>Current capabilities</th></tr></thead>
+<tbody>
+<tr><td>Entry points</td><td>Python API, <code>sas2pyspark</code> CLI, Streamlit conversion/testing UI, and project-oriented commands/workflows.</td></tr>
+<tr><td>Parser and diagnostics</td><td>Source-aware lexical/statement parser with line locations; conservative conversion errors and warnings.</td></tr>
+<tr><td>DATA steps</td><td>SET/WHERE, row filters, assignments, IF/ELSE, nested IF/DO and SELECT blocks, OUTPUT routing, MERGE BY and IN= flags, RETAIN variants, arrays, loops, inline DATALINES, _N_, LAG/DIF, and supported SET dataset options.</td></tr>
+<tr><td>Procedures</td><td>PROC SQL, SORT, FREQ, MEANS/SUMMARY, UNIVARIATE approximation, TRANSPOSE, FORMAT, APPEND, DATASETS, IMPORT/EXPORT, PRINT, CONTENTS, COPY, and COMPARE within documented options.</td></tr>
+<tr><td>Macros</td><td>%LET, macro variables, %MACRO calls and parameters, bounded nested/recursive expansion, compile-time %IF/%DO, text functions, %SYSFUNC subset, runtime variables, opt-in %SYSGET, and bounded dynamic %INCLUDE paths.</td></tr>
+<tr><td>Dates and formats</td><td>SAS date-day and datetime-second counts, date/datetime literals, common date functions, supported informats/formats, VALUE/INVALUE/PICTURE definitions, and CNTLIN conversion for standard control columns.</td></tr>
+<tr><td>Migration governance</td><td>Repository discovery, dataset/program dependency analysis, project conversion tracking, review/readiness reporting, local execution testing, and optional SAS/PySpark output reconciliation.</td></tr>
+</tbody></table>
+
+<h3>Recent committed work</h3>
+<table>
+<thead><tr><th>Commit</th><th>Summary</th></tr></thead>
+<tbody>
+<tr><td><code>6f0e64d</code></td><td>Runtime macro variables using PROC SQL SELECT INTO and CALL SYMPUT/SYMPUTX.</td></tr>
+<tr><td><code>5af224f</code></td><td>Macro text functions, %SYSEVALF, %SYMEXIST, %RETURN, and forward %GOTO.</td></tr>
+<tr><td><code>c2f7221</code></td><td>Broad converter extension covering blocks, dates, formats, includes, merge, outputs, RETAIN, procedures, macros, and SQL.</td></tr>
+<tr><td><code>6b72638</code></td><td>Project restructuring and source-aware parser foundation.</td></tr>
+<tr><td><code>03b88cc</code></td><td>Initial SAS-to-PySpark framework.</td></tr>
+</tbody></table>
+<p><strong>Worktree status at this documentation snapshot:</strong> implementation groups 1–6 include additional uncommitted changes for inline data/_N_, LAG/DIF and SET options, report procedures, nested data-step logic/arrays/RETAIN/LENGTH, SAS date/datetime semantics and format extensions, and macro/include enhancements. These changes are not represented by the commit list above. This guide and the README also include the group 7 documentation and local performance check; none of those uncommitted changes are represented by the commit list.</p>
+
+<h2>3. Design and architecture</h2>
+<h3>High-level architecture</h3>
+<div class="diagram">
+<svg viewBox="0 0 900 410" role="img" aria-label="High-level architecture diagram">
+ <defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#41627f"/></marker></defs>
+ <rect x="20" y="150" width="135" height="75" rx="8" fill="#e9f4f8" stroke="#1684a0" stroke-width="2"/><text x="87" y="180" text-anchor="middle" font-size="16" fill="#12355b">SAS sources</text><text x="87" y="202" text-anchor="middle" font-size="12" fill="#334">.sas / includes</text>
+ <rect x="205" y="40" width="165" height="70" rx="8" fill="#eef2ff" stroke="#5369b1" stroke-width="2"/><text x="287" y="70" text-anchor="middle" font-size="15" fill="#12355b">CLI / Python API</text><text x="287" y="91" text-anchor="middle" font-size="12">batch conversion</text>
+ <rect x="205" y="155" width="165" height="70" rx="8" fill="#eef2ff" stroke="#5369b1" stroke-width="2"/><text x="287" y="185" text-anchor="middle" font-size="15" fill="#12355b">Converter core</text><text x="287" y="206" text-anchor="middle" font-size="12">parse / macros / rewrite</text>
+ <rect x="205" y="270" width="165" height="70" rx="8" fill="#eef2ff" stroke="#5369b1" stroke-width="2"/><text x="287" y="300" text-anchor="middle" font-size="15" fill="#12355b">Streamlit UI</text><text x="287" y="321" text-anchor="middle" font-size="12">review / local testing</text>
+ <rect x="430" y="145" width="175" height="90" rx="8" fill="#eaf7ed" stroke="#4b9b61" stroke-width="2"/><text x="517" y="178" text-anchor="middle" font-size="15" fill="#12355b">Generated PySpark</text><text x="517" y="201" text-anchor="middle" font-size="12">DataFrames / Spark SQL</text><text x="517" y="220" text-anchor="middle" font-size="12">warnings + source code</text>
+ <rect x="665" y="60" width="205" height="75" rx="8" fill="#fff7dd" stroke="#d79a1d" stroke-width="2"/><text x="767" y="91" text-anchor="middle" font-size="15" fill="#12355b">Spark runtime</text><text x="767" y="114" text-anchor="middle" font-size="12">test data / CSV / Parquet</text>
+ <rect x="665" y="180" width="205" height="75" rx="8" fill="#fff7dd" stroke="#d79a1d" stroke-width="2"/><text x="767" y="211" text-anchor="middle" font-size="15" fill="#12355b">Project governance</text><text x="767" y="234" text-anchor="middle" font-size="12">inventory / review / readiness</text>
+ <rect x="665" y="300" width="205" height="75" rx="8" fill="#fff7dd" stroke="#d79a1d" stroke-width="2"/><text x="767" y="331" text-anchor="middle" font-size="15" fill="#12355b">Validation outputs</text><text x="767" y="354" text-anchor="middle" font-size="12">logs / previews / reconciliation</text>
+ <path d="M155 188 L205 188" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M370 75 C410 75 405 160 430 170" fill="none" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M370 190 L430 190" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M370 305 C410 305 405 225 430 210" fill="none" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M605 170 C630 145 635 110 665 105" fill="none" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M605 190 L665 215" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+ <path d="M605 215 C635 245 635 320 665 335" fill="none" stroke="#41627f" stroke-width="2" marker-end="url(#arrow)"/>
+</svg>
+</div>
+<h3>Low-level converter architecture</h3>
+<div class="diagram">
+<svg viewBox="0 0 900 520" role="img" aria-label="Low-level converter pipeline diagram">
+ <defs><marker id="arrow2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#41627f"/></marker></defs>
+ <g font-family="Arial" text-anchor="middle">
+ <rect x="280" y="15" width="340" height="44" rx="7" fill="#e9f4f8" stroke="#1684a0"/><text x="450" y="43" font-size="14">Source text + options (SAS version, include root, sysget opt-in)</text>
+ <rect x="280" y="82" width="340" height="44" rx="7" fill="#e9f4f8" stroke="#1684a0"/><text x="450" y="110" font-size="14">Safe include expansion (literal / preceding %LET path)</text>
+ <rect x="280" y="149" width="340" height="44" rx="7" fill="#eef2ff" stroke="#5369b1"/><text x="450" y="177" font-size="14">parse_program: statements, tokens, spans, source lines</text>
+ <rect x="280" y="216" width="340" height="55" rx="7" fill="#eef2ff" stroke="#5369b1"/><text x="450" y="239" font-size="14">Macro processor: variables, %IF/%DO, calls/recursion,</text><text x="450" y="258" font-size="13">%SYSFUNC / %SYSGET and runtime-macro validation</text>
+ <rect x="210" y="294" width="480" height="86" rx="7" fill="#eaf7ed" stroke="#4b9b61"/><text x="450" y="316" font-size="14">Ordered source rewrite passes</text><text x="450" y="339" font-size="12">SET options / arrays+loops / LAG / row number / DATALINES</text><text x="450" y="358" font-size="12">SYMPUT / OUTPUT routing / nested IF-SELECT / RETAIN / LENGTH</text>
+ <rect x="280" y="403" width="340" height="44" rx="7" fill="#fff7dd" stroke="#d79a1d"/><text x="450" y="431" font-size="14">Statement dispatch: DATA step, PROC handlers, SQL</text>
+ <rect x="280" y="470" width="340" height="44" rx="7" fill="#fff7dd" stroke="#d79a1d"/><text x="450" y="498" font-size="14">Generated Python + warnings / ConversionError diagnostics</text>
+ <path d="M450 59 L450 82 M450 126 L450 149 M450 193 L450 216 M450 271 L450 294 M450 380 L450 403 M450 447 L450 470" stroke="#41627f" stroke-width="2" marker-end="url(#arrow2)"/>
+ </g>
+</svg>
+</div>
+
+<h3>Process flow</h3>
+<ol>
+  <li>Resolve source-version metadata and reset per-conversion format state.</li>
+  <li>Inline approved includes; enforce a root boundary, reject cycles, and limit nesting.</li>
+  <li>Parse SAS source into source-located statements and tokens.</li>
+  <li>Extract macro definitions and expand compile-time macro constructs under depth, loop, and output-size bounds.</li>
+  <li>Apply ordered prepasses for syntax requiring whole-step context and helper markers.</li>
+  <li>Dispatch statements to DATA-step and PROC converters; unsupported syntax raises an explicit error.</li>
+  <li>Return generated Python plus warnings, source-version selection, and diagnostics; user/runtime tools execute it separately.</li>
+</ol>
+
+<h3>Core algorithm</h3>
+<pre>convert(source, options):
+  reset per-conversion registries
+  source = inline_safe_includes(source, include_root)
+  statements = parse_program(source)
+  statements = expand_macros(statements, allow_sysget)
+  for rewrite in ordered_rewrite_passes:
+      statements = rewrite(statements)
+  output = generated_header
+  while statements remain:
+      if helper_marker: emit helper code
+      elif DATA step: validate + translate data actions/windows
+      elif supported PROC: validate + translate procedure
+      else: raise source-located ConversionError
+  return code, warnings, version profile</pre>
+<p class="small">The ordered prepasses are intentionally explicit because transformations can depend on one another. The implementation uses named helpers in <code>src/sas2pyspark/</code>; see the low-level diagram for the current pipeline order.</p>
+
+<h2>4. Capabilities and semantic conventions</h2>
+<h3>Data-step and procedure highlights</h3>
+<ul>
+  <li>Simple SET sources union by name; supported dataset options apply WHERE, FIRSTOBS/OBS, KEEP/DROP, then RENAME. MERGE BY approximates SAS match-merge behavior with windows and joins.</li>
+  <li>Nested block statements are converted to guarded assignments. IF/SELECT conditions that are unsafe to model are rejected.</li>
+  <li>Output-producing indexed loops and statically bounded non-OUTPUT loops have different paths. The latter are unrolled under a statement cap.</li>
+  <li>PROC PRINT maps to <code>DataFrame.show()</code>; CONTENTS to schema display; COPY aliases views; COMPARE emits a limited summary.</li>
+  <li>CSV IMPORT/EXPORT use Spark CSV readers/writers. PROC FORMAT supports documented static mappings and a bounded CNTLIN path.</li>
+</ul>
+<h3>Dates, missing values, ordering</h3>
+<ul>
+  <li>SAS date numerics are day counts from 1960-01-01. SAS datetime numerics are seconds from that date. These are not Spark DATE/TIMESTAMP columns.</li>
+  <li>Character and numeric missing values map to Spark NULL with selected SAS-like string behavior. SAS special missing codes .A-.Z are not preserved as distinct states.</li>
+  <li>Spark does not guarantee row order. Monotonic IDs/windows are best-effort stand-ins for observation order in operations such as LAG/DIF, _N_, and RETAIN.</li>
+</ul>
+
+<h2>5. Limitations and risk controls</h2>
+<table>
+<thead><tr><th>Limitation</th><th>Impact / mitigation</th></tr></thead>
+<tbody>
+<tr><td>Partial language and PROC coverage</td><td>Unsupported statements fail. Resolve manually or add a narrow converter feature with semantic tests.</td></tr>
+<tr><td>No automatic SAS equivalence proof</td><td>Compare representative output rows, schemas, edge cases, and aggregates with real SAS runs.</td></tr>
+<tr><td>Observation ordering</td><td>Spark order is best effort. Add deterministic source keys/order columns before relying on LAG, RETAIN, FIRST/LAST, or _N_.</td></tr>
+<tr><td>RETAIN and windows</td><td>Some RETAIN patterns require a single Spark partition or do not support BY/MERGE and self-reference. Avoid for large data without redesign.</td></tr>
+<tr><td>Run-time macro variables</td><td>Generated Spark SQL session variables require Spark 4.0+ and are not usable in compile-time/structural contexts.</td></tr>
+<tr><td>%SYSGET</td><td>Disabled by default. Opt-in reads host environment values during conversion; never expose secrets or untrusted values to conversion output.</td></tr>
+<tr><td>Dynamic includes</td><td>Only paths resolvable from preceding %LET values are supported; macro-parameter includes are rejected. Path roots, cycles, and nesting are bounded.</td></tr>
+<tr><td>CNTLIN formats</td><td>Rows are collected to the driver and should be small. Complex format catalogs/options are unsupported.</td></tr>
+<tr><td>File formats and engines</td><td>CSV flows are supported; LIBNAME engines and general SAS datasets are not materialized. Supply data as Spark-readable files/DataFrames.</td></tr>
+<tr><td>Execution security</td><td>Generated Python and the Streamlit test worker run with the user's account permissions; the worker is not a security sandbox. Run only trusted source/code.</td></tr>
+</tbody></table>
+
+<h2>6. Test scenarios and sample data</h2>
+<p>The automated suite covers source parsing, converter output, project workflows, governance/readiness, GUI testing, reconciliation, and Spark execution when the optional test dependencies and Java are available. At the documentation snapshot, the project test command is:</p>
+<pre>py -3.11 -m unittest discover -s tests</pre>
+<p>For direct local runs in this checkout, set <code>PYTHONPATH=src</code>. Spark integration tests use local Spark; PySpark 4 requires Java 17 or newer. The test extra is declared in <code>pyproject.toml</code>.</p>
+
+<h3>Representative scenarios</h3>
+<table>
+<thead><tr><th>Scenario</th><th>Representative SAS</th><th>Input / expected behavior</th></tr></thead>
+<tbody>
+<tr><td>Filter and assignment</td><td><code>data out; set people; where age ge 18; adult=1; run;</code></td><td>Rows below 18 are removed; retained rows receive <code>adult=1</code>.</td></tr>
+<tr><td>Runtime macro variable</td><td><code>proc sql noprint; select max(id) into :maxid from people; quit;</code></td><td>Spark session variable is declared and available in later supported expressions (Spark 4+).</td></tr>
+<tr><td>Nested macro / recursion</td><td><code>%make(%identity(people));</code>, bounded countdown macro</td><td>Nested argument expansion works; recursion is bounded by the 32-level limit.</td></tr>
+<tr><td>Dynamic include</td><td><code>%let file=sub/part.sas; %include "&amp;file.";</code></td><td>Included source is resolved under the allowed root; traversal and cycles are rejected.</td></tr>
+<tr><td>Date/datetime</td><td><code>dt='02JAN1960:01:02:03'dt; d=datepart(dt);</code></td><td><code>dt=90123</code> seconds; <code>d=1</code> day; TIMEPART returns 3723 seconds.</td></tr>
+<tr><td>INVALUE / PICTURE</td><td><code>input(flag,yn.)</code>, <code>put(amount,dollars.)</code></td><td>Exact mappings and supported digit mask produce mapped/rounded labels.</td></tr>
+<tr><td>CNTLIN</td><td><code>proc format cntlin=control; run;</code></td><td>Small format control table maps score 1 to Low, 3 to Medium, 8 to High, and 12 to Other.</td></tr>
+<tr><td>Nested blocks and arrays</td><td><code>do i=1 to dim(q); q{i}=x*i; end;</code></td><td>Static loops unroll; array element assignments map to element columns.</td></tr>
+</tbody></table>
+
+<h3>Sample input and program</h3>
+<pre>people.csv
+id,name,age
+1,Ada,36
+2,Bo,17
+3,Cy,52</pre>
+<pre>data work.adults;
+  set work.people;
+  where age ge 18;
+  retain prior_name '';
+  if age gt 40 then prior_name = name;
+  band = 'adult';
+  keep id name age prior_name band;
+run;</pre>
+<p>Expected retained rows are Ada and Cy; Bo is filtered out. Because Spark row order is unspecified, production logic should use a stable explicit ordering key before relying on the retained value across multiple rows. Converter tests assert code shape and rejection behavior; Spark tests execute generated code with representative DataFrames and assert values, types, row counts, and helper-column cleanup.</p>
+
+<h3>Local performance check</h3>
+<p>A synthetic pipeline filtered <code>age &gt;= 18</code>, derived <code>adult_flag</code> and <code>age_band</code>, then aggregated counts and flag sums. On Python 3.11.9, PySpark 4.3.0, Java 17.0.20.1, Spark <code>local[2]</code> with two shuffle partitions, warmed cached <code>Spark.range</code> inputs were measured three times:</p>
+<table>
+<thead><tr><th>Input rows</th><th>Output rows</th><th>Median elapsed</th></tr></thead>
+<tbody>
+<tr><td>100,000</td><td>79,992</td><td>0.429 s</td></tr>
+<tr><td>1,000,000</td><td>799,992</td><td>0.310 s</td></tr>
+</tbody></table>
+<p>Conversion took about 7.84 ms and generated 384 characters. This is a local, synthetic, cached reproducibility snapshot, not a benchmark suite or a production throughput claim. The lower median for the larger input illustrates measurement noise from Spark warm-up, scheduling, and host load. Use representative uncached data and the target cluster for capacity or scaling decisions.</p>
+
+<h2>7. Repository details and operation</h2>
+<table>
+<tbody>
+<tr><th>Repository</th><td><code>https://github.com/chetanmbulla/Sas_to_pyspark_convertion</code></td></tr>
+<tr><th>Branch at snapshot</th><td><code>main</code></td></tr>
+<tr><th>Package/version</th><td><code>sas2pyspark</code> / <code>0.1.0</code></td></tr>
+<tr><th>Python support</th><td>Python 3.10+ per <code>pyproject.toml</code>; validation environment Python 3.11.</td></tr>
+<tr><th>Dependencies</th><td>Core converter has no third-party runtime dependencies. Optional extras provide PySpark, Streamlit, and reconciliation packages.</td></tr>
+<tr><th>Key locations</th><td><code>src/sas2pyspark/</code> package; <code>app/</code> UI; <code>tests/</code>; <code>examples/</code>; <code>docs/</code>.</td></tr>
+</tbody></table>
+<h3>Quick commands (PowerShell)</h3>
+<pre>py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\sas2pyspark.exe input.sas --output output.py
+py -3.11 -m unittest discover -s tests</pre>
+<p>Python API: <code>from sas2pyspark import SasToPySparkConverter</code>, then <code>SasToPySparkConverter().convert(source)</code>. Enable environment access explicitly with <code>SasToPySparkConverter(allow_sysget=True)</code>. The CLI and GUI do not enable %SYSGET by default.</p>
+
+<h2>8. Release and validation guidance</h2>
+<ol>
+  <li>Inventory the SAS programs, input/output datasets, libraries, dependencies, and available SAS reference outputs.</li>
+  <li>Convert a small representative program; inspect warnings and errors instead of treating code generation as a pass/fail equivalence check.</li>
+  <li>Review generated Python and confirm the Spark schema, null behavior, ordering, date types/units, and side effects.</li>
+  <li>Run deterministic test cases and compare outputs with SAS using the repository's reconciliation workflow where feasible.</li>
+  <li>Record unresolved syntax and semantic gaps; keep unsupported logic blocked from production until manually translated and validated.</li>
+</ol>
+<p class="small">This guide documents repository behavior and engineering conventions as of 4 November 2026. Feature support can change; consult the current README, tests, and source before relying on a particular construct.</p>
+</body>
+</html>
