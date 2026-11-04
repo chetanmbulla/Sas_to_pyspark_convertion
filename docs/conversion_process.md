@@ -123,11 +123,19 @@ datasets, filters, `BY` keys (including per-key `ASCENDING`/`DESCENDING`
 modifiers), array declarations, assignments, conditionals, and supported
 `KEEP`/`DROP` rules. Conditional assignments and `SELECT/WHEN`
 branches are checked against the supported simple-assignment patterns. A
-supported `DO` loop must use integer literal bounds and step, simple
-assignments, and one final `OUTPUT`.
+supported output-generating `DO` loop may use integer literals or compile-time
+integer expressions for its bounds and step; it must have simple assignments
+and one final `OUTPUT`. Variable-dependent loop bounds remain unsupported.
 
 For a `MERGE`, the converter requires multiple inputs and a `BY` statement.
-The generated program checks that each input has unique BY keys before joining.
+The generated program checks that each input has the BY columns before joining.
+By default, duplicate rows within each BY group use best-effort Spark order.
+The sas2pyspark extension `merge left(order_by=(left_seq))
+right(order_by=(right_seq descending));` provides an independent stable order
+for every input. When provided on all inputs, the generated program verifies
+the order columns and rejects duplicate BY-key/order-key combinations at
+runtime. This controls duplicate-key pairing but is not standard SAS syntax;
+`WHERE=` and other MERGE dataset options remain unsupported.
 
 Each `PROC` parser validates its required options and statements. For example,
 `PROC IMPORT` and `PROC EXPORT` support CSV rather than arbitrary SAS DBMS
@@ -176,9 +184,13 @@ registered as temporary Spark views. A successful conversion returns
 `ConversionResult.code` and any non-fatal notes in `ConversionResult.warnings`.
 
 Warnings matter: some SAS behavior has no exact match in unordered Spark
-DataFrames. For example, `RETAIN` and `FIRST.`/`LAST.` behavior may rely on
-best-effort row ordering, and `PROC SORT NODUPKEY` may keep a different tied
-row than SAS.
+DataFrames. By default, `RETAIN`, `LAG`/`DIF`, `_N_`, and `FIRST.`/`LAST.`
+behavior use best-effort order and may differ from SAS. A sas2pyspark
+DATA-step extension, `ORDER BY key1, key2 DESC;`, can define their iteration
+order when the keys are unique. The generated program checks for missing or
+duplicate keys at runtime. It does not sort output rows, affect `SET`
+`FIRSTOBS`/`OBS`, or define per-input order for `MERGE`. `PROC SORT NODUPKEY`
+may still keep a different tied row than SAS.
 
 ## 6. Handle unsupported input
 

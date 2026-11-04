@@ -162,17 +162,18 @@ code { color: #0f456e; font: 0.94em Consolas, monospace; }
 <h2>4. Capabilities and semantic conventions</h2>
 <h3>Data-step and procedure highlights</h3>
 <ul>
-  <li>Simple SET sources union by name; supported dataset options apply WHERE, FIRSTOBS/OBS, KEEP/DROP, then RENAME. MERGE BY approximates SAS match-merge behavior with windows and joins.</li>
+  <li>Simple SET sources union by name; supported dataset options apply WHERE, FIRSTOBS/OBS, KEEP/DROP, then RENAME. MERGE BY approximates SAS match-merge behavior with windows and joins; per-input <code>ORDER_BY=(...)</code> options provide deterministic duplicate-key pairing.</li>
   <li>Nested block statements are converted to guarded assignments. IF/SELECT conditions that are unsafe to model are rejected.</li>
-  <li>Output-producing indexed loops and statically bounded non-OUTPUT loops have different paths. The latter are unrolled under a statement cap.</li>
-  <li>PROC PRINT maps to <code>DataFrame.show()</code>; CONTENTS to schema display; COPY aliases views; COMPARE emits a limited summary.</li>
+  <li>Output-producing indexed loops accept integer literal or compile-time integer-expression bounds and steps. Statically bounded non-OUTPUT loops are unrolled under a statement cap.</li>
+  <li>PROC PRINT maps to <code>DataFrame.show()</code>; CONTENTS displays a schema or column names and can emit Spark schema metadata with <code>OUT=</code>; COPY aliases views; COMPARE emits a limited summary.</li>
   <li>CSV IMPORT/EXPORT use Spark CSV readers/writers. PROC FORMAT supports documented static mappings and a bounded CNTLIN path.</li>
 </ul>
+<p class="small"><code>PROC CONTENTS OUT=</code> produces <code>NAME</code>, <code>SPARK_TYPE</code>, <code>NULLABLE</code>, and <code>POSITION</code> in Spark schema order. It is an explicit Spark-oriented metadata extension and does not reproduce the SAS output dataset schema.</p>
 <h3>Dates, missing values, ordering</h3>
 <ul>
   <li>SAS date numerics are day counts from 1960-01-01. SAS datetime numerics are seconds from that date. These are not Spark DATE/TIMESTAMP columns.</li>
   <li>Character and numeric missing values map to Spark NULL with selected SAS-like string behavior. SAS special missing codes .A-.Z are not preserved as distinct states.</li>
-  <li>Spark does not guarantee row order. Monotonic IDs/windows are best-effort stand-ins for observation order in operations such as LAG/DIF, _N_, and RETAIN.</li>
+  <li>Spark does not guarantee row order. By default monotonic IDs/windows are best-effort stand-ins for observation order in LAG/DIF, _N_, RETAIN, and BY flags. The <code>ORDER BY key1, key2 DESC;</code> DATA-step extension provides a checked unique key for deterministic SET-step windows; it does not sort output rows or affect SET FIRSTOBS/OBS. MERGE uses independent <code>ORDER_BY=(...)</code> keys on each input and validates uniqueness within BY groups.</li>
 </ul>
 
 <h2>5. Limitations and risk controls</h2>
@@ -181,7 +182,7 @@ code { color: #0f456e; font: 0.94em Consolas, monospace; }
 <tbody>
 <tr><td>Partial language and PROC coverage</td><td>Unsupported statements fail. Resolve manually or add a narrow converter feature with semantic tests.</td></tr>
 <tr><td>No automatic SAS equivalence proof</td><td>Compare representative output rows, schemas, edge cases, and aggregates with real SAS runs.</td></tr>
-<tr><td>Observation ordering</td><td>Spark order is best effort. Add deterministic source keys/order columns before relying on LAG, RETAIN, FIRST/LAST, or _N_.</td></tr>
+<tr><td>Observation ordering</td><td>Without explicit ordering keys, Spark order is best effort. SET DATA steps require unique keys; MERGE requires a key on every input, unique within BY groups, and fails on missing or duplicate keys.</td></tr>
 <tr><td>RETAIN and windows</td><td>Some RETAIN patterns require a single Spark partition or do not support BY/MERGE and self-reference. Avoid for large data without redesign.</td></tr>
 <tr><td>Run-time macro variables</td><td>Generated Spark SQL session variables require Spark 4.0+ and are not usable in compile-time/structural contexts.</td></tr>
 <tr><td>%SYSGET</td><td>Disabled by default. Opt-in reads host environment values during conversion; never expose secrets or untrusted values to conversion output.</td></tr>

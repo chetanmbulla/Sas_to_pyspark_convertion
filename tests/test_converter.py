@@ -619,6 +619,60 @@ class ConverterTests(unittest.TestCase):
         )
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_data_step_order_by_uses_explicit_unique_order_keys(self):
+        result = self.converter.convert(
+            "data out; set source; order by sequence descending, event_id; "
+            "previous = lag(value); row_number = _N_; by group; "
+            "is_first = first.group; is_last = last.group; run;"
+        )
+
+        self.assertIn(
+            "lag((value), 1) over (order by `sequence` desc, `event_id` asc)",
+            result.code,
+        )
+        self.assertIn(
+            "withColumn('__sas2pyspark_n', F.expr("
+            "'row_number() over (order by `sequence` desc, `event_id` asc)'))",
+            result.code,
+        )
+        self.assertIn(
+            "DATA-step ORDER BY keys must be unique for deterministic observation order",
+            result.code,
+        )
+        self.assertIn("partitionBy(F.col('group')).orderBy(", result.code)
+        self.assertFalse(
+            any("best-effort observation order" in warning for warning in result.warnings)
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_data_step_order_by_rejects_bad_keys_and_merge(self):
+        invalid = (
+            ("data out; set source; order by; run;", "requires simple column names"),
+            (
+                "data out; set source; order by id, id; run;",
+                "columns must be distinct",
+            ),
+            (
+                "data out; merge left right; by id; order by sequence; run;",
+                "not supported with MERGE",
+            ),
+        )
+        for source, expected in invalid:
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(expected, str(context.exception))
+
+    def test_data_step_order_by_without_order_sensitive_operations_warns(self):
+        result = self.converter.convert(
+            "data out; set source; order by id; copied = value; run;"
+        )
+
+        self.assertNotIn("dropDuplicates", result.code)
+        self.assertTrue(
+            any("has no effect" in warning for warning in result.warnings)
+        )
+
     def test_proc_sort_and_nodupkey(self):
         result = self.converter.convert(
             """
@@ -1044,6 +1098,7 @@ run;
         for bad in (
             "proc print data=a(obs=5); run;",
             "proc print data=a; by x; run;",
+            "proc print data=a label; run;",
             "proc print; run;",
             "proc contents data=a; modify x; run;",
             "proc copy in=work out=lib; run;",
@@ -1051,6 +1106,31 @@ run;
         ):
             with self.assertRaises(ConversionError, msg=bad):
                 SasToPySparkConverter().convert(bad)
+
+    def test_proc_contents_out_emits_spark_schema_metadata(self):
+        result = SasToPySparkConverter().convert(
+            "proc contents data=work.people out=work.people_columns short varnum; run;"
+        )
+
+        self.assertIn(
+            "df_people_columns = spark.createDataFrame("
+            "[(field.name, field.dataType.simpleString(), field.nullable, position) "
+            "for position, field in enumerate(df_people.schema.fields, start=1)], "
+            "'NAME STRING, SPARK_TYPE STRING, NULLABLE BOOLEAN, POSITION INT')",
+            result.code,
+        )
+        self.assertIn(
+            "df_people_columns.createOrReplaceTempView('people_columns')",
+            result.code,
+        )
+        self.assertIn("print(df_people.columns)", result.code)
+        self.assertTrue(
+            any("not the SAS PROC CONTENTS output schema" in warning for warning in result.warnings)
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+
+        with self.assertRaisesRegex(ConversionError, "PROC CONTENTS supports"):
+            SasToPySparkConverter().convert("proc contents data=people unsupported; run;")
 
     def test_nested_blocks_select_arrays_retain_and_length(self):
         converter = SasToPySparkConverter()
@@ -1687,6 +1767,25 @@ run;
         self.assertIn(".select(*['id', 'index', 'scaled'])", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
+    def test_output_do_loop_accepts_compile_time_integer_expressions(self):
+        result = self.converter.convert(
+            """
+            data expanded;
+              set source;
+              do index = 1 + 1 to 5 * 2 by 1 + 2;
+                scaled = index * 10;
+                output;
+              end;
+            run;
+            """
+        )
+        self.assertIn(
+            "F.explode(F.sequence(F.lit(2), F.lit(10), F.lit(3)))",
+            result.code,
+        )
+        self.assertIn("withColumn('scaled', F.expr('index * 10'))", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
     def test_output_do_loop_rejects_unmodeled_semantics(self):
         unsupported_sources = (
             (
@@ -1699,7 +1798,15 @@ run;
             ),
             (
                 "data out; set source; do index = 1.5 to 5; output; end; run;",
-                "integer-literal DO index",
+                "integer literals or compile-time integer expressions",
+            ),
+            (
+                "data out; set source; do index = 1 to limit; output; end; run;",
+                "bounds and step must be integer literals",
+            ),
+            (
+                "data out; set source; do index = 1 to 5 by 2 - 2; output; end; run;",
+                "BY step cannot be zero",
             ),
             (
                 "data out; set source; do index = 1 to 5; output; run;",
@@ -1772,6 +1879,63 @@ run;
         compile(result.code, "<generated-pyspark>", "exec")
         with self.assertRaises(ConversionError):
             self.converter.convert("data o; merge l(in=a) r(in=a); by id; run;")
+
+    def test_merge_by_accepts_per_input_order_keys(self):
+        result = self.converter.convert(
+            "data out; merge left(order_by=(left_seq)) right(in=present "
+            "order_by=(right_seq descending)); by id; run;"
+        )
+
+        self.assertIn(
+            "__sas2pyspark_merge_order_keys = "
+            "[[('left_seq', True)], [('right_seq', False)]]",
+            result.code,
+        )
+        self.assertIn(
+            "MERGE ORDER_BY keys must be unique within each BY group",
+            result.code,
+        )
+        self.assertIn("F.col(__sas2pyspark_column).asc()", result.code)
+        self.assertIn("F.col(__sas2pyspark_column).desc()", result.code)
+        self.assertFalse(
+            any(
+                "MERGE duplicate-key row pairing uses best-effort" in warning
+                for warning in result.warnings
+            )
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_merge_by_rejects_partial_or_unsupported_order_options(self):
+        invalid_sources = (
+            (
+                "data out; merge left(order_by=(seq)) right; by id; run;",
+                "Specify ORDER_BY for every MERGE input",
+            ),
+            (
+                "data out; merge left(order_by=(seq seq)) right(order_by=(seq)); by id; run;",
+                "comma-separated simple column names",
+            ),
+            (
+                "data out; merge left(where=(active=1)) right; by id; run;",
+                "support IN= and ORDER_BY",
+            ),
+        )
+        for source, expected_message in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(ConversionError) as context:
+                    self.converter.convert(source)
+                self.assertIn(expected_message, str(context.exception))
+
+    def test_merge_without_input_order_keys_warns_about_pairing(self):
+        result = self.converter.convert(
+            "data out; merge left right; by id; run;"
+        )
+        self.assertTrue(
+            any(
+                "MERGE duplicate-key row pairing uses best-effort" in warning
+                for warning in result.warnings
+            )
+        )
 
     def test_merge_by_rejects_unsupported_forms(self):
         unsupported_sources = (

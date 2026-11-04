@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import re
 
+from .data_order import OrderByError, order_by_sql, parse_order_by
 from .macro_processor import MacroExpansionError, MacroStatement
 
 _DATA = re.compile(r"data\s+((?:\w+\.)?\w+)", re.I)
 _CALL = re.compile(r"\b(lag|dif)(\d*)\s*\(", re.I)
 _QUOTED = re.compile(r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")")
-_ORDER = "over (order by monotonically_increasing_id())"
 _MAX_LAG = 100
 
 
@@ -36,6 +36,7 @@ def rewrite_lag(statements: list[MacroStatement]) -> list[MacroStatement]:
         }:
             end += 1
         body = statements[index + 1 : end]
+        order_keys = _step_order(body)
         if end >= len(statements) or not any(
             _CALL.search(_QUOTED.sub("''", item.text)) for item in body
         ):
@@ -45,7 +46,7 @@ def rewrite_lag(statements: list[MacroStatement]) -> list[MacroStatement]:
         result.append(statement)
         helpers: list[str] = []
         for item in body:
-            text, assignments = _rewrite_statement(item, len(helpers))
+            text, assignments = _rewrite_statement(item, len(helpers), order_keys)
             for name, expression in assignments:
                 helpers.append(name)
                 result.append(MacroStatement(f"{name} = {expression}", item.line))
@@ -58,7 +59,9 @@ def rewrite_lag(statements: list[MacroStatement]) -> list[MacroStatement]:
 
 
 def _rewrite_statement(
-    item: MacroStatement, offset: int
+    item: MacroStatement,
+    offset: int,
+    order_keys: tuple[tuple[str, bool], ...] | None,
 ) -> tuple[str, list[tuple[str, str]]]:
     parts = _QUOTED.split(item.text)
     assignments: list[tuple[str, str]] = []
@@ -82,7 +85,12 @@ def _rewrite_statement(
                     f"{call.group(1).upper()} lag must be between 1 and {_MAX_LAG}.",
                     item,
                 )
-            lagged = f"lag(({argument}), {lag}) {_ORDER}"
+            order = (
+                order_by_sql(order_keys)
+                if order_keys
+                else "order by monotonically_increasing_id()"
+            )
+            lagged = f"lag(({argument}), {lag}) over ({order})"
             expression = (
                 lagged
                 if call.group(1).casefold() == "lag"
@@ -93,6 +101,24 @@ def _rewrite_statement(
             text = text[: call.start()] + name + text[closing + 1 :]
         parts[position] = text
     return "".join(parts), assignments
+
+
+def _step_order(
+    body: list[MacroStatement],
+) -> tuple[tuple[str, bool], ...] | None:
+    found = []
+    for item in body:
+        try:
+            keys = parse_order_by(item.text)
+        except OrderByError as error:
+            raise MacroExpansionError(str(error), item) from error
+        if keys is not None:
+            found.append((item, keys))
+    if len(found) > 1:
+        raise MacroExpansionError(
+            "A DATA step supports only one ORDER BY statement.", found[1][0]
+        )
+    return found[0][1] if found else None
 
 
 def _matching(text: str, opening: int, item: MacroStatement) -> int:

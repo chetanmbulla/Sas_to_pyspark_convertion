@@ -28,7 +28,8 @@ from .macro_processor import (
 from .data_blocks import rewrite_if_blocks
 from .data_length import rewrite_length
 from .data_retain import rewrite_retain
-from .data_unroll import rewrite_arrays_and_loops
+from .data_unroll import parse_constant_integer, rewrite_arrays_and_loops
+from .data_order import OrderByError, OrderKey, parse_order_by
 from .data_outputs import rewrite_outputs
 from .data_lines import DATALINES_MARKER, rewrite_datalines
 from .data_lag import rewrite_lag
@@ -197,6 +198,7 @@ class _DataAction:
     merge_keys: tuple[str, ...] = ()
     merge_directions: tuple[bool, ...] = ()
     merge_in_vars: tuple[str, ...] = ()
+    merge_order_keys: tuple[tuple[OrderKey, ...], ...] = ()
     branches: tuple[tuple[str, str], ...] = ()
     retain_initial: str | None = None
     retain_partition: tuple[str, ...] = ()
@@ -212,8 +214,7 @@ _DATA_ASSIGNMENT = re.compile(
 _ARRAY_REFERENCE = re.compile(r"\b([A-Za-z_]\w*)\s*\[\s*([^\]]+)\s*\]")
 _IF_THEN = re.compile(r"^if\s+(.+?)\s+then(?:\s+(.+))?$", re.IGNORECASE | re.DOTALL)
 _DO_LOOP = re.compile(
-    r"^do\s+([A-Za-z_]\w*)\s*=\s*([+-]?\d+)\s+to\s*([+-]?\d+)"
-    r"(?:\s+by\s+([+-]?\d+))?$",
+    r"^do\s+([A-Za-z_]\w*)\s*=\s*(.+?)\s+to\s*(.+?)(?:\s+by\s+(.+))?$",
     re.IGNORECASE,
 )
 _SQL_CREATE = re.compile(
@@ -244,6 +245,80 @@ def _python_name(dataset: str) -> str:
 def _sql_name(dataset: str) -> str:
     """Use the table component of a two-level SAS name as a Spark view name."""
     return _dataset_name(dataset)
+
+
+def _parse_merge_inputs(
+    text: str,
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[OrderKey, ...], ...],
+]:
+    sources: list[str] = []
+    in_vars: list[str] = []
+    order_keys: list[tuple[OrderKey, ...]] = []
+    position = 0
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position == len(text):
+            break
+        dataset = re.match(r"(?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*", text[position:])
+        if dataset is None:
+            raise ConversionError(f"Unsupported SAS dataset reference: {text[position:]!r}.")
+        sources.append(_dataset_name(dataset.group(0)))
+        position += dataset.end()
+        input_flag = ""
+        input_order: tuple[OrderKey, ...] = ()
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position < len(text) and text[position] == "(":
+            position += 1
+            while True:
+                while position < len(text) and text[position].isspace():
+                    position += 1
+                if position >= len(text):
+                    raise ConversionError("Unclosed MERGE dataset options.")
+                if text[position] == ")":
+                    position += 1
+                    break
+                flag = re.match(r"in\s*=\s*([A-Za-z_]\w*)", text[position:], re.I)
+                if flag is not None:
+                    if input_flag:
+                        raise ConversionError("MERGE input supports only one IN= option.")
+                    input_flag = flag.group(1)
+                    position += flag.end()
+                    continue
+                order_option = re.match(r"order_by\s*=\s*\(", text[position:], re.I)
+                if order_option is not None:
+                    if input_order:
+                        raise ConversionError(
+                            "MERGE input supports only one ORDER_BY option."
+                        )
+                    position += order_option.end()
+                    end = text.find(")", position)
+                    if end < 0:
+                        raise ConversionError("Unclosed MERGE ORDER_BY option.")
+                    try:
+                        parsed = parse_order_by("order by " + text[position:end])
+                    except OrderByError as error:
+                        raise ConversionError(str(error)) from error
+                    if parsed is None:
+                        raise ConversionError("MERGE ORDER_BY requires simple column names.")
+                    input_order = parsed
+                    position = end + 1
+                    continue
+                raise ConversionError(
+                    "Unsupported SAS dataset reference; MERGE dataset options "
+                    "support IN= and ORDER_BY=(key, ...) only."
+                )
+        in_vars.append(input_flag)
+        order_keys.append(input_order)
+    if order_keys and any(order_keys) and not all(order_keys):
+        raise ConversionError(
+            "Specify ORDER_BY for every MERGE input or omit it from all inputs."
+        )
+    return tuple(sources), tuple(in_vars), tuple(order_keys)
 
 
 def _map_unquoted(value: str, transform: Callable[[str], str]) -> str:
@@ -839,6 +914,7 @@ class SasToPySparkConverter:
         sources: tuple[str, ...] | None = None
         merge_sources: tuple[str, ...] | None = None
         merge_in_vars: tuple[str, ...] = ()
+        merge_order_keys: tuple[tuple[OrderKey, ...], ...] = ()
         merge_keys: tuple[str, ...] | None = None
         merge_directions: tuple[bool, ...] | None = None
         where_filters: list[str] = []
@@ -852,6 +928,7 @@ class SasToPySparkConverter:
         by_columns: tuple[str, ...] | None = None
         by_flags_used: set[str] = set()
         display_formats: set[str] = set()
+        order_by_keys: tuple[OrderKey, ...] | None = None
 
         def data_expression(expression: str) -> str:
             expanded = _expand_array_references(expression, arrays)
@@ -920,6 +997,15 @@ class SasToPySparkConverter:
             statement = source_statement.text.strip()
             lower = statement.lower()
             try:
+                parsed_order = parse_order_by(statement)
+                if parsed_order is not None:
+                    if order_by_keys is not None:
+                        raise ConversionError(
+                            "A DATA step supports only one ORDER BY statement."
+                        )
+                    order_by_keys = parsed_order
+                    index += 1
+                    continue
                 if output_loop_seen and not (
                     lower.startswith("keep ") or lower.startswith("drop ")
                 ):
@@ -996,25 +1082,15 @@ class SasToPySparkConverter:
                             "MERGE and BY must appear before DATA-step processing "
                             "statements in the supported subset."
                         )
-                    datasets = re.findall(
-                        r"\s*((?:\w+\.)?\w+)\s*(?:\(\s*in\s*=\s*([A-Za-z_]\w*)\s*\))?",
-                        statement[6:],
-                        re.IGNORECASE,
-                    )
-                    spelled = re.sub(r"\s+", "", statement[6:])
-                    rebuilt = "".join(
-                        f"{name}(in={flag})" if flag else name for name, flag in datasets
-                    )
-                    if spelled.lower() != rebuilt.lower():
-                        raise ConversionError(
-                            f"Unsupported SAS dataset reference: {statement[6:].strip()!r}."
-                        )
-                    if len(datasets) < 2:
+                    (
+                        merge_sources,
+                        merge_in_vars,
+                        merge_order_keys,
+                    ) = _parse_merge_inputs(statement[6:])
+                    if len(merge_sources) < 2:
                         raise ConversionError(
                             "MERGE requires at least two input datasets."
                         )
-                    merge_sources = tuple(_dataset_name(name) for name, _ in datasets)
-                    merge_in_vars = tuple(flag for _, flag in datasets)
                     if len(set(merge_sources)) != len(merge_sources):
                         raise ConversionError(
                             "MERGE input datasets must have distinct names."
@@ -1066,6 +1142,7 @@ class SasToPySparkConverter:
                                 merge_keys=merge_keys,
                                 merge_directions=merge_directions,
                                 merge_in_vars=merge_in_vars,
+                                merge_order_keys=merge_order_keys,
                             )
                         )
                     elif sources is not None and by_columns is None:
@@ -1194,13 +1271,26 @@ class SasToPySparkConverter:
                     loop_match = _DO_LOOP.fullmatch(statement)
                     if not loop_match:
                         raise ConversionError(
-                            "Only integer-literal DO index = start TO stop [BY step] "
-                            "loops are supported."
+                            "Only DO index = start TO stop [BY step] loops with "
+                            "integer literals or compile-time integer expressions "
+                            "are supported."
                         )
                     loop_variable = loop_match.group(1)
-                    loop_start = int(loop_match.group(2))
-                    loop_stop = int(loop_match.group(3))
-                    loop_step = int(loop_match.group(4) or "1")
+                    loop_start = parse_constant_integer(loop_match.group(2))
+                    loop_stop = parse_constant_integer(loop_match.group(3))
+                    loop_step = (
+                        parse_constant_integer(loop_match.group(4))
+                        if loop_match.group(4)
+                        else 1
+                    )
+                    if None in (loop_start, loop_stop, loop_step):
+                        raise ConversionError(
+                            "DO loop bounds and step must be integer literals or "
+                            "compile-time integer expressions."
+                        )
+                    assert loop_start is not None
+                    assert loop_stop is not None
+                    assert loop_step is not None
                     if loop_step == 0:
                         raise ConversionError("DO loop BY step cannot be zero.")
                     body_assignments: list[tuple[str, str]] = []
@@ -1563,6 +1653,12 @@ class SasToPySparkConverter:
                     line=source_statement.line,
                     statement=source_statement.text,
                 ) from error
+            except OrderByError as error:
+                raise ConversionError(
+                    str(error),
+                    line=source_statement.line,
+                    statement=source_statement.text,
+                ) from error
             index += 1
 
         if index >= len(statements):
@@ -1570,6 +1666,11 @@ class SasToPySparkConverter:
         if sources is None and (merge_sources is None or merge_keys is None):
             raise ConversionError(
                 "DATA steps require one SET statement or a MERGE followed by BY."
+            )
+        if order_by_keys is not None and merge_sources is not None:
+            raise ConversionError(
+                "DATA-step ORDER BY is not supported with MERGE; each MERGE input "
+                "requires its own stable row-order key."
             )
         if retain_vars:
             missing = [name for key, (name, _) in retain_vars.items() if key not in retain_seen]
@@ -1606,6 +1707,47 @@ class SasToPySparkConverter:
                 )
         for condition in where_filters:
             lines.append(f"{_python_name(target)} = {_python_name(target)}.filter(F.expr({condition!r}))")
+        row_number_action = next(
+            (
+                action
+                for action in actions
+                if action.kind == "assign"
+                and action.column == "__sas2pyspark_n"
+                and action.expression.lower().startswith("row_number() over ")
+            ),
+            None,
+        )
+        order_sensitive = (
+            row_number_action is not None
+            or bool(retain_vars)
+            or bool(by_flags_used)
+            or any(
+                "lag(" in action.expression.casefold()
+                or " over (" in action.expression.casefold()
+                for action in actions
+            )
+        )
+        if order_by_keys is not None and order_sensitive:
+            order_names = [name for name, _ in order_by_keys]
+            lines.extend(
+                [
+                    f"__sas2pyspark_order_matches = [[column for column in "
+                    f"{_python_name(target)}.columns if column.casefold() == "
+                    f"key.casefold()] for key in {order_names!r}]",
+                    "if any(len(matches) != 1 for matches in __sas2pyspark_order_matches):",
+                    "    raise ValueError('DATA-step ORDER BY columns must exist exactly once in the input DataFrame.')",
+                    "__sas2pyspark_order_columns = [matches[0] for matches in __sas2pyspark_order_matches]",
+                    f"if {_python_name(target)}.count() != "
+                    f"{_python_name(target)}.dropDuplicates("
+                    "__sas2pyspark_order_columns).count():",
+                    "    raise ValueError('DATA-step ORDER BY keys must be unique for deterministic observation order.')",
+                ]
+            )
+        if row_number_action is not None:
+            lines.append(
+                f"{_python_name(target)} = {_python_name(target)}.withColumn("
+                f"'{row_number_action.column}', F.expr({row_number_action.expression!r}))"
+            )
         by_flag_columns: list[str] = []
         if by_columns is not None and by_flags_used:
             order_column = "__sas2pyspark_by_order"
@@ -1615,7 +1757,10 @@ class SasToPySparkConverter:
                 if flag in by_flags_used
                 for column in by_columns
             ]
-            helper_columns = [order_column, *by_flag_columns]
+            helper_columns = [
+                *([] if order_by_keys is not None else [order_column]),
+                *by_flag_columns,
+            ]
             helper_names = {column.lower() for column in helper_columns}
             action_columns = {
                 action.column.lower()
@@ -1642,9 +1787,31 @@ class SasToPySparkConverter:
                     f"if any(column.lower() in {{column.lower() for column in {helper_columns!r}}} "
                     f"for column in {_python_name(target)}.columns):",
                     "    raise ValueError('BY processing temporary column name conflicts with an input column.')",
-                    f"{_python_name(target)} = {_python_name(target)}.withColumn("
-                    f"{order_column!r}, F.monotonically_increasing_id())",
+                    *(
+                        []
+                        if order_by_keys is not None
+                        else [
+                            f"{_python_name(target)} = {_python_name(target)}.withColumn("
+                            f"{order_column!r}, F.monotonically_increasing_id())",
+                        ]
+                    ),
                 ]
+            )
+            flag_order = (
+                ", ".join(
+                    f"F.col({name!r}).{'asc' if ascending else 'desc'}()"
+                    for name, ascending in order_by_keys
+                )
+                if order_by_keys is not None
+                else f"F.col({order_column!r}).asc()"
+            )
+            last_flag_order = (
+                ", ".join(
+                    f"F.col({name!r}).{'desc' if ascending else 'asc'}()"
+                    for name, ascending in order_by_keys
+                )
+                if order_by_keys is not None
+                else f"F.col({order_column!r}).desc()"
             )
             for key_index, key in enumerate(by_columns):
                 if "first" in by_flags_used:
@@ -1656,7 +1823,7 @@ class SasToPySparkConverter:
                         f"{_python_name(target)} = {_python_name(target)}.withColumn("
                         f"{first_name!r}, F.row_number().over("
                         f"__sas2pyspark_window.partitionBy({prefix}).orderBy("
-                        f"F.col({order_column!r}).asc())) == 1)"
+                        f"{flag_order})) == 1)"
                     )
                 if "last" in by_flags_used:
                     last_name = f"__sas2pyspark_last_{key.lower()}"
@@ -1667,9 +1834,11 @@ class SasToPySparkConverter:
                         f"{_python_name(target)} = {_python_name(target)}.withColumn("
                         f"{last_name!r}, F.row_number().over("
                         f"__sas2pyspark_window.partitionBy({prefix}).orderBy("
-                        f"F.col({order_column!r}).desc())) == 1)"
+                        f"{last_flag_order})) == 1)"
                     )
         for action in actions:
+            if action is row_number_action:
+                continue
             if action.kind == "merge":
                 lines.extend(
                     self._render_merge(
@@ -1678,6 +1847,7 @@ class SasToPySparkConverter:
                         action.merge_keys,
                         action.merge_directions,
                         action.merge_in_vars,
+                        action.merge_order_keys,
                     )
                 )
             elif action.kind == "filter":
@@ -1703,7 +1873,7 @@ class SasToPySparkConverter:
                 initial_value = float(action.retain_reset or action.retain_initial)
                 retain_temporary_columns = (
                     [retain_delta]
-                    if action.retain_partition
+                    if action.retain_partition or order_by_keys is not None
                     else [retain_order, retain_delta]
                 )
                 window_spec = "__sas2pyspark_window"
@@ -1712,7 +1882,14 @@ class SasToPySparkConverter:
                         f"F.col({column!r})" for column in action.retain_partition
                     )
                     window_spec += f".partitionBy({partition_columns})"
-                window_spec += f".orderBy(F.col({retain_order!r}))"
+                if order_by_keys is not None:
+                    order_columns = ", ".join(
+                        f"F.col({column!r}).{'asc' if ascending else 'desc'}()"
+                        for column, ascending in order_by_keys
+                    )
+                    window_spec += f".orderBy({order_columns})"
+                else:
+                    window_spec += f".orderBy(F.col({retain_order!r}))"
                 lines.extend(
                     [
                         "from pyspark.sql import Window as __sas2pyspark_window",
@@ -1724,7 +1901,7 @@ class SasToPySparkConverter:
                         "    raise ValueError('PROC/DATA-step RETAIN temporary column name conflicts with an input column.')",
                         *(
                             []
-                            if action.retain_partition
+                            if action.retain_partition or order_by_keys is not None
                             else [
                                 f"{retain_input} = {retain_input}.withColumn("
                                 f"{retain_order!r}, F.monotonically_increasing_id())"
@@ -1828,9 +2005,14 @@ class SasToPySparkConverter:
         elif drop:
             lines.append(f"{_python_name(target)} = {_python_name(target)}.drop(*{drop!r})")
         if by_flag_columns:
+            order_helpers = (
+                []
+                if order_by_keys is not None
+                else ["__sas2pyspark_by_order"]
+            )
             lines.append(
                 f"{_python_name(target)} = {_python_name(target)}.drop("
-                f"*{[ '__sas2pyspark_by_order', *by_flag_columns]!r})"
+                f"*{[*order_helpers, *by_flag_columns]!r})"
             )
         in_names = [name for name in merge_in_vars if name]
         if in_names:
@@ -1842,7 +2024,12 @@ class SasToPySparkConverter:
             ]
         )
         data_step_warnings = []
-        if retain_vars:
+        if order_by_keys is not None and not order_sensitive:
+            data_step_warnings.append(
+                "DATA-step ORDER BY does not sort output rows and has no effect "
+                "unless the step uses an order-sensitive operation."
+            )
+        if retain_vars and order_by_keys is None:
             data_step_warnings.append(
                 "RETAIN uses Spark monotonically_increasing_id() as a best-effort "
                 "row order; Spark does not guarantee SAS observation order, so "
@@ -1854,12 +2041,22 @@ class SasToPySparkConverter:
                 "row order is unspecified and Spark schema coercion may differ "
                 "from SAS variable type and length rules."
             )
-        if by_flag_columns:
+        if by_flag_columns and order_by_keys is None:
             data_step_warnings.append(
                 "BY-group FIRST./LAST. flags use Spark "
                 "monotonically_increasing_id() as a best-effort observation "
                 "order; row order is unspecified and results may differ from "
                 "SAS or change across executions."
+            )
+        merge_action = next(
+            (action for action in actions if action.kind == "merge"),
+            None,
+        )
+        if merge_action is not None and not any(merge_action.merge_order_keys):
+            data_step_warnings.append(
+                "MERGE duplicate-key row pairing uses best-effort Spark input "
+                "order; specify ORDER_BY=(...) on every MERGE input for "
+                "deterministic pairing."
             )
         if display_formats:
             data_step_warnings.append(
@@ -1877,10 +2074,16 @@ class SasToPySparkConverter:
         keys: tuple[str, ...],
         directions: tuple[bool, ...],
         in_vars: tuple[str, ...] = (),
+        order_keys: tuple[tuple[OrderKey, ...], ...] = (),
     ) -> list[str]:
         """Generate a SAS BY-group merge, repeating the last row of shorter groups."""
         target_frame = _python_name(target)
         input_frames = ", ".join(_python_name(source) for source in sources)
+        input_order_keys = (
+            [list(input_keys) for input_keys in order_keys]
+            if order_keys and any(order_keys)
+            else [[] for _ in sources]
+        )
         in_selection = [
             f"__sas2pyspark_merge_selection.append(F.col('__sas2pyspark_m{index}_present').isNotNull().alias({name!r}))"
             for index, name in enumerate(in_vars)
@@ -1890,6 +2093,7 @@ class SasToPySparkConverter:
             "from pyspark.sql import Window as __sas2pyspark_window",
             f"__sas2pyspark_merge_inputs = [{input_frames}]",
             f"__sas2pyspark_merge_keys = {list(keys)!r}",
+            f"__sas2pyspark_merge_order_keys = {input_order_keys!r}",
             "__sas2pyspark_merge_frames = []",
             "__sas2pyspark_merge_payload = []",
             "for __sas2pyspark_merge_index, __sas2pyspark_merge_frame in enumerate(__sas2pyspark_merge_inputs):",
@@ -1900,9 +2104,28 @@ class SasToPySparkConverter:
             "    ]",
             "    if any(__sas2pyspark_key is None for __sas2pyspark_key in __sas2pyspark_merge_actual_keys):",
             "        raise ValueError('SAS MERGE BY key is missing from an input DataFrame.')",
+            "    __sas2pyspark_merge_order_names = __sas2pyspark_merge_order_keys[__sas2pyspark_merge_index]",
+            "    __sas2pyspark_merge_order_actual = [",
+            "        next((__sas2pyspark_column for __sas2pyspark_column in __sas2pyspark_merge_frame.columns",
+            "              if __sas2pyspark_column.casefold() == __sas2pyspark_name.casefold()), None)",
+            "        for __sas2pyspark_name, _ in __sas2pyspark_merge_order_names",
+            "    ]",
+            "    if any(__sas2pyspark_column is None for __sas2pyspark_column in __sas2pyspark_merge_order_actual):",
+            "        raise ValueError('MERGE ORDER_BY column is missing from its input DataFrame.')",
+            "    if __sas2pyspark_merge_order_actual:",
+            "        __sas2pyspark_order_uniqueness_columns = list(dict.fromkeys([*__sas2pyspark_merge_actual_keys, *__sas2pyspark_merge_order_actual]))",
+            "        if (__sas2pyspark_merge_frame.count() != __sas2pyspark_merge_frame",
+            "                .dropDuplicates(__sas2pyspark_order_uniqueness_columns).count()):",
+            "            raise ValueError('MERGE ORDER_BY keys must be unique within each BY group.')",
+            "        __sas2pyspark_merge_order_by = [",
+            "            F.col(__sas2pyspark_column).asc() if __sas2pyspark_ascending else F.col(__sas2pyspark_column).desc()",
+            "            for __sas2pyspark_column, (_, __sas2pyspark_ascending) in zip(__sas2pyspark_merge_order_actual, __sas2pyspark_merge_order_names)",
+            "        ]",
+            "    else:",
+            "        __sas2pyspark_merge_order_by = [F.monotonically_increasing_id()]",
             "    __sas2pyspark_merge_window = __sas2pyspark_window.partitionBy(*__sas2pyspark_merge_actual_keys)",
             "    __sas2pyspark_merge_numbered = (__sas2pyspark_merge_frame",
-            "        .withColumn('__sas2pyspark_rn', F.row_number().over(__sas2pyspark_merge_window.orderBy(F.monotonically_increasing_id())))",
+            "        .withColumn('__sas2pyspark_rn', F.row_number().over(__sas2pyspark_merge_window.orderBy(*__sas2pyspark_merge_order_by)))",
             "        .withColumn('__sas2pyspark_cnt', F.count(F.lit(1)).over(__sas2pyspark_merge_window)))",
             "    __sas2pyspark_merge_columns = [",
             "        __sas2pyspark_column for __sas2pyspark_column in __sas2pyspark_merge_frame.columns",
@@ -2393,7 +2616,7 @@ class SasToPySparkConverter:
         lines: list[str] = []
         warnings: list[str] = []
         if proc == "print":
-            allowed_flags = {"noobs", "label", "n", "double", "uniform"}
+            allowed_flags = {"noobs"}
             if "data" not in options or not flags <= allowed_flags or set(options) - {"data", "obs"}:
                 raise ConversionError(
                     "PROC PRINT supports DATA=, OBS=, NOOBS and the VAR and WHERE statements."
@@ -2430,12 +2653,41 @@ class SasToPySparkConverter:
                 f"{limit} rows and is not formatted like SAS listing output."
             )
         elif proc == "contents":
-            if "data" not in options or not flags <= {"noprint", "short", "varnum"} or set(options) - {"data"}:
-                raise ConversionError("PROC CONTENTS supports DATA=, NOPRINT, SHORT and VARNUM.")
+            if (
+                "data" not in options
+                or not flags <= {"noprint", "short", "varnum"}
+                or set(options) - {"data", "out"}
+            ):
+                raise ConversionError(
+                    "PROC CONTENTS supports DATA=, OUT=, NOPRINT, SHORT and VARNUM."
+                )
             if body:
                 raise reject(body[0])
+            target = frame(options["data"])
+            if "out" in options:
+                metadata = frame(options["out"])
+                lines.extend(
+                    [
+                        f"{metadata} = spark.createDataFrame("
+                        f"[(field.name, field.dataType.simpleString(), "
+                        f"field.nullable, position) for position, field in "
+                        f"enumerate({target}.schema.fields, start=1)], "
+                        "'NAME STRING, SPARK_TYPE STRING, NULLABLE BOOLEAN, "
+                        "POSITION INT')",
+                        f"{metadata}.createOrReplaceTempView("
+                        f"{_sql_name(_dataset_name(options['out']))!r})",
+                    ]
+                )
+                warnings.append(
+                    "PROC CONTENTS OUT= emits Spark schema metadata "
+                    "(NAME, SPARK_TYPE, NULLABLE, POSITION), not the SAS "
+                    "PROC CONTENTS output schema."
+                )
             if "noprint" not in flags:
-                lines.append(f"{frame(options['data'])}.printSchema()")
+                if "short" in flags:
+                    lines.append(f"print({target}.columns)")
+                else:
+                    lines.append(f"{target}.printSchema()")
             else:
                 lines.append("# PROC CONTENTS NOPRINT: nothing to display.")
         elif proc == "copy":

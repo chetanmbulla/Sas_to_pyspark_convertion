@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import re
 
-from .macro_processor import MacroStatement
+from .data_order import OrderByError, order_by_sql, parse_order_by
+from .macro_processor import MacroExpansionError, MacroStatement
 
 HELPER = "__sas2pyspark_n"
 _DATA = re.compile(r"data\s+((?:\w+\.)?\w+)", re.I)
@@ -35,6 +36,20 @@ def rewrite_row_number(statements: list[MacroStatement]) -> list[MacroStatement]
         }:
             end += 1
         body = statements[index + 1 : end]
+        order_keys = None
+        for item in body:
+            try:
+                parsed_order = parse_order_by(item.text)
+            except OrderByError as error:
+                raise MacroExpansionError(str(error), item) from error
+            if parsed_order is not None:
+                order_keys = parsed_order
+                break
+        order_clause = (
+            order_by_sql(order_keys)
+            if order_keys
+            else "order by monotonically_increasing_id()"
+        )
         if end >= len(statements) or not any(
             _N.search(_QUOTED.sub("''", item.text)) for item in body
         ):
@@ -52,7 +67,7 @@ def rewrite_row_number(statements: list[MacroStatement]) -> list[MacroStatement]
                 result.append(
                     MacroStatement(
                         f"{HELPER} = row_number() over "
-                        "(order by monotonically_increasing_id())",
+                        f"({order_clause})",
                         item.line,
                     )
                 )
@@ -60,7 +75,8 @@ def rewrite_row_number(statements: list[MacroStatement]) -> list[MacroStatement]
             result.insert(
                 len(result) - len(body),
                 MacroStatement(
-                    f"{HELPER} = row_number() over (order by monotonically_increasing_id())",
+                    f"{HELPER} = row_number() over "
+                    f"({order_clause})",
                     statement.line,
                 ),
             )

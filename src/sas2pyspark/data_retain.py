@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 from .data_blocks import _IF_ACTION, _IF_DELETE, _flatten, _read_chain, _to_statements
+from .data_order import OrderByError, order_by_sql, parse_order_by
 from .macro_processor import MacroExpansionError, MacroStatement
 
 _DATA = re.compile(r"data\s+((?:\w+\.)?\w+)", re.I)
@@ -21,7 +22,7 @@ _TOKEN = re.compile(
     r"\s*('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[A-Za-z_]\w*)"
 )
 _IF_THEN = re.compile(r"if\s+(.+?)\s+then\s+(.+)", re.I | re.S)
-_WINDOW = "over (order by monotonically_increasing_id() rows between unbounded preceding and current row)"
+_WINDOW_FRAME = "rows between unbounded preceding and current row"
 
 
 def rewrite_retain(statements: list[MacroStatement]) -> list[MacroStatement]:
@@ -92,6 +93,21 @@ def _rewrite_step(body: list[MacroStatement]) -> tuple[list[MacroStatement], lis
     retain_items = [item for item in body if re.match(r"retain\s", item.text.strip(), re.I)]
     if not retain_items:
         return body, []
+    order_keys = None
+    for item in body:
+        try:
+            parsed_order = parse_order_by(item.text)
+        except OrderByError as error:
+            raise MacroExpansionError(str(error), item) from error
+        if parsed_order is not None:
+            order_keys = parsed_order
+            break
+    order_clause = (
+        order_by_sql(order_keys)
+        if order_keys
+        else "order by monotonically_increasing_id()"
+    )
+    window = f"over ({order_clause} {_WINDOW_FRAME})"
     declared: dict[str, tuple[str, str | None]] = {}
     for item in retain_items:
         for name, initial in _parse_retain(item):
@@ -169,7 +185,7 @@ def _rewrite_step(body: list[MacroStatement]) -> tuple[list[MacroStatement], lis
         )
         last = entries[-1][0]
         replacements[last] = [
-            MacroStatement(f"{helper} = last(case {cases} end, true) {_WINDOW}", body[last].line),
+            MacroStatement(f"{helper} = last(case {cases} end, true) {window}", body[last].line),
             MacroStatement(
                 f"{name} = case when {helper} is null then {initial or 'null'} "
                 f"else {helper}.v end",

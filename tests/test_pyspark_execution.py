@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from datetime import date
 from decimal import Decimal
@@ -123,6 +125,48 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         }
         self.assertEqual(summaries["sales"], (2, 70.0))
         self.assertEqual(summaries["engineering"], (1, 90.0))
+
+    def test_report_procedures_execute_and_emit_contents_metadata(self):
+        source = """
+        proc print data=work.people obs=1;
+          var id value;
+          where id > 0;
+        run;
+        proc contents data=work.people out=work.people_schema short varnum;
+        run;
+        proc copy in=work out=archive;
+          select people;
+        run;
+        proc compare base=work.people compare=work.reference;
+        run;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_people": self.spark.createDataFrame(
+                [(1, "one"), (2, "two")], ["id", "value"]
+            ),
+            "df_reference": self.spark.createDataFrame(
+                [(1, "one"), (2, "different")], ["id", "value"]
+            ),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        output = StringIO()
+        with redirect_stdout(output):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        report = output.getvalue()
+        self.assertIn("id", report)
+        self.assertIn("PROC COMPARE: base rows 2 compare rows 2", report)
+        self.assertIn("only in base 1 only in compare 1", report)
+        metadata = namespace["df_people_schema"].collect()
+        self.assertEqual(
+            [
+                (row.NAME, row.SPARK_TYPE, row.NULLABLE, row.POSITION)
+                for row in metadata
+            ],
+            [("id", "bigint", True, 1), ("value", "string", True, 2)],
+        )
+        self.assertEqual(self.spark.table("people").count(), 2)
 
     def test_set_concatenates_datasets_and_fills_missing_columns(self):
         source = """
@@ -571,6 +615,108 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             (r.id, r.amount, r.prev, r.change) for r in namespace["df_b"].collect()
         )
         self.assertEqual(rows, [(3, 7, None, None), (4, 2, 7, -5)])
+
+    def test_explicit_data_order_controls_lag_row_number_and_by_flags(self):
+        source = """
+        data ordered;
+          set events;
+          order by sequence;
+          by group;
+          previous = lag(value);
+          observation = _N_;
+          is_first = first.group;
+          is_last = last.group;
+        run;
+        """
+        events = self.spark.createDataFrame(
+            [(3, "a", 30), (1, "a", 10), (4, "b", 40), (2, "a", 20)],
+            "sequence int, group string, value int",
+        )
+        namespace = {"spark": self.spark, "df_events": events}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        rows = [
+            (row.sequence, row.previous, row.observation, row.is_first, row.is_last)
+            for row in namespace["df_ordered"].orderBy("sequence").collect()
+        ]
+        self.assertEqual(
+            rows,
+            [
+                (1, None, 1, True, False),
+                (2, 10, 2, False, False),
+                (3, 20, 3, False, True),
+                (4, 30, 4, True, True),
+            ],
+        )
+        self.assertFalse(
+            any("best-effort observation order" in warning for warning in generated.warnings)
+        )
+
+    def test_explicit_data_order_controls_character_retain(self):
+        source = """
+        data carried;
+          set events;
+          order by sequence;
+          retain prior '';
+          if value > 0 then prior = value;
+        run;
+        """
+        events = self.spark.createDataFrame(
+            [(3, 9), (1, 5), (2, 0)], "sequence int, value int"
+        )
+        namespace = {"spark": self.spark, "df_events": events}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = [
+            (row.sequence, row.prior)
+            for row in namespace["df_carried"].orderBy("sequence").collect()
+        ]
+        self.assertEqual(rows, [(1, 5), (2, 5), (3, 9)])
+        self.assertFalse(
+            any("RETAIN uses Spark" in warning for warning in generated.warnings)
+        )
+
+    def test_explicit_data_order_controls_numeric_retain(self):
+        source = """
+        data totals;
+          set events;
+          order by sequence;
+          retain running 0;
+          running = running + value;
+        run;
+        """
+        events = self.spark.createDataFrame(
+            [(3, 30), (1, 10), (2, 20)], "sequence int, value int"
+        )
+        namespace = {"spark": self.spark, "df_events": events}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = [
+            (row.sequence, row.running)
+            for row in namespace["df_totals"].orderBy("sequence").collect()
+        ]
+        self.assertEqual(rows, [(1, 10), (2, 30), (3, 60)])
+
+    def test_explicit_data_order_rejects_missing_or_duplicate_keys(self):
+        source = "data out; set events; order by sequence; n = _N_; run;"
+        generated = SasToPySparkConverter().convert(source)
+
+        missing_namespace = {
+            "spark": self.spark,
+            "df_events": self.spark.createDataFrame([(1,)], ["value"]),
+        }
+        with self.assertRaisesRegex(ValueError, "must exist exactly once"):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), missing_namespace)
+
+        duplicate_namespace = {
+            "spark": self.spark,
+            "df_events": self.spark.createDataFrame(
+                [(1, "a"), (1, "b")], "sequence int, value string"
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "keys must be unique"):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), duplicate_namespace)
 
     def test_nested_blocks_select_arrays_retain_and_length_execute(self):
         source = """
@@ -1169,6 +1315,28 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             ],
         )
 
+    def test_output_do_loop_evaluates_compile_time_integer_expressions(self):
+        source = """
+        data work.expanded;
+          set work.source;
+          do index = (1 + 1) to (2 * 2) by (1 + 1);
+            scaled = index * 10;
+            output;
+          end;
+          keep id index scaled;
+        run;
+        """
+        df_source = self.spark.createDataFrame([(7,)], ["id"])
+        namespace = {"spark": self.spark, "df_source": df_source}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        rows = namespace["df_expanded"].orderBy("index").collect()
+        self.assertEqual(
+            [(row["id"], row["index"], row["scaled"]) for row in rows],
+            [(7, 2, 20), (7, 4, 40)],
+        )
+
     def test_output_do_loop_with_no_iterations_emits_no_rows(self):
         source = """
         data work.empty_expansion;
@@ -1338,6 +1506,70 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             [(3, "r3")],
         )
         self.assertNotIn("inl", namespace["df_one_to_many"].columns)
+
+    def test_merge_by_orders_duplicate_rows_per_input(self):
+        source = """
+        data ordered_merge;
+          merge left(order_by=(left_seq)) right(order_by=(right_seq descending));
+          by id;
+        run;
+        """
+        namespace = {
+            "spark": self.spark,
+            "df_left": self.spark.createDataFrame(
+                [(1, 2, "left-2"), (1, 1, "left-1"), (2, 1, "left-b")],
+                "id int, left_seq int, left_value string",
+            ),
+            "df_right": self.spark.createDataFrame(
+                [(1, 1, "right-1"), (1, 2, "right-2"), (2, 1, "right-b")],
+                "id int, right_seq int, right_value string",
+            ),
+        }
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        actual = {
+            (row.id, row.left_value, row.right_value)
+            for row in namespace["df_ordered_merge"].collect()
+        }
+        self.assertEqual(
+            actual,
+            {
+                (1, "left-1", "right-2"),
+                (1, "left-2", "right-1"),
+                (2, "left-b", "right-b"),
+            },
+        )
+
+    def test_merge_by_order_requires_present_unique_keys_within_groups(self):
+        source = (
+            "data out; merge left(order_by=(seq_l)) right(order_by=(seq_r)); "
+            "by id; run;"
+        )
+        generated = SasToPySparkConverter().convert(source)
+        namespace = {
+            "spark": self.spark,
+            "df_left": self.spark.createDataFrame(
+                [(1, 1, "a"), (1, 1, "b")], "id int, seq_l int, value string"
+            ),
+            "df_right": self.spark.createDataFrame(
+                [(1, 1, "x")], "id int, seq_r int, other string"
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "unique within each BY group"):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        missing_namespace = {
+            "spark": self.spark,
+            "df_left": self.spark.createDataFrame([(1, "a")], "id int, value string"),
+            "df_right": self.spark.createDataFrame(
+                [(1, 1, "x")], "id int, seq_r int, other string"
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "ORDER_BY column is missing"):
+            exec(
+                compile(generated.code, "<generated-pyspark>", "exec"),
+                missing_namespace,
+            )
 
     def test_common_sas_functions_execute_with_expected_values(self):
         source = """

@@ -159,8 +159,8 @@ class _Step:
         self, header: re.Match[str], body: list[MacroStatement], opener: MacroStatement
     ) -> list[MacroStatement]:
         variable = header.group(1)
-        values = [_constant(header.group(group)) for group in (2, 3)]
-        step = _constant(header.group(4)) if header.group(4) else 1
+        values = [parse_constant_integer(header.group(group)) for group in (2, 3)]
+        step = parse_constant_integer(header.group(4)) if header.group(4) else 1
         if None in values or step is None:
             raise MacroExpansionError(
                 "Iterative DO loops without OUTPUT are unrolled at conversion time, "
@@ -197,7 +197,7 @@ class _Step:
 
 
 def _reference(match: re.Match[str], dims: tuple[int, ...], item: MacroStatement) -> str:
-    indexes = [_constant(part) for part in match.group(2).split(",")]
+    indexes = [parse_constant_integer(part) for part in match.group(2).split(",")]
     if len(indexes) != len(dims):
         raise MacroExpansionError(
             f"Array {match.group(1)!r} needs {len(dims)} subscript(s).", item
@@ -216,7 +216,7 @@ def _reference(match: re.Match[str], dims: tuple[int, ...], item: MacroStatement
     return f"{match.group(1)}[{flat + 1}]"
 
 
-def _constant(text: str) -> int | None:
+def parse_constant_integer(text: str) -> int | None:
     value = text.strip()
     if not re.fullmatch(r"[\d\s+\-*()]+", value) or "**" in value:
         return None
