@@ -122,20 +122,51 @@ Within a `DATA` step, the converter gathers its output dataset, input dataset or
 datasets, filters, `BY` keys (including per-key `ASCENDING`/`DESCENDING`
 modifiers), array declarations, assignments, `CALL MISSING`, conditionals, and
 supported `KEEP`/`DROP` rules. `CALL MISSING` accepts explicit simple variable
-names and emits nullable Spark columns while preserving existing column types.
+names, optionally guarded by a simple `IF condition THEN`, and emits nullable
+Spark columns while preserving existing column types.
 Conditional assignments and `SELECT/WHEN`
 branches are checked against the supported simple-assignment patterns. A
-supported output-generating `DO` loop may use integer literals or compile-time
-integer expressions for its bounds and step; it must have simple assignments
-and one final `OUTPUT`. Variable-dependent loop bounds remain unsupported.
+supported output-generating `DO` loop may use numeric input-column expressions
+for its bounds and an integer literal or compile-time integer expression for its
+step; it must have simple assignments and one final `OUTPUT`. Runtime bounds
+must be present integers and may generate at most 5000 iterations per input row.
+Non-output loops may also use runtime bounds and execute ordered simple and
+conditional assignments for each iteration, carrying assigned values between
+iterations. Conditional branches may update different existing or initialized state
+columns, including the final `ELSE`; the
+selected branch updates only its target. Without a final `ELSE`, no matching or
+missing conditions preserve all current values. The loop index
+body may include nested `IF ... THEN DO`/`ELSE DO` blocks, evaluated in source order
+as guarded assignments. The loop index is left at its final SAS value. Stateful or
+multiple assignments require target
+columns to exist in the input or to be initialized earlier in the DATA step;
+initialized columns are supported as loop state. Decimal loop-state columns retain
+their scale and widen to precision 38 to accommodate repeated arithmetic; other
+state fields retain their Spark types. One stateless assignment may create a new
+column. Runtime-bound non-output loops support dynamic array reads and writes with
+numeric arithmetic indexes; indexes are checked on each iteration and writes carry
+forward in statement order. Conditional DELETE stops processing and removes an input row when its predicate
+matches at its source position, including predicates that use loop-carried values.
+Earlier assignments in the iteration are visible to the predicate; missing predicates
+do not delete. DELETE is unsupported in output-producing loops.
+Other non-output loops still require compile-time bounds.
 Character/conditional `RETAIN` may be combined with a single-input `SET` and
 `BY`; carried state continues across BY groups unless the source explicitly
-resets it. `MERGE` with this RETAIN form remains unsupported.
+resets it. `MERGE` with this RETAIN form remains unsupported. Dynamic array
+reads and assignment targets may use arithmetic expressions over input columns
+and numeric literals, with parentheses and `+`, `-`, `*`, `/`, or `%`. Runtime
+checks validate referenced-column types, computed index bounds, and array-column
+compatibility. Outside runtime-bounded loops, index identifiers must be unchanged
+input columns; inside them, the loop index is also allowed. Dynamic array writes
+inside loops are limited to non-`OUTPUT` loops and may appear in supported
+conditional branches. Function calls and indexed assignments inside conditional or
+nested blocks outside these loops remain unsupported.
 
 For a `MERGE`, the converter requires multiple inputs and a `BY` statement.
 The generated program checks that each input has the BY columns before joining.
-By default, duplicate rows within each BY group use best-effort Spark order.
-The sas2pyspark extension `merge left(order_by=(left_seq))
+With per-input order keys omitted, generated code checks that each input has
+unique BY keys and fails at runtime if duplicates would make row pairing
+ambiguous. The sas2pyspark extension `merge left(order_by=(left_seq))
 right(order_by=(right_seq descending));` provides an independent stable order
 for every input. When provided on all inputs, the generated program verifies
 the order columns and rejects duplicate BY-key/order-key combinations at
@@ -188,14 +219,13 @@ Output SAS datasets are represented as DataFrames named `df_<table>` and are
 registered as temporary Spark views. A successful conversion returns
 `ConversionResult.code` and any non-fatal notes in `ConversionResult.warnings`.
 
-Warnings matter: some SAS behavior has no exact match in unordered Spark
-DataFrames. By default, `RETAIN`, `LAG`/`DIF`, `_N_`, and `FIRST.`/`LAST.`
-behavior use best-effort order and may differ from SAS. A sas2pyspark
-DATA-step extension, `ORDER BY key1, key2 DESC;`, can define their iteration
-order when the keys are unique. The generated program checks for missing or
-duplicate keys at runtime. It does not sort output rows, affect `SET`
-`FIRSTOBS`/`OBS`, or define per-input order for `MERGE`. `PROC SORT NODUPKEY`
-may still keep a different tied row than SAS.
+Warnings matter: some SAS behavior has no exact match in Spark DataFrames.
+`RETAIN`, `LAG`/`DIF`, `_N_`, and `FIRST.`/`LAST.` require a sas2pyspark
+DATA-step extension, `ORDER BY key1, key2 DESC;`, whose keys are checked for
+presence and uniqueness at runtime. The extension does not sort output rows,
+affect `SET FIRSTOBS`/`OBS`, or define per-input order for `MERGE`. Without
+per-input MERGE `ORDER_BY`, duplicate BY groups fail at runtime. `PROC SORT
+NODUPKEY` may still keep a different tied row than SAS.
 
 ## 6. Handle unsupported input
 
@@ -208,6 +238,8 @@ Check [Supported syntax](../README.md#supported-syntax) and its limitations befo
 reworking a failed statement. Simplify the SAS source into supported forms or
 manually review and translate the unsupported behavior; do not assume that
 similar-looking SAS syntax has identical Spark semantics.
+See the [coverage policy](sas-coverage.md) for the support-status definitions,
+semantic-fixture acceptance gates, and incremental IR migration path.
 
 ## 7. Check and run the generated program
 

@@ -447,7 +447,7 @@ proc sql; select ';' as marker from output; quit;
         source_texts = {
             "good.sas": "data good; set source; run;",
             "warn.sas": (
-                "data running; retain total 0; set amounts; "
+                "data running; order by row_id; retain total 0; set amounts; "
                 "total = total + amount; run;"
             ),
             "unsupported.sas": "proc iml; run;",

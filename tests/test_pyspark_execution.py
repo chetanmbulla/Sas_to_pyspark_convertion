@@ -623,6 +623,24 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         self.assertEqual(result.schema["label"].dataType, frame.schema["label"].dataType)
         self.assertEqual(result.schema["unset_text"].dataType.simpleString(), "string")
 
+    def test_conditional_call_missing_preserves_values_when_condition_is_false_or_missing(self):
+        source = """
+        data cleared;
+          set source;
+          if clear_flag then call missing(score);
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, True, 10), (2, False, 20), (3, None, 30)],
+            "id int, clear_flag boolean, score int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        rows = namespace["df_cleared"].orderBy("id").collect()
+        self.assertEqual([(row.id, row.score) for row in rows], [(1, None), (2, 20), (3, 30)])
+
     def test_character_retain_carries_across_by_groups_in_explicit_order(self):
         source = """
         data carried;
@@ -654,10 +672,208 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
              ("B", "beta"), ("C", "beta")],
         )
 
+    def test_dynamic_array_reads_select_values_and_reject_invalid_indexes(self):
+        source = """
+        data selected;
+          set source;
+          array values{3} v1-v3;
+          selected = values[index + 1];
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(0, 10, 20, 30), (2, 11, 21, 31)],
+            "index int, v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_selected"].orderBy("index").collect()
+        self.assertEqual(
+            [(row["index"], row.selected) for row in rows], [(0, 10), (2, 31)]
+        )
+
+        for invalid_value, schema in (
+            (4, "index int, v1 int, v2 int, v3 int"),
+            (None, "index int, v1 int, v2 int, v3 int"),
+            (1.5, "index double, v1 int, v2 int, v3 int"),
+        ):
+            with self.subTest(index=invalid_value):
+                invalid_frame = self.spark.createDataFrame(
+                    [(invalid_value, 10, 20, 30)], schema
+                )
+                invalid_namespace = {"spark": self.spark, "df_source": invalid_frame}
+                with self.assertRaisesRegex(
+                    ValueError, "missing, non-integer, or outside"
+                ):
+                    exec(
+                        compile(generated.code, "<generated-pyspark>", "exec"),
+                        invalid_namespace,
+                    )
+
+        mixed_types = self.spark.createDataFrame(
+            [(1, 10, "twenty", 30)], "index int, v1 int, v2 string, v3 int"
+        )
+        mixed_namespace = {"spark": self.spark, "df_source": mixed_types}
+        with self.assertRaisesRegex(TypeError, "one Spark data type"):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), mixed_namespace)
+
+    def test_dynamic_array_writes_update_only_the_selected_element(self):
+        source = """
+        data updated;
+          set source;
+          array values{3} v1-v3;
+          values[index + 1] = score;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(0, 10, 20, 30, 99), (2, 11, 21, 31, 88)],
+            "index int, v1 int, v2 int, v3 int, score int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_updated"].orderBy("index").collect()
+        self.assertEqual(
+            [(row["v1"], row["v2"], row["v3"]) for row in rows],
+            [(99, 20, 30), (11, 21, 88)],
+        )
+        invalid_frame = self.spark.createDataFrame(
+            [(3, 10, 20, 30, 99)],
+            "index int, v1 int, v2 int, v3 int, score int",
+        )
+        invalid_namespace = {"spark": self.spark, "df_source": invalid_frame}
+        with self.assertRaisesRegex(ValueError, "outside the declared bounds"):
+            exec(
+                compile(generated.code, "<generated-pyspark>", "exec"),
+                invalid_namespace,
+            )
+
+    def test_runtime_do_loop_reads_and_updates_dynamic_array_elements(self):
+        source = """
+        data updated;
+          set source;
+          array values{3} v1-v3;
+          selected = 0;
+          do index = first_index to last_index;
+            selected = values[index + shift];
+            values[index + shift] = values[index + shift] + 10;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 2, 0, 1, 2, 3),
+                (2, 2, 3, 0, 10, 20, 30),
+                (3, 3, 1, 0, 4, 5, 6),
+            ],
+            "id int, first_index int, last_index int, shift int, "
+            "v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        result = namespace["df_updated"]
+        rows = result.orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["selected"], row["v1"], row["v2"], row["v3"])
+                for row in rows
+            ],
+            [(2, 11, 12, 3), (30, 10, 30, 40), (0, 4, 5, 6)],
+        )
+
+        invalid_frame = self.spark.createDataFrame(
+            [(1, 1, 4, 0, 1, 2, 3)],
+            "id int, first_index int, last_index int, shift int, "
+            "v1 int, v2 int, v3 int",
+        )
+        invalid_namespace = {"spark": self.spark, "df_source": invalid_frame}
+        with self.assertRaisesRegex(ValueError, "array index"):
+            exec(
+                compile(generated.code, "<generated-pyspark>", "exec"),
+                invalid_namespace,
+            )
+        fractional_frame = self.spark.createDataFrame(
+            [(1, 1, 1, 0.5, 1, 2, 3)],
+            "id int, first_index int, last_index int, shift double, "
+            "v1 int, v2 int, v3 int",
+        )
+        fractional_namespace = {"spark": self.spark, "df_source": fractional_frame}
+        with self.assertRaisesRegex(ValueError, "array index"):
+            exec(
+                compile(generated.code, "<generated-pyspark>", "exec"),
+                fractional_namespace,
+            )
+
+    def test_runtime_do_loop_conditionally_updates_dynamic_array_elements(self):
+        source = """
+        data updated;
+          set source;
+          array values{3} v1-v3;
+          do index = first_index to last_index;
+            if index = selected_index then values[index] = values[index] + 10;
+            else values[index] = values[index] + 1;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 1, 2, 3),
+                (2, 1, 3, None, 10, 20, 30),
+                (3, 3, 1, 2, 4, 5, 6),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_updated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["v1"], row["v2"], row["v3"]) for row in rows],
+            [(2, 12, 4), (11, 21, 31), (4, 5, 6)],
+        )
+
+    def test_runtime_do_loop_updates_array_in_nested_conditional_blocks(self):
+        source = """
+        data updated;
+          set source;
+          array values{3} v1-v3;
+          do index = first_index to last_index;
+            if index >= first_index then do;
+              if index = selected_index then do;
+                values[index] = values[index] + 10;
+              end;
+              else do;
+                values[index] = values[index] + 1;
+              end;
+            end;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 1, 2, 3),
+                (2, 1, 3, None, 10, 20, 30),
+                (3, 3, 1, 2, 4, 5, 6),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_updated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["v1"], row["v2"], row["v3"]) for row in rows],
+            [(2, 12, 4), (11, 21, 31), (4, 5, 6)],
+        )
+
     def test_lag_dif_and_set_options_execute(self):
         source = """
         data b;
           set a(where=(x > 1) firstobs=2 obs=3 keep=id x rename=(x=amount));
+          order by id;
           prev = lag(amount);
           change = dif(amount);
         run;
@@ -779,6 +995,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         source = """
         data b;
           set a;
+          order by id;
           length tag $ 3;
           retain carry '';
           array q{*} q1-q3;
@@ -822,6 +1039,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         run;
         data b;
           set a;
+          order by id;
           rownum = _n_;
           if _n_ >= 2;
           keep id name rownum;
@@ -929,6 +1147,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
     def test_retain_executes_supported_running_total(self):
         source = """
         data work.running;
+          order by row_id;
           retain total 10;
           set work.amounts;
           total = total + amount;
@@ -951,6 +1170,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
     def test_retain_executes_by_group_reset_running_total(self):
         source = """
         data work.running;
+          order by row_id;
           retain total 10;
           set work.amounts;
           by region department;
@@ -981,6 +1201,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
     def test_retain_multiple_variables_execute(self):
         source = """
         data work.multi;
+          order by row_id;
           retain total count 0 bonus 100;
           set work.amounts;
           total = total + amount;
@@ -989,6 +1210,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
           avg = total / count;
         run;
         data work.grouped;
+          order by row_id;
           retain total 0 count 0;
           set work.amounts;
           by region;
@@ -1020,6 +1242,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
     def test_retain_rejects_missing_accumulator_input(self):
         source = """
         data work.running;
+          order by row_id;
           retain total 0;
           set work.amounts;
           total = total + amount;
@@ -1061,6 +1284,7 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
         source = """
         data work.flagged;
           set work.source;
+          order by row_id;
           by region department;
           first_region = first.region;
           first_department = first.department;
@@ -1394,6 +1618,623 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             [(7, 2, 20), (7, 4, 40)],
         )
 
+    def test_output_do_loop_evaluates_runtime_bounds_per_input_row(self):
+        source = """
+        data expanded;
+          set source;
+          do index = first_index to last_index by 2;
+            scaled = index * 10;
+            output;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1, 5), (2, 2, 4), (3, 5, 1)],
+            "id int, first_index int, last_index int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_expanded"].orderBy("id", "index").collect()
+        self.assertEqual(
+            [(row["id"], row["index"], row["scaled"]) for row in rows],
+            [(1, 1, 10), (1, 3, 30), (1, 5, 50), (2, 2, 20), (2, 4, 40)],
+        )
+
+        descending_source = """
+        data expanded;
+          set source;
+          do index = first_index to last_index by -2;
+            output;
+          end;
+        run;
+        """
+        descending_frame = self.spark.createDataFrame(
+            [(4, 5, 1)], "id int, first_index int, last_index int"
+        )
+        descending_namespace = {"spark": self.spark, "df_source": descending_frame}
+        descending_code = SasToPySparkConverter().convert(descending_source).code
+        exec(compile(descending_code, "<generated-pyspark>", "exec"), descending_namespace)
+        descending_rows = descending_namespace["df_expanded"].orderBy("index").collect()
+        self.assertEqual([row["index"] for row in descending_rows], [1, 3, 5])
+
+        invalid_sources = (
+            ([(1, 1.5, 5)], "first_index double, last_index int"),
+            ([(1, None, 5)], "first_index int, last_index int"),
+            ([(1, 0, 10000)], "first_index int, last_index int"),
+        )
+        for rows, schema in invalid_sources:
+            with self.subTest(rows=rows):
+                invalid_frame = self.spark.createDataFrame(rows, f"id int, {schema}")
+                invalid_namespace = {"spark": self.spark, "df_source": invalid_frame}
+                expected_error = (
+                    "5000-iteration limit"
+                    if rows[0][2] == 10000
+                    else "present integers"
+                )
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    exec(
+                        compile(generated.code, "<generated-pyspark>", "exec"),
+                        invalid_namespace,
+                    )
+
+    def test_non_output_do_loop_evaluates_runtime_bounds_per_input_row(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index by 2;
+            result = index * 10;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1, 5, 99), (2, 2, 4, 88), (3, 5, 1, 77)],
+            "id int, first_index int, last_index int, result int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["id"], row["index"], row["result"])
+                for row in rows
+            ],
+            [(1, 7, 50), (2, 6, 40), (3, 5, 77)],
+        )
+
+        descending_source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index by -2;
+            result = index * 10;
+          end;
+        run;
+        """
+        descending_frame = self.spark.createDataFrame(
+            [(4, 5, 1, 77)],
+            "id int, first_index int, last_index int, result int",
+        )
+        descending_namespace = {"spark": self.spark, "df_source": descending_frame}
+        descending_code = SasToPySparkConverter().convert(descending_source).code
+        exec(compile(descending_code, "<generated-pyspark>", "exec"), descending_namespace)
+        descending_row = descending_namespace["df_calculated"].first()
+        self.assertEqual(
+            (descending_row["index"], descending_row["result"]), (-1, 10)
+        )
+
+        invalid_sources = (
+            (
+                [(1, 1.5, 5)],
+                "first_index double, last_index int",
+                ValueError,
+                "present integers",
+            ),
+            (
+                [(1, None, 5)],
+                "first_index int, last_index int",
+                ValueError,
+                "present integers",
+            ),
+            (
+                [(1, "1", 5)],
+                "first_index string, last_index int",
+                TypeError,
+                "must be numeric",
+            ),
+            (
+                [(1, 0, 10001)],
+                "first_index int, last_index int",
+                ValueError,
+                "5000-iteration limit",
+            ),
+        )
+        for rows, schema, error_type, error_message in invalid_sources:
+            with self.subTest(rows=rows):
+                invalid_frame = self.spark.createDataFrame(
+                    rows, f"id int, {schema}"
+                )
+                invalid_namespace = {"spark": self.spark, "df_source": invalid_frame}
+                with self.assertRaisesRegex(error_type, error_message):
+                    exec(
+                        compile(generated.code, "<generated-pyspark>", "exec"),
+                        invalid_namespace,
+                    )
+
+    def test_non_output_do_loop_preserves_ordered_loop_carried_assignments(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            total = total + index;
+            doubled = total * 2;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1, 3, 5, -1), (2, 5, 1, 7, 9)],
+            "id int, first_index int, last_index int, total int, doubled int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["index"], row["total"], row["doubled"])
+                for row in rows
+            ],
+            [(4, 11, 22), (5, 7, 9)],
+        )
+
+    def test_non_output_do_loop_supports_conditional_state_assignments(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index = selected_index then total = total + increment;
+            else total = total + 1;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 10, 5),
+                (2, 1, 3, None, 10, 5),
+                (3, 3, 1, 3, 7, 5),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "total int, increment int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["index"], row["total"]) for row in rows],
+            [(4, 17), (4, 13), (3, 7)],
+        )
+
+        no_else_source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index = selected_index then total = total + increment;
+          end;
+        run;
+        """
+        no_else_namespace = {"spark": self.spark, "df_source": frame}
+        no_else_generated = SasToPySparkConverter().convert(no_else_source)
+        exec(
+            compile(no_else_generated.code, "<generated-pyspark>", "exec"),
+            no_else_namespace,
+        )
+        no_else_rows = no_else_namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["index"], row["total"]) for row in no_else_rows],
+            [(4, 15), (4, 10), (3, 7)],
+        )
+
+    def test_non_output_do_loop_supports_ordered_else_if_chains(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index = first_match then total = total + 10;
+            else if index = second_match then total = total + 20;
+            else total = total + 1;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 3, 0),
+                (2, 1, 3, 3, 3, 0),
+                (3, 1, 3, None, 2, 0),
+                (4, 3, 1, 2, 1, 9),
+            ],
+            "id int, first_index int, last_index int, first_match int, "
+            "second_match int, total int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["index"], row["total"]) for row in rows],
+            [(4, 31), (4, 12), (4, 22), (3, 9)],
+        )
+
+        no_final_else_source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index = first_match then total = total + 10;
+            else if index = second_match then total = total + 20;
+          end;
+        run;
+        """
+        no_else_namespace = {"spark": self.spark, "df_source": frame}
+        no_else_generated = SasToPySparkConverter().convert(no_final_else_source)
+        exec(
+            compile(no_else_generated.code, "<generated-pyspark>", "exec"),
+            no_else_namespace,
+        )
+        no_else_rows = no_else_namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["index"], row["total"]) for row in no_else_rows],
+            [(4, 30), (4, 10), (4, 20), (3, 9)],
+        )
+
+    def test_non_output_do_loop_else_if_branches_can_update_different_targets(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index = first_match then left_value = left_value + 10;
+            else if index = second_match then right_value = right_value + 20;
+            else left_value = left_value + 1;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 1, 2, 0, 0),
+                (2, 1, 3, 3, 2, 5, 7),
+                (3, 1, 3, None, 2, 5, 7),
+            ],
+            "id int, first_index int, last_index int, first_match int, "
+            "second_match int, left_value int, right_value int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["index"], row["left_value"], row["right_value"])
+                for row in rows
+            ],
+            [(4, 11, 20), (4, 16, 27), (4, 7, 27)],
+        )
+
+    def test_non_output_do_loop_supports_nested_if_do_blocks(self):
+        source = """
+        data calculated;
+          set source;
+          do index = first_index to last_index;
+            if index >= first_index then do;
+              total = total + index;
+              if index = selected_index then do;
+                total = total + increment;
+              end;
+              else do;
+                total = total + 1;
+              end;
+            end;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 10, 0),
+                (2, 1, 3, None, 5, 2),
+                (3, 3, 1, 3, 5, 9),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "increment int, total int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_calculated"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["index"], row["total"]) for row in rows],
+            [(4, 18), (4, 11), (3, 9)],
+        )
+
+    def test_non_output_do_loop_conditionally_deletes_rows(self):
+        source = """
+        data filtered;
+          set source;
+          do index = first_index to last_index;
+            total = total + index;
+            if index = cutoff then delete;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 0),
+                (2, 1, 3, 4, 0),
+                (3, 3, 1, 3, 5),
+                (4, 1, 2, None, 7),
+            ],
+            "id int, first_index int, last_index int, cutoff int, total int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_filtered"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["id"], row["index"], row["total"])
+                for row in rows
+            ],
+            [(2, 4, 6), (3, 3, 5), (4, 3, 10)],
+        )
+        delete_only_source = """
+        data filtered_only;
+          set source;
+          do index = first_index to last_index;
+            if index = cutoff then delete;
+          end;
+        run;
+        """
+        delete_only_namespace = {"spark": self.spark, "df_source": frame}
+        delete_only = SasToPySparkConverter().convert(delete_only_source)
+        exec(
+            compile(delete_only.code, "<generated-pyspark>", "exec"),
+            delete_only_namespace,
+        )
+        delete_only_rows = (
+            delete_only_namespace["df_filtered_only"].orderBy("id").collect()
+        )
+        self.assertEqual(
+            [(row["id"], row["index"]) for row in delete_only_rows],
+            [(2, 4), (3, 3), (4, 3)],
+        )
+
+    def test_non_output_do_loop_deletes_using_loop_carried_state(self):
+        source = """
+        data filtered;
+          set source;
+          do index = first_index to last_index;
+            total = total + index;
+            if total > cutoff then delete;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 4, 3, 0),
+                (2, 1, 4, 100, 0),
+                (3, 3, 1, 6, 7),
+            ],
+            "id int, first_index int, last_index int, cutoff int, total int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_filtered"].orderBy("id").collect()
+        self.assertEqual(
+            [(row["id"], row["index"], row["total"]) for row in rows],
+            [(2, 5, 10), (3, 3, 7)],
+        )
+
+        delete_before_update = """
+        data filtered;
+          set source;
+          do index = first_index to last_index;
+            if total < cutoff then delete;
+            total = total + index;
+          end;
+        run;
+        """
+        before_frame = self.spark.createDataFrame(
+            [(1, 1, 2, 6, 5), (2, 1, 2, 5, 5)],
+            "id int, first_index int, last_index int, cutoff int, total int",
+        )
+        before_namespace = {"spark": self.spark, "df_source": before_frame}
+        before_generated = SasToPySparkConverter().convert(delete_before_update)
+        exec(
+            compile(before_generated.code, "<generated-pyspark>", "exec"),
+            before_namespace,
+        )
+        before_rows = before_namespace["df_filtered"].collect()
+        self.assertEqual(
+            [(row["id"], row["total"]) for row in before_rows],
+            [(2, 8)],
+        )
+
+        descending_source = """
+        data filtered;
+          set source;
+          do index = first_index to last_index by -1;
+            total = total + index;
+            if total > cutoff then delete;
+          end;
+        run;
+        """
+        descending_frame = self.spark.createDataFrame(
+            [(1, 4, 1, 6, 0), (2, 4, 1, 100, 0), (3, 1, 4, -1, 7)],
+            "id int, first_index int, last_index int, cutoff int, total int",
+        )
+        descending_namespace = {"spark": self.spark, "df_source": descending_frame}
+        descending_generated = SasToPySparkConverter().convert(descending_source)
+        exec(
+            compile(descending_generated.code, "<generated-pyspark>", "exec"),
+            descending_namespace,
+        )
+        descending_rows = (
+            descending_namespace["df_filtered"].orderBy("id").collect()
+        )
+        self.assertEqual(
+            [
+                (row["id"], row["index"], row["total"])
+                for row in descending_rows
+            ],
+            [(2, 0, 10), (3, 1, 7)],
+        )
+
+    def test_non_output_do_loop_delete_with_conditional_targets_and_nested_guards(self):
+        source = """
+        data filtered;
+          set source;
+          do index = first_index to last_index;
+            if index = 1 then left_value = left_value + 10;
+            else if index = 2 then right_value = right_value + 20;
+            else left_value = left_value + 1;
+            if index >= 2 then do;
+              right_value = right_value + left_value;
+              if right_value > cutoff then delete;
+            end;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 35, 0, 0),
+                (2, 1, 3, 50, 0, 0),
+                (3, 1, 1, -1, 0, 0),
+            ],
+            "id int, first_index int, last_index int, cutoff int, "
+            "left_value int, right_value int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_filtered"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (
+                    row["id"],
+                    row["index"],
+                    row["left_value"],
+                    row["right_value"],
+                )
+                for row in rows
+            ],
+            [(2, 4, 11, 41), (3, 2, 10, 0)],
+        )
+
+    def test_non_output_do_loop_deletes_using_updated_dynamic_array_values(self):
+        source = """
+        data filtered;
+          set source;
+          array values{3} v1-v3;
+          do index = first_index to last_index;
+            if index = selected_index then values[index] = values[index] + 10;
+            else values[index] = values[index] + 1;
+            if values[index] > cutoff then delete;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 11, 1, 2, 3),
+                (2, 1, 3, 2, 100, 1, 2, 3),
+                (3, 2, 3, 3, 5, 10, 0, 1),
+                (5, 1, 1, 1, None, 2, 3, 4),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "cutoff int, v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_filtered"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["id"], row["index"], row["v1"], row["v2"], row["v3"])
+                for row in rows
+            ],
+            [(2, 4, 2, 12, 4), (5, 2, 12, 3, 4)],
+        )
+
+    def test_non_output_do_loop_nested_array_update_can_trigger_delete(self):
+        source = """
+        data filtered;
+          set source;
+          array values{3} v1-v3;
+          do index = first_index to last_index;
+            if index >= first_index then do;
+              if index = selected_index then values[index] = values[index] + 10;
+              else values[index] = values[index] + 1;
+              if values[index] > cutoff then delete;
+            end;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [
+                (1, 1, 3, 2, 11, 1, 2, 3),
+                (2, 1, 3, 2, 100, 1, 2, 3),
+                (3, 1, 1, 1, 10, 0, 2, 3),
+                (4, 3, 1, 2, 0, 1, 2, 3),
+                (5, 1, 1, 1, None, 2, 3, 4),
+            ],
+            "id int, first_index int, last_index int, selected_index int, "
+            "cutoff int, v1 int, v2 int, v3 int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        rows = namespace["df_filtered"].orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["id"], row["index"], row["v1"], row["v2"], row["v3"])
+                for row in rows
+            ],
+            [
+                (2, 4, 2, 12, 4),
+                (3, 2, 10, 2, 3),
+                (4, 3, 1, 2, 3),
+                (5, 2, 12, 3, 4),
+            ],
+        )
+
+    def test_non_output_do_loop_uses_explicit_initializers_for_new_state_columns(self):
+        source = """
+        data calculated;
+          set source;
+          total = 0.0;
+          doubled = 0;
+          do index = first_index to last_index;
+            total = total + index;
+            doubled = total * 2;
+          end;
+        run;
+        """
+        frame = self.spark.createDataFrame(
+            [(1, 1, 3), (2, 5, 1)],
+            "id int, first_index int, last_index int",
+        )
+        namespace = {"spark": self.spark, "df_source": frame}
+        generated = SasToPySparkConverter().convert(source)
+        exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+        result = namespace["df_calculated"]
+        rows = result.orderBy("id").collect()
+        self.assertEqual(
+            [
+                (row["index"], row["total"], row["doubled"])
+                for row in rows
+            ],
+            [(4, 6.0, 12), (5, 0.0, 0)],
+        )
+        self.assertEqual(result.schema["total"].dataType.simpleString(), "decimal(38,1)")
+        self.assertEqual(result.schema["doubled"].dataType.simpleString(), "int")
+
     def test_output_do_loop_with_no_iterations_emits_no_rows(self):
         source = """
         data work.empty_expansion;
@@ -1519,16 +2360,18 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
     def test_merge_by_handles_duplicate_keys_and_in_flags(self):
         source = """
         data work.one_to_many;
-          merge work.dup_left(in=inl) work.single_right(in=inr);
+          merge work.dup_left(in=inl order_by=(lv))
+                work.single_right(in=inr order_by=(rv));
           by id;
           if inl;
         run;
         data work.many_to_many;
-          merge work.dup_left work.dup_right;
+          merge work.dup_left(order_by=(lv)) work.dup_right(order_by=(xv));
           by id;
         run;
         data work.only_right;
-          merge work.dup_left(in=inl) work.single_right(in=inr);
+          merge work.dup_left(in=inl order_by=(lv))
+                work.single_right(in=inr order_by=(rv));
           by id;
           if inr and not inl;
         run;
@@ -1563,6 +2406,39 @@ class GeneratedPySparkExecutionTests(unittest.TestCase):
             [(3, "r3")],
         )
         self.assertNotIn("inl", namespace["df_one_to_many"].columns)
+
+    def test_merge_by_rejects_duplicate_groups_without_input_order_keys(self):
+        source = "data out; merge left right; by id; run;"
+        generated = SasToPySparkConverter().convert(source)
+        namespace = {
+            "spark": self.spark,
+            "df_left": self.spark.createDataFrame(
+                [(1, "a"), (1, "b")], "id int, value string"
+            ),
+            "df_right": self.spark.createDataFrame([(1, "x")], "id int, value string"),
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate BY keys require ORDER_BY"):
+            exec(compile(generated.code, "<generated-pyspark>", "exec"), namespace)
+
+        collision_source = (
+            "data out; merge left right; "
+            "by __sas2pyspark_group_count; run;"
+        )
+        collision_code = SasToPySparkConverter().convert(collision_source).code
+        collision_namespace = {
+            "spark": self.spark,
+            "df_left": self.spark.createDataFrame(
+                [(1,), (1,)], ["__sas2pyspark_group_count"]
+            ),
+            "df_right": self.spark.createDataFrame(
+                [(1,)], ["__sas2pyspark_group_count"]
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate BY keys require ORDER_BY"):
+            exec(
+                compile(collision_code, "<generated-pyspark>", "exec"),
+                collision_namespace,
+            )
 
     def test_merge_by_orders_duplicate_rows_per_input(self):
         source = """

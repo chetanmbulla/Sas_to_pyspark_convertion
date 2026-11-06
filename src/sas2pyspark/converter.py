@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from .data_length import rewrite_length
 from .data_retain import rewrite_retain
 from .data_unroll import parse_constant_integer, rewrite_arrays_and_loops
 from .data_order import OrderByError, OrderKey, parse_order_by
+from .ir import DataAction as _DataAction, DataStepIR
 from .data_outputs import rewrite_outputs
 from .data_lines import DATALINES_MARKER, rewrite_datalines
 from .data_lag import rewrite_lag
@@ -183,29 +185,6 @@ def _resolve_sas_version(
     )
 
 
-@dataclass(frozen=True)
-class _DataAction:
-    kind: str
-    expression: str
-    column: str | None = None
-    columns: tuple[str, ...] = ()
-    condition: str | None = None
-    otherwise: str | None = None
-    loop_start: int | None = None
-    loop_stop: int | None = None
-    loop_step: int | None = None
-    loop_assignments: tuple[tuple[str, str], ...] = ()
-    merge_sources: tuple[str, ...] = ()
-    merge_keys: tuple[str, ...] = ()
-    merge_directions: tuple[bool, ...] = ()
-    merge_in_vars: tuple[str, ...] = ()
-    merge_order_keys: tuple[tuple[OrderKey, ...], ...] = ()
-    branches: tuple[tuple[str, str], ...] = ()
-    retain_initial: str | None = None
-    retain_partition: tuple[str, ...] = ()
-    retain_reset: str | None = None
-
-
 _DATASET = re.compile(r"^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)$")
 _ASSIGNMENT = re.compile(r"^([A-Za-z_]\w*)\s*=(?!=|>)\s*(.+)$", re.DOTALL)
 _DATA_ASSIGNMENT = re.compile(
@@ -237,6 +216,22 @@ def _dataset_name(value: str) -> str:
     if not match:
         raise ConversionError(f"Unsupported SAS dataset reference: {value!r}.")
     return match.group(1).lower()
+
+
+def _call_missing_names(statement: str) -> tuple[str, ...]:
+    call = re.fullmatch(
+        r"call\s+missing\s*\((.*)\)", statement.strip(), re.IGNORECASE | re.DOTALL
+    )
+    names = [name.strip() for name in call.group(1).split(",")] if call else []
+    if not names or any(not re.fullmatch(r"[A-Za-z_]\w*", name) for name in names):
+        raise ConversionError(
+            "CALL MISSING supports one or more simple variable names, "
+            "for example CALL MISSING(score, label)."
+        )
+    unique_names: dict[str, str] = {}
+    for name in names:
+        unique_names.setdefault(name.casefold(), name)
+    return tuple(unique_names.values())
 
 
 def _python_name(dataset: str) -> str:
@@ -391,9 +386,13 @@ def _expression(value: str) -> str:
 
 
 def _expand_array_references(
-    value: str, arrays: dict[str, tuple[str, ...]]
+    value: str,
+    arrays: dict[str, tuple[str, ...]],
+    *,
+    allow_dynamic_read: bool = False,
+    on_dynamic_read: Callable[[tuple[str, ...], str, tuple[str, ...]], None] | None = None,
 ) -> str:
-    """Replace supported constant-index SAS array references with columns."""
+    """Replace SAS array references with columns or checked dynamic reads."""
 
     def replace(part: str) -> str:
         def substitute(match: re.Match[str]) -> str:
@@ -405,9 +404,18 @@ def _expand_array_references(
                 )
             index_text = match.group(2).strip()
             if not index_text.isdigit():
+                if allow_dynamic_read:
+                    index_expression, index_columns = _dynamic_array_index(index_text)
+                    elements = arrays[array_name]
+                    if on_dynamic_read is not None:
+                        on_dynamic_read(elements, index_expression, index_columns)
+                    values = ", ".join(f"`{element}`" for element in elements)
+                    return (
+                        f"element_at(array({values}), "
+                        f"CAST(({index_expression}) AS INT))"
+                    )
                 raise ConversionError(
-                    "SAS array references currently require a positive integer "
-                    "literal index."
+                    "SAS array references require a positive integer literal index."
                 )
             index = int(index_text)
             elements = arrays[array_name]
@@ -421,6 +429,92 @@ def _expand_array_references(
         return _ARRAY_REFERENCE.sub(substitute, part)
 
     return _map_unquoted(value, replace)
+
+
+def _dynamic_array_index(value: str) -> tuple[str, tuple[str, ...]]:
+    try:
+        parsed = ast.parse(value, mode="eval")
+    except SyntaxError as error:
+        raise ConversionError(
+            "Dynamic SAS array indexes support numeric arithmetic expressions only."
+        ) from error
+
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.Mod,
+        ast.UAdd,
+        ast.USub,
+        ast.Constant,
+        ast.Name,
+        ast.Load,
+    )
+    names: dict[str, str] = {}
+    for node in ast.walk(parsed):
+        if not isinstance(node, allowed_nodes):
+            raise ConversionError(
+                "Dynamic SAS array indexes support identifiers, numeric literals, "
+                "parentheses, and +, -, *, /, or % arithmetic only."
+            )
+        if isinstance(node, ast.Constant) and (
+            isinstance(node.value, bool) or not isinstance(node.value, (int, float))
+        ):
+            raise ConversionError("Dynamic SAS array indexes must be numeric.")
+        if isinstance(node, ast.Name):
+            names.setdefault(node.id.casefold(), node.id)
+    if not names:
+        raise ConversionError(
+            "Dynamic SAS array indexes must reference at least one numeric variable."
+        )
+    return value, tuple(names.values())
+
+
+def _dynamic_loop_bound(value: str) -> tuple[str, tuple[str, ...]]:
+    try:
+        parsed = ast.parse(value, mode="eval")
+    except SyntaxError as error:
+        raise ConversionError(
+            "Dynamic DO loop bounds support numeric arithmetic over input columns only."
+        ) from error
+
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.Mod,
+        ast.UAdd,
+        ast.USub,
+        ast.Constant,
+        ast.Name,
+        ast.Load,
+    )
+    names: dict[str, str] = {}
+    for node in ast.walk(parsed):
+        if not isinstance(node, allowed_nodes):
+            raise ConversionError(
+                "Dynamic DO loop bounds support identifiers, numeric literals, "
+                "parentheses, and +, -, *, /, or % arithmetic only."
+            )
+        if isinstance(node, ast.Constant) and (
+            isinstance(node.value, bool) or not isinstance(node.value, (int, float))
+        ):
+            raise ConversionError("Dynamic DO loop bounds must be numeric.")
+        if isinstance(node, ast.Name):
+            names.setdefault(node.id.casefold(), node.id)
+    if not names:
+        raise ConversionError(
+            "Dynamic DO loop bounds must reference an input column."
+        )
+    return value, tuple(names.values())
 
 
 def _parse_array_declaration(statement: str) -> tuple[str, tuple[str, ...]]:
@@ -930,9 +1024,48 @@ class SasToPySparkConverter:
         by_flags_used: set[str] = set()
         display_formats: set[str] = set()
         order_by_keys: tuple[OrderKey, ...] | None = None
+        dynamic_array_reads: dict[
+            tuple[tuple[str, ...], str, str | None],
+            tuple[
+                tuple[str, ...],
+                str,
+                tuple[str, ...],
+                tuple[str, int | str, int | str, int] | None,
+            ],
+        ] = {}
+        current_dynamic_loop: tuple[str, int | str, int | str, int] | None = None
+
+        def register_dynamic_array_read(
+            elements: tuple[str, ...],
+            index_expression: str,
+            index_columns: tuple[str, ...],
+        ) -> None:
+            loop_key = (
+                current_dynamic_loop[0].casefold()
+                if current_dynamic_loop is not None
+                else None
+            )
+            dynamic_array_reads.setdefault(
+                (
+                    tuple(element.casefold() for element in elements),
+                    index_expression.casefold(),
+                    loop_key,
+                ),
+                (
+                    elements,
+                    index_expression,
+                    index_columns,
+                    current_dynamic_loop,
+                ),
+            )
 
         def data_expression(expression: str) -> str:
-            expanded = _expand_array_references(expression, arrays)
+            expanded = _expand_array_references(
+                expression,
+                arrays,
+                allow_dynamic_read=True,
+                on_dynamic_read=register_dynamic_array_read,
+            )
             for in_var in merge_in_vars:
                 if in_var:
                     expanded = _map_unquoted(
@@ -989,6 +1122,36 @@ class SasToPySparkConverter:
                     "and a constant valid index."
                 )
             return expanded
+
+        def dynamic_array_target(
+            column: str,
+        ) -> tuple[tuple[str, ...], str, tuple[str, ...], str | None] | None:
+            reference = _ARRAY_REFERENCE.fullmatch(column.strip())
+            if reference is None:
+                return None
+            array_name, index_text = reference.groups()
+            array_key = next(
+                (name for name in arrays if name.casefold() == array_name.casefold()),
+                None,
+            )
+            if array_key is None:
+                raise ConversionError(
+                    f"SAS array reference {array_name!r} requires a preceding "
+                    "supported ARRAY declaration."
+                )
+            if index_text.strip().isdigit():
+                return None
+            elements = arrays[array_key]
+            index_expression, index_columns = _dynamic_array_index(index_text)
+            register_dynamic_array_read(
+                elements, index_expression, index_columns
+            )
+            return (
+                elements,
+                index_expression,
+                index_columns,
+                current_dynamic_loop[0] if current_dynamic_loop else None,
+            )
 
         index = start + 1
         output_loop_seen = False
@@ -1061,26 +1224,11 @@ class SasToPySparkConverter:
                             "value; character and uninitialized RETAIN are unsupported."
                         )
                 elif lower.startswith("call missing"):
-                    call = re.fullmatch(
-                        r"call\s+missing\s*\((.*)\)", statement, re.IGNORECASE | re.DOTALL
-                    )
-                    names = (
-                        [name.strip() for name in call.group(1).split(",")]
-                        if call is not None
-                        else []
-                    )
-                    if not names or any(
-                        not re.fullmatch(r"[A-Za-z_]\w*", name) for name in names
-                    ):
-                        raise ConversionError(
-                            "CALL MISSING supports one or more simple variable names, "
-                            "for example CALL MISSING(score, label)."
-                        )
                     actions.append(
                         _DataAction(
                             kind="missing",
                             expression="",
-                            columns=tuple(dict.fromkeys(names)),
+                            columns=_call_missing_names(statement),
                         )
                     )
                 elif lower.startswith("set "):
@@ -1307,19 +1455,42 @@ class SasToPySparkConverter:
                         if loop_match.group(4)
                         else 1
                     )
-                    if None in (loop_start, loop_stop, loop_step):
+                    if loop_step is None:
                         raise ConversionError(
-                            "DO loop bounds and step must be integer literals or "
-                            "compile-time integer expressions."
+                            "DO loop BY step must be an integer literal or "
+                            "compile-time integer expression."
                         )
-                    assert loop_start is not None
-                    assert loop_stop is not None
                     assert loop_step is not None
                     if loop_step == 0:
                         raise ConversionError("DO loop BY step cannot be zero.")
+                    bound_columns: list[str] = []
+                    if loop_start is None:
+                        raw_start, start_columns = _dynamic_loop_bound(
+                            loop_match.group(2)
+                        )
+                        loop_start = data_expression(raw_start)
+                        bound_columns.extend(start_columns)
+                    if loop_stop is None:
+                        raw_stop, stop_columns = _dynamic_loop_bound(
+                            loop_match.group(3)
+                        )
+                        loop_stop = data_expression(raw_stop)
+                        bound_columns.extend(stop_columns)
+                    bound_columns = list(
+                        dict.fromkeys(column.casefold() for column in bound_columns)
+                    )
                     body_assignments: list[tuple[str, str]] = []
+                    loop_delete_conditions: list[str] = []
+                    loop_operations: list[tuple[str, int | str]] = []
+                    loop_array_write = False
+                    loop_conditional_assignment = False
                     output_count = 0
                     body_index = index + 1
+                    current_dynamic_loop = (
+                        (loop_variable, loop_start, loop_stop, loop_step)
+                        if bound_columns
+                        else None
+                    )
                     while (
                         body_index < len(statements)
                         and statements[body_index].text.lower() != "end"
@@ -1336,52 +1507,312 @@ class SasToPySparkConverter:
                                 raise ConversionError(
                                     "OUTPUT must be the final statement in a supported DO loop."
                                 )
+                        elif (
+                            delete_match := re.fullmatch(
+                                r"if\s+coalesce\s*\(\s*not\s*\((.*)\)\s*,\s*true\s*\)",
+                                body_text,
+                                re.IGNORECASE | re.DOTALL,
+                            )
+                        ) is not None:
+                            condition = data_expression(delete_match.group(1))
+                            loop_delete_conditions.append(condition)
+                            loop_operations.append(("delete", condition))
+                        elif body_text.lower().startswith("if "):
+                            loop_conditional_assignment = True
+                            conditional = _IF_THEN.fullmatch(body_text)
+                            if conditional is None or conditional.group(2) is None:
+                                raise ConversionError(
+                                    "Runtime-bound DO loops support only IF "
+                                    "conditions with simple assignment branches."
+                                )
+                            chain_index = body_index
+                            chain_updates: list[tuple[str, str, str]] = []
+                            branch_columns: list[str] = []
+                            current = conditional
+                            while True:
+                                branch_assignment = _DATA_ASSIGNMENT.fullmatch(
+                                    (current.group(2) or "").strip()
+                                )
+                                if branch_assignment is None:
+                                    raise ConversionError(
+                                        "Runtime-bound DO loop IF branches must be "
+                                        "simple assignments."
+                                    )
+                                branch_condition = data_expression(current.group(1))
+                                branch_expression = data_expression(
+                                    branch_assignment.group(2)
+                                )
+                                dynamic_target = dynamic_array_target(
+                                    branch_assignment.group(1)
+                                )
+                                if dynamic_target is not None:
+                                    if not bound_columns:
+                                        raise ConversionError(
+                                            "Dynamic array assignment targets inside "
+                                            "DO loops require runtime bounds."
+                                        )
+                                    elements, index_expression, _, _ = dynamic_target
+                                    loop_array_write = True
+                                    for element_index, element in enumerate(
+                                        elements, start=1
+                                    ):
+                                        branch_columns.append(element)
+                                        chain_updates.append(
+                                            (
+                                                f"({branch_condition}) AND "
+                                                f"(({index_expression}) = "
+                                                f"{element_index})",
+                                                element,
+                                                branch_expression,
+                                            )
+                                        )
+                                else:
+                                    branch_column = data_column(
+                                        branch_assignment.group(1)
+                                    )
+                                    if branch_column.casefold() == loop_variable.casefold():
+                                        raise ConversionError(
+                                            "DO loop body cannot reassign its index variable."
+                                        )
+                                    branch_columns.append(branch_column)
+                                    chain_updates.append(
+                                        (
+                                            branch_condition,
+                                            branch_column,
+                                            branch_expression,
+                                        )
+                                    )
+                                if chain_index + 1 >= len(statements):
+                                    break
+                                else_match = re.fullmatch(
+                                    r"else\s+(.+)",
+                                    statements[chain_index + 1].text.strip(),
+                                    re.IGNORECASE | re.DOTALL,
+                                )
+                                if else_match is None:
+                                    if statements[
+                                        chain_index + 1
+                                    ].text.strip().lower().startswith("else"):
+                                        raise ConversionError(
+                                            "Runtime-bound DO loop ELSE branches "
+                                            "must be simple assignments."
+                                        )
+                                    break
+                                chain_index += 1
+                                else_body = else_match.group(1).strip()
+                                next_if = _IF_THEN.fullmatch(else_body)
+                                if next_if is not None:
+                                    if next_if.group(2) is None:
+                                        raise ConversionError(
+                                            "Runtime-bound DO loop ELSE IF "
+                                            "branches must be simple assignments."
+                                        )
+                                    current = next_if
+                                    continue
+                                else_assignment = _DATA_ASSIGNMENT.fullmatch(else_body)
+                                if else_assignment is None:
+                                    raise ConversionError(
+                                        "Runtime-bound DO loop ELSE branches must "
+                                        "be simple assignments."
+                                    )
+                                else_expression = data_expression(
+                                    else_assignment.group(2)
+                                )
+                                prior_conditions = " OR ".join(
+                                    f"coalesce(({condition}), false)"
+                                    for condition, _, _ in chain_updates
+                                    if condition
+                                )
+                                else_condition = (
+                                    f"NOT ({prior_conditions})"
+                                    if prior_conditions
+                                    else "true"
+                                )
+                                dynamic_target = dynamic_array_target(
+                                    else_assignment.group(1)
+                                )
+                                if dynamic_target is not None:
+                                    if not bound_columns:
+                                        raise ConversionError(
+                                            "Dynamic array assignment targets inside "
+                                            "DO loops require runtime bounds."
+                                        )
+                                    elements, index_expression, _, _ = dynamic_target
+                                    loop_array_write = True
+                                    for element_index, element in enumerate(
+                                        elements, start=1
+                                    ):
+                                        branch_columns.append(element)
+                                        chain_updates.append(
+                                            (
+                                                f"({else_condition}) AND "
+                                                f"(({index_expression}) = "
+                                                f"{element_index})",
+                                                element,
+                                                else_expression,
+                                            )
+                                        )
+                                else:
+                                    else_column = data_column(
+                                        else_assignment.group(1)
+                                    )
+                                    if else_column.casefold() == loop_variable.casefold():
+                                        raise ConversionError(
+                                            "DO loop body cannot reassign its index variable."
+                                        )
+                                    branch_columns.append(else_column)
+                                    chain_updates.append(
+                                        (
+                                            else_condition,
+                                            else_column,
+                                            else_expression,
+                                        )
+                                    )
+                                break
+                            body_index = chain_index
+                            target_columns = list(
+                                dict.fromkeys(
+                                    [
+                                        *branch_columns,
+                                    ]
+                                )
+                            )
+                            for target_column in target_columns:
+                                case_branches = " ".join(
+                                    "WHEN ({condition}) THEN ({value})".format(
+                                        condition=condition,
+                                        value=(
+                                            expression
+                                            if branch_column.casefold() == target_column.casefold()
+                                            else target_column
+                                        ),
+                                    )
+                                    for condition, branch_column, expression in chain_updates
+                                )
+                                body_assignments.append(
+                                    (
+                                        target_column,
+                                        f"CASE {case_branches} ELSE "
+                                        f"({target_column}) END",
+                                    )
+                                )
+                                loop_operations.append(
+                                    ("assignment", len(body_assignments) - 1)
+                                )
                         else:
                             body_assignment = _DATA_ASSIGNMENT.fullmatch(body_text)
                             if not body_assignment:
                                 raise ConversionError(
                                     "DO loop bodies support only simple assignments "
-                                    "followed by OUTPUT."
-                                )
-                            column = data_column(body_assignment.group(1))
-                            if column.lower() == loop_variable.lower():
-                                raise ConversionError(
-                                    "DO loop body cannot reassign its index variable."
+                                    "and an optional final OUTPUT."
                                 )
                             expression = data_expression(body_assignment.group(2))
-                            if re.search(
-                                rf"\b{re.escape(column)}\b",
-                                expression,
-                                re.IGNORECASE,
-                            ):
-                                raise ConversionError(
-                                    "DO loop assignments cannot depend on their own "
-                                    "previous-iteration value."
+                            dynamic_target = dynamic_array_target(
+                                body_assignment.group(1)
+                            )
+                            if dynamic_target is not None:
+                                if not bound_columns:
+                                    raise ConversionError(
+                                        "Dynamic array assignment targets inside "
+                                        "DO loops require runtime bounds."
+                                    )
+                                elements, index_expression, _, _ = dynamic_target
+                                loop_array_write = True
+                                for element_index, element in enumerate(
+                                    elements, start=1
+                                ):
+                                    body_assignments.append(
+                                        (
+                                            element,
+                                            f"CASE WHEN ({index_expression}) = "
+                                            f"{element_index} THEN ({expression}) "
+                                            f"ELSE {element} END",
+                                        )
+                                    )
+                                    loop_operations.append(
+                                        ("assignment", len(body_assignments) - 1)
+                                    )
+                            else:
+                                column = data_column(body_assignment.group(1))
+                                if column.lower() == loop_variable.lower():
+                                    raise ConversionError(
+                                        "DO loop body cannot reassign its index variable."
+                                    )
+                                body_assignments.append((column, expression))
+                                loop_operations.append(
+                                    ("assignment", len(body_assignments) - 1)
                                 )
-                            body_assignments.append((column, expression))
                         body_index += 1
+                    current_dynamic_loop = None
                     if body_index >= len(statements):
                         raise ConversionError("DO loop is missing END.")
-                    if output_count != 1:
+                    if output_count > 1:
                         raise ConversionError(
-                            "Supported DO loops require exactly one OUTPUT at the end."
+                            "Supported DO loops allow at most one final OUTPUT."
                         )
-                    if actions and actions[-1].kind == "do_output":
+                    if output_count and loop_array_write:
+                        raise ConversionError(
+                            "Dynamic array writes are not supported in "
+                            "output-producing DO loops."
+                        )
+                    if output_count and loop_conditional_assignment:
+                        raise ConversionError(
+                            "Conditional assignments are supported only in "
+                            "runtime-bounded non-OUTPUT DO loops."
+                        )
+                    if output_count and loop_delete_conditions:
+                        raise ConversionError(
+                            "Conditional DELETE is supported only in "
+                            "runtime-bounded non-OUTPUT DO loops."
+                        )
+                    if output_count and any(
+                        re.search(
+                            rf"\b{re.escape(column)}\b",
+                            expression,
+                            re.IGNORECASE,
+                        )
+                        for column, expression in body_assignments
+                    ):
+                        raise ConversionError(
+                            "DO loop assignments cannot depend on their own "
+                            "previous-iteration value."
+                        )
+                    if output_count == 0 and not bound_columns:
+                        raise ConversionError(
+                            "DO loops without OUTPUT require compile-time bounds."
+                        )
+                    if output_count == 0 and not body_assignments and not loop_delete_conditions:
+                        raise ConversionError(
+                            "Runtime-bound DO loops without OUTPUT require an "
+                            "assignment or conditional DELETE."
+                        )
+                    if output_count == 0 and any(
+                        column.casefold() in bound_columns
+                        for column, _ in body_assignments
+                    ):
+                        raise ConversionError(
+                            "Runtime-bound DO loop bounds cannot be assigned in "
+                            "the loop body."
+                        )
+                    if actions and actions[-1].kind in {"do_output", "do_runtime"}:
                         raise ConversionError(
                             "Only one output-generating DO loop is supported per DATA step."
                         )
                     actions.append(
                         _DataAction(
-                            kind="do_output",
+                            kind="do_output" if output_count else "do_runtime",
                             expression="",
                             column=loop_variable,
                             loop_start=loop_start,
                             loop_stop=loop_stop,
                             loop_step=loop_step,
+                            loop_bound_columns=tuple(bound_columns),
                             loop_assignments=tuple(body_assignments),
+                            loop_delete_conditions=tuple(loop_delete_conditions),
+                            loop_operations=tuple(loop_operations),
                         )
                     )
-                    output_loop_seen = True
+                    output_loop_seen = output_count == 1
                     index = body_index
                 elif lower == "output":
                     raise ConversionError(
@@ -1390,7 +1821,22 @@ class SasToPySparkConverter:
                     )
                 elif lower.startswith("if "):
                     conditional = _IF_THEN.fullmatch(statement)
-                    if conditional:
+                    if (
+                        conditional is not None
+                        and conditional.group(2) is not None
+                        and conditional.group(2).strip().casefold().startswith(
+                            "call missing"
+                        )
+                    ):
+                        actions.append(
+                            _DataAction(
+                                kind="missing",
+                                expression="",
+                                columns=_call_missing_names(conditional.group(2)),
+                                condition=data_expression(conditional.group(1)),
+                            )
+                        )
+                    elif conditional:
                         else_match = (
                             re.fullmatch(
                                 r"else\s+(.+)",
@@ -1608,69 +2054,88 @@ class SasToPySparkConverter:
                         raise ConversionError(
                             f"Unsupported DATA step statement: {statement[:80]!r}."
                         )
-                    column = data_column(assignment.group(1))
-                    column_key = column.lower()
-                    if column_key in retain_vars:
-                        retain_column, retain_initial = retain_vars[column_key]
-                        reset_info = retain_resets.get(column_key)
-                        retain_reset_key = reset_info[0] if reset_info else None
-                        retain_reset_value = reset_info[1] if reset_info else None
-                        if column_key in retain_seen:
-                            raise ConversionError(
-                                "A retained accumulator can be updated only once "
-                                "per DATA-step iteration."
-                            )
-                        accumulator_match = re.fullmatch(
-                            rf"{re.escape(retain_column)}\s*\+\s*(.+)",
-                            assignment.group(2),
-                            re.IGNORECASE | re.DOTALL,
-                        )
-                        if not accumulator_match:
-                            raise ConversionError(
-                                "RETAIN supports only accumulator assignments of "
-                                "the form variable = variable + expression."
-                            )
-                        increment = accumulator_match.group(1).strip()
-                        if re.search(
-                            rf"\b{re.escape(retain_column)}\b",
-                            increment,
-                            re.IGNORECASE,
-                        ):
-                            raise ConversionError(
-                                "RETAIN accumulator increments cannot reference "
-                                "the retained variable."
-                            )
+                    dynamic_target = dynamic_array_target(assignment.group(1))
+                    if dynamic_target is not None:
+                        (
+                            elements,
+                            index_expression,
+                            index_columns,
+                            loop_variable,
+                        ) = dynamic_target
                         actions.append(
                             _DataAction(
-                                kind="retain_sum",
-                                expression=data_expression(increment),
-                                column=column,
-                                retain_initial=retain_initial,
-                                retain_partition=(
-                                    by_columns[
-                                        : next(
-                                            key_index
-                                            for key_index, key in enumerate(by_columns)
-                                            if key.lower() == retain_reset_key.lower()
-                                        )
-                                        + 1
-                                    ]
-                                    if by_columns is not None
-                                    and retain_reset_key is not None
-                                    else ()
-                                ),
-                                retain_reset=retain_reset_value,
+                                kind="array_assign",
+                                expression=data_expression(assignment.group(2)),
+                                columns=elements,
+                                array_index=index_expression,
+                                array_index_columns=index_columns,
+                                array_loop_variable=loop_variable,
                             )
                         )
-                        retain_seen.add(column_key)
                     else:
-                        actions.append(
-                            _DataAction(
-                                "assign",
-                                data_expression(assignment.group(2)),
-                                column,
+                        column = data_column(assignment.group(1))
+                        column_key = column.lower()
+                        if column_key in retain_vars:
+                            retain_column, retain_initial = retain_vars[column_key]
+                            reset_info = retain_resets.get(column_key)
+                            retain_reset_key = reset_info[0] if reset_info else None
+                            retain_reset_value = reset_info[1] if reset_info else None
+                            if column_key in retain_seen:
+                                raise ConversionError(
+                                    "A retained accumulator can be updated only once "
+                                    "per DATA-step iteration."
+                                )
+                            accumulator_match = re.fullmatch(
+                                rf"{re.escape(retain_column)}\s*\+\s*(.+)",
+                                assignment.group(2),
+                                re.IGNORECASE | re.DOTALL,
                             )
-                        )
+                            if not accumulator_match:
+                                raise ConversionError(
+                                    "RETAIN supports only accumulator assignments of "
+                                    "the form variable = variable + expression."
+                                )
+                            increment = accumulator_match.group(1).strip()
+                            if re.search(
+                                rf"\b{re.escape(retain_column)}\b",
+                                increment,
+                                re.IGNORECASE,
+                            ):
+                                raise ConversionError(
+                                    "RETAIN accumulator increments cannot reference "
+                                    "the retained variable."
+                                )
+                            actions.append(
+                                _DataAction(
+                                    kind="retain_sum",
+                                    expression=data_expression(increment),
+                                    column=column,
+                                    retain_initial=retain_initial,
+                                    retain_partition=(
+                                        by_columns[
+                                            : next(
+                                                key_index
+                                                for key_index, key in enumerate(by_columns)
+                                                if key.lower() == retain_reset_key.lower()
+                                            )
+                                            + 1
+                                        ]
+                                        if by_columns is not None
+                                        and retain_reset_key is not None
+                                        else ()
+                                    ),
+                                    retain_reset=retain_reset_value,
+                                )
+                            )
+                            retain_seen.add(column_key)
+                        else:
+                            actions.append(
+                                _DataAction(
+                                    "assign",
+                                    data_expression(assignment.group(2)),
+                                    column,
+                                )
+                            )
             except ConversionError as error:
                 raise ConversionError(
                     error.message,
@@ -1720,7 +2185,51 @@ class SasToPySparkConverter:
                     "BY-group RETAIN requires an IF FIRST.<BY key> reset before "
                     "each accumulator assignment."
                 )
+        for _, _, index_columns, loop_context in dynamic_array_reads.values():
+            for index_column in index_columns:
+                if (
+                    loop_context is not None
+                    and index_column.casefold() == loop_context[0].casefold()
+                ):
+                    continue
+                if any(
+                    (
+                        action.column is not None
+                        and action.column.casefold() == index_column.casefold()
+                    )
+                    or (
+                        action.kind in {"missing", "array_assign"}
+                        and any(
+                            column.casefold() == index_column.casefold()
+                            for column in action.columns
+                        )
+                    )
+                    or any(
+                        column.casefold() == index_column.casefold()
+                        for column, _ in action.loop_assignments
+                    )
+                    for action in actions
+                ):
+                    raise ConversionError(
+                        f"Dynamic array index variable {index_column!r} cannot be "
+                        "assigned in the same DATA step."
+                    )
 
+        dynamic_array_access_ids = {
+            (
+                tuple(element.casefold() for element in elements),
+                index_expression.casefold(),
+                loop_context[0].casefold() if loop_context is not None else None,
+            ): access_index
+                for access_index, (
+                    elements,
+                    index_expression,
+                    _,
+                    loop_context,
+                ) in enumerate(
+                dynamic_array_reads.values()
+            )
+        }
         lines: list[str] = []
         if sources is not None:
             lines.append(f"{_python_name(target)} = {_python_name(sources[0])}")
@@ -1728,6 +2237,136 @@ class SasToPySparkConverter:
                 lines.append(
                     f"{_python_name(target)} = {_python_name(target)}.unionByName("
                     f"{_python_name(source)}, allowMissingColumns=True)"
+                )
+        for read_index, (
+            elements,
+            index_expression,
+            index_columns,
+            loop_context,
+        ) in enumerate(dynamic_array_reads.values()):
+            frame = _python_name(target)
+            element_matches = f"__sas2pyspark_array_elements_{read_index}"
+            index_matches = f"__sas2pyspark_array_index_matches_{read_index}"
+            resolved_elements = f"__sas2pyspark_array_columns_{read_index}"
+            resolved_indexes = f"__sas2pyspark_array_index_columns_{read_index}"
+            raw_index = f"__sas2pyspark_array_index_value_{read_index}"
+            integer_index = f"{raw_index}_integer"
+            input_index_columns = tuple(
+                name
+                for name in index_columns
+                if loop_context is None
+                or name.casefold() != loop_context[0].casefold()
+            )
+            lines.extend(
+                [
+                    f"{element_matches} = [[column for column in {frame}.columns "
+                    f"if column.casefold() == name.casefold()] for name in {list(elements)!r}]",
+                    f"if any(len(matches) != 1 for matches in {element_matches}):",
+                    "    raise ValueError('Dynamic SAS array elements must exist exactly once in the input DataFrame.')",
+                    f"{resolved_elements} = [matches[0] for matches in {element_matches}]",
+                    f"{index_matches} = [[column for column in {frame}.columns "
+                    f"if column.casefold() == name.casefold()] "
+                    f"for name in {list(input_index_columns)!r}]",
+                    f"if any(len(matches) != 1 for matches in {index_matches}):",
+                    "    raise ValueError('Dynamic SAS array index columns must exist exactly once in the input DataFrame.')",
+                    f"{resolved_indexes} = [matches[0] for matches in {index_matches}]",
+                    "from pyspark.sql.types import NumericType as __sas2pyspark_numeric_type",
+                    f"if any(not isinstance({frame}.schema[column].dataType, "
+                    f"__sas2pyspark_numeric_type) for column in {resolved_indexes}):",
+                    "    raise TypeError('Dynamic SAS array index variables must be numeric.')",
+                    f"if any({frame}.schema[column].dataType != "
+                    f"{frame}.schema[{resolved_elements}[0]].dataType "
+                    f"for column in {resolved_elements}[1:]):",
+                    "    raise TypeError('Dynamic SAS array elements must have one Spark data type.')",
+                ]
+            )
+            if loop_context is None:
+                lines.extend(
+                    [
+                        f"{raw_index} = F.expr({index_expression!r})",
+                        f"{integer_index} = {raw_index}.cast('int')",
+                        f"if {frame}.filter({raw_index}.isNull() | "
+                        f"{integer_index}.isNull() | ({raw_index} != {integer_index}) | "
+                        f"({integer_index} < 1) | ({integer_index} > {len(elements)}))"
+                        ".limit(1).count():",
+                        "    raise ValueError('Dynamic SAS array index is missing, non-integer, or outside the declared bounds.')",
+                    ]
+                )
+            else:
+                loop_variable, loop_start, loop_stop, loop_step = loop_context
+                loop_alias = f"__sas2pyspark_array_loop_{read_index}"
+                loop_state_alias = f"__sas2pyspark_array_valid_{read_index}"
+                start_sql = (
+                    str(loop_start)
+                    if isinstance(loop_start, int)
+                    else loop_start
+                )
+                stop_sql = (
+                    str(loop_stop)
+                    if isinstance(loop_stop, int)
+                    else loop_stop
+                )
+                if loop_step > 0:
+                    loop_sequence = (
+                        f"CASE WHEN ({start_sql}) <= ({stop_sql}) "
+                        f"THEN sequence(CAST(({start_sql}) AS BIGINT), "
+                        f"CAST(({stop_sql}) AS BIGINT), {loop_step}) "
+                        "ELSE CAST(array() AS ARRAY<BIGINT>) END"
+                    )
+                else:
+                    loop_sequence = (
+                        f"CASE WHEN ({start_sql}) >= ({stop_sql}) "
+                        f"THEN sequence(CAST(({start_sql}) AS BIGINT), "
+                        f"CAST(({stop_sql}) AS BIGINT), {loop_step}) "
+                        "ELSE CAST(array() AS ARRAY<BIGINT>) END"
+                    )
+                loop_index_expression = re.sub(
+                    rf"(?<![\w.]){re.escape(loop_variable)}(?![\w.(])",
+                    loop_alias,
+                    index_expression,
+                    flags=re.IGNORECASE,
+                )
+                raw_sql = f"({loop_index_expression})"
+                integer_sql = f"CAST({raw_sql} AS INT)"
+                start_integer_sql = f"CAST(({start_sql}) AS BIGINT)"
+                stop_integer_sql = f"CAST(({stop_sql}) AS BIGINT)"
+                start_measure_sql = f"CAST(({start_sql}) AS DECIMAL(38, 0))"
+                stop_measure_sql = f"CAST(({stop_sql}) AS DECIMAL(38, 0))"
+                if loop_step > 0:
+                    loop_active = (
+                        f"({start_sql}) IS NOT NULL AND ({stop_sql}) IS NOT NULL "
+                        f"AND ({start_sql}) = {start_integer_sql} "
+                        f"AND ({stop_sql}) = {stop_integer_sql} "
+                        f"AND ({start_integer_sql}) <= ({stop_integer_sql}) "
+                        f"AND FLOOR(({stop_measure_sql} - {start_measure_sql}) / "
+                        f"{loop_step}) + 1 <= 5000"
+                    )
+                else:
+                    loop_active = (
+                        f"({start_sql}) IS NOT NULL AND ({stop_sql}) IS NOT NULL "
+                        f"AND ({start_sql}) = {start_integer_sql} "
+                        f"AND ({stop_sql}) = {stop_integer_sql} "
+                        f"AND ({start_integer_sql}) >= ({stop_integer_sql}) "
+                        f"AND FLOOR(({start_measure_sql} - {stop_measure_sql}) / "
+                        f"{abs(loop_step)}) + 1 <= 5000"
+                    )
+                loop_sequence = loop_sequence.replace(
+                    f"CASE WHEN ",
+                    f"CASE WHEN {loop_active} AND ",
+                    1,
+                )
+                invalid_sql = (
+                    f"aggregate({loop_sequence}, false, "
+                    f"({loop_state_alias}, {loop_alias}) -> {loop_state_alias} OR "
+                    f"({raw_sql} IS NULL OR {integer_sql} IS NULL OR "
+                    f"{raw_sql} <> {integer_sql} OR {integer_sql} < 1 OR "
+                    f"{integer_sql} > {len(elements)}))"
+                )
+                lines.extend(
+                    [
+                        f"if {frame}.filter(F.expr({invalid_sql!r})).limit(1).count():",
+                        "    raise ValueError('Dynamic SAS array index is missing, non-integer, or outside the declared bounds.')",
+                    ]
                 )
         for condition in where_filters:
             lines.append(f"{_python_name(target)} = {_python_name(target)}.filter(F.expr({condition!r}))")
@@ -1741,18 +2380,25 @@ class SasToPySparkConverter:
             ),
             None,
         )
-        order_sensitive = (
-            row_number_action is not None
-            or bool(retain_vars)
-            or bool(by_flags_used)
-            or any(
-                "lag(" in action.expression.casefold()
-                or " over (" in action.expression.casefold()
-                for action in actions
-            )
+        data_step_ir = DataStepIR(
+            target=target,
+            source_line=statements[start].line,
+            actions=tuple(actions),
+            order_by_keys=order_by_keys,
+            has_retained_state=bool(retain_vars),
+            by_flags=frozenset(by_flags_used),
+            has_row_number=row_number_action is not None,
         )
-        if order_by_keys is not None and order_sensitive:
-            order_names = [name for name, _ in order_by_keys]
+        order_sensitive = data_step_ir.requires_deterministic_order
+        if order_sensitive and data_step_ir.order_by_keys is None:
+            raise ConversionError(
+                f"DATA step {data_step_ir.target!r} uses order-sensitive "
+                "operations, which require an explicit ORDER BY with unique "
+                "keys because Spark does not preserve SAS observation order.",
+                line=data_step_ir.source_line,
+            )
+        if data_step_ir.order_by_keys is not None and order_sensitive:
+            order_names = [name for name, _ in data_step_ir.order_by_keys]
             lines.extend(
                 [
                     f"__sas2pyspark_order_matches = [[column for column in "
@@ -1888,6 +2534,9 @@ class SasToPySparkConverter:
                     matches = (
                         f"__sas2pyspark_missing_matches_{action_index}_{column_index}"
                     )
+                    value = (
+                        f"__sas2pyspark_missing_value_{action_index}_{column_index}"
+                    )
                     lines.extend(
                         [
                             f"{matches} = [name for name in {frame}.columns "
@@ -1895,13 +2544,56 @@ class SasToPySparkConverter:
                             f"if len({matches}) > 1:",
                             "    raise ValueError('CALL MISSING variable is "
                             "ambiguous in the input DataFrame.')",
-                            f"{frame} = {frame}.withColumn("
-                            f"{matches}[0] if {matches} else {column!r}, "
-                            f"F.lit(None).cast("
+                            f"{value} = F.lit(None).cast("
                             f"{frame}.schema[{matches}[0]].dataType "
-                            f"if {matches} else 'double'))",
+                            f"if {matches} else 'double')",
                         ]
                     )
+                    if action.condition is not None:
+                        lines.append(
+                            f"{value} = F.when(F.expr({action.condition!r}), {value})"
+                            f".otherwise(F.col({matches}[0]) if {matches} "
+                            f"else F.lit(None).cast('double'))"
+                        )
+                    lines.append(
+                        f"{frame} = {frame}.withColumn("
+                        f"{matches}[0] if {matches} else {column!r}, {value})"
+                    )
+            elif action.kind == "array_assign" and action.array_index is not None:
+                frame = _python_name(target)
+                access_index = dynamic_array_access_ids[
+                    (
+                        tuple(element.casefold() for element in action.columns),
+                        action.array_index.casefold(),
+                        (
+                            action.array_loop_variable.casefold()
+                            if action.array_loop_variable is not None
+                            else None
+                        ),
+                    )
+                ]
+                resolved_elements = f"__sas2pyspark_array_columns_{access_index}"
+                raw_index = f"__sas2pyspark_array_index_value_{access_index}"
+                integer_index = f"{raw_index}_integer"
+                value = f"__sas2pyspark_array_assignment_{action_index}"
+                lines.extend(
+                    [
+                        f"if any(column.casefold() == {value!r}.casefold() "
+                        f"for column in {frame}.columns):",
+                        "    raise ValueError('Dynamic SAS array assignment temporary column conflicts with an input column.')",
+                        f"{frame} = {frame}.withColumn({value!r}, "
+                        f"F.expr({action.expression!r}))",
+                    ]
+                )
+                for element_index in range(1, len(action.columns) + 1):
+                    lines.append(
+                        f"{frame} = {frame}.withColumn("
+                        f"{resolved_elements}[{element_index - 1}], "
+                        f"F.when({integer_index} == {element_index}, "
+                        f"F.col({value!r})).otherwise("
+                        f"F.col({resolved_elements}[{element_index - 1}])))"
+                    )
+                lines.append(f"{frame} = {frame}.drop({value!r})")
             elif (
                 action.kind == "retain_sum"
                 and action.column is not None
@@ -2013,17 +2705,472 @@ class SasToPySparkConverter:
                     f".otherwise(F.expr({action.otherwise!r})))"
                 )
             elif (
-                action.kind == "do_output"
+                action.kind in {"do_output", "do_runtime"}
                 and action.column is not None
                 and action.loop_start is not None
                 and action.loop_stop is not None
                 and action.loop_step is not None
             ):
-                if (
+                if action.loop_bound_columns:
+                    frame = _python_name(target)
+                    matches = f"__sas2pyspark_loop_bound_matches_{action_index}"
+                    resolved = f"__sas2pyspark_loop_bound_columns_{action_index}"
+                    start_value = f"__sas2pyspark_loop_start_{action_index}"
+                    stop_value = f"__sas2pyspark_loop_stop_{action_index}"
+                    start_integer = f"{start_value}_integer"
+                    stop_integer = f"{stop_value}_integer"
+                    lines.extend(
+                        [
+                            f"{matches} = [[column for column in {frame}.columns "
+                            f"if column.casefold() == name.casefold()] "
+                            f"for name in {list(action.loop_bound_columns)!r}]",
+                            f"if any(len(found) != 1 for found in {matches}):",
+                            "    raise ValueError('Dynamic DO loop bound columns must exist exactly once in the input DataFrame.')",
+                            f"{resolved} = [found[0] for found in {matches}]",
+                            "from pyspark.sql.types import NumericType as __sas2pyspark_numeric_type",
+                            f"if any(not isinstance({frame}.schema[column].dataType, "
+                            f"__sas2pyspark_numeric_type) for column in {resolved}):",
+                            "    raise TypeError('Dynamic DO loop bound columns must be numeric.')",
+                        ]
+                    )
+                    start_column = (
+                        f"F.lit({action.loop_start})"
+                        if isinstance(action.loop_start, int)
+                        else f"F.expr({action.loop_start!r})"
+                    )
+                    stop_column = (
+                        f"F.lit({action.loop_stop})"
+                        if isinstance(action.loop_stop, int)
+                        else f"F.expr({action.loop_stop!r})"
+                    )
+                    lines.extend(
+                        [
+                            f"{start_value} = {start_column}",
+                            f"{stop_value} = {stop_column}",
+                            f"{start_integer} = {start_value}.cast('long')",
+                            f"{stop_integer} = {stop_value}.cast('long')",
+                            f"if {frame}.filter({start_value}.isNull() | "
+                            f"{stop_value}.isNull() | {start_integer}.isNull() | "
+                            f"{stop_integer}.isNull() | ({start_value} != {start_integer}) | "
+                            f"({stop_value} != {stop_integer})).limit(1).count():",
+                            "    raise ValueError('Dynamic DO loop bounds must be present integers.')",
+                        ]
+                    )
+                    if action.loop_step > 0:
+                        active = f"({start_integer} <= {stop_integer})"
+                        start_measure = f"{start_integer}.cast('decimal(38, 0)')"
+                        stop_measure = f"{stop_integer}.cast('decimal(38, 0)')"
+                        count = (
+                            f"F.floor(({stop_measure} - {start_measure}) / "
+                            f"{action.loop_step}) + 1"
+                        )
+                    else:
+                        active = f"({start_integer} >= {stop_integer})"
+                        start_measure = f"{start_integer}.cast('decimal(38, 0)')"
+                        stop_measure = f"{stop_integer}.cast('decimal(38, 0)')"
+                        count = (
+                            f"F.floor(({start_measure} - {stop_measure}) / "
+                            f"{abs(action.loop_step)}) + 1"
+                        )
+                    lines.extend(
+                        [
+                            f"if {frame}.filter(F.when({active}, {count})"
+                            f".otherwise(F.lit(0)) > 5000).limit(1).count():",
+                            "    raise ValueError('Dynamic DO loop exceeds the 5000-iteration limit.')",
+                        ]
+                    )
+                    if action.kind == "do_runtime":
+                        last_value = f"__sas2pyspark_loop_last_value_{action_index}"
+                        lines.extend(
+                            [
+                                f"if any(column.casefold() == {last_value!r}.casefold() "
+                                f"for column in {frame}.columns):",
+                                "    raise ValueError('Dynamic DO loop temporary column conflicts with an input column.')",
+                            ]
+                        )
+                        if action.loop_step > 0:
+                            last_offset = (
+                                f"F.floor(({stop_measure} - {start_measure}) / "
+                                f"{action.loop_step}) * {action.loop_step}"
+                            )
+                        else:
+                            last_offset = (
+                                f"F.floor(({start_measure} - {stop_measure}) / "
+                                f"{abs(action.loop_step)}) * {abs(action.loop_step)}"
+                            )
+                            last_offset = f"-({last_offset})"
+                        last_expression = (
+                            f"F.when({active}, {start_integer} + "
+                            f"({last_offset}).cast('long')).otherwise({start_integer})"
+                        )
+                        lines.append(
+                            f"{frame} = {frame}.withColumn({last_value!r}, "
+                            f"{last_expression})"
+                        )
+                        assigned_names = tuple(
+                            dict.fromkeys(
+                                column.casefold()
+                                for column, _ in action.loop_assignments
+                            )
+                        )
+                        stateful_delete = any(
+                            re.search(
+                                rf"(?<![\w.]){re.escape(assigned_name)}(?![\w.(])",
+                                condition,
+                                re.IGNORECASE,
+                            )
+                            for condition in action.loop_delete_conditions
+                            for assigned_name in assigned_names
+                        )
+                        stateful = stateful_delete or (
+                            len(action.loop_assignments) > 1
+                            or any(
+                                re.search(
+                                    rf"(?<![\w.]){re.escape(assigned_name)}(?![\w.(])",
+                                    expression,
+                                    re.IGNORECASE,
+                                )
+                                for _, expression in action.loop_assignments
+                                for assigned_name in assigned_names
+                            )
+                        )
+                        if action.loop_delete_conditions and not stateful_delete:
+                            loop_iteration = (
+                                f"__sas2pyspark_delete_iteration_{action_index}"
+                            )
+                            loop_state = (
+                                f"__sas2pyspark_delete_state_{action_index}"
+                            )
+                            start_sql = (
+                                str(action.loop_start)
+                                if isinstance(action.loop_start, int)
+                                else action.loop_start
+                            )
+                            stop_sql = (
+                                str(action.loop_stop)
+                                if isinstance(action.loop_stop, int)
+                                else action.loop_stop
+                            )
+                            direction = "<=" if action.loop_step > 0 else ">="
+                            delete_sequence = (
+                                f"CASE WHEN ({start_sql}) {direction} ({stop_sql}) "
+                                f"THEN sequence(CAST(({start_sql}) AS BIGINT), "
+                                f"CAST(({stop_sql}) AS BIGINT), {action.loop_step}) "
+                                "ELSE CAST(array() AS ARRAY<BIGINT>) END"
+                            )
+                            delete_expressions = []
+                            for condition in action.loop_delete_conditions:
+                                iteration_condition = _map_unquoted(
+                                    condition,
+                                    lambda part: re.sub(
+                                        rf"(?<![\w.]){re.escape(action.column)}"
+                                        rf"(?![\w.(])",
+                                        loop_iteration,
+                                        part,
+                                        flags=re.IGNORECASE,
+                                    ),
+                                )
+                                delete_expressions.append(
+                                    f"aggregate({delete_sequence}, false, "
+                                    f"({loop_state}, {loop_iteration}) -> "
+                                    f"{loop_state} OR coalesce(("
+                                    f"{iteration_condition}), false))"
+                                )
+                            delete_sql = " OR ".join(
+                                f"({expression})"
+                                for expression in delete_expressions
+                            )
+                            lines.append(
+                                f"{frame} = {frame}.filter(~F.expr("
+                                f"{delete_sql!r}))"
+                            )
+                        if stateful:
+                            target_matches = (
+                                f"__sas2pyspark_loop_target_matches_{action_index}"
+                            )
+                            resolved_targets = (
+                                f"__sas2pyspark_loop_targets_{action_index}"
+                            )
+                            target_types = (
+                                f"__sas2pyspark_loop_target_types_{action_index}"
+                            )
+                            state_value = (
+                                f"__sas2pyspark_loop_state_{action_index}"
+                            )
+                            post_value = (
+                                f"__sas2pyspark_loop_post_value_{action_index}"
+                            )
+                            for helper in (state_value, post_value):
+                                lines.extend(
+                                    [
+                                        f"if any(column.casefold() == {helper!r}.casefold() "
+                                        f"for column in {frame}.columns):",
+                                        "    raise ValueError('Dynamic DO loop temporary column conflicts with an input column.')",
+                                    ]
+                                )
+                            lines.extend(
+                                [
+                                    f"{target_matches} = [[column for column in "
+                                    f"{frame}.columns if column.casefold() == name.casefold()] "
+                                    f"for name in {list(assigned_names)!r}]",
+                                    f"if any(len(found) != 1 for found in {target_matches}):",
+                                    "    raise ValueError('Stateful dynamic DO loop assignment columns must exist exactly once in the input DataFrame.')",
+                                    f"{resolved_targets} = [found[0] for found in {target_matches}]",
+                                    f"{target_types} = [{frame}.schema[column].dataType.simpleString() "
+                                    f"for column in {resolved_targets}]",
+                                    f"if any(data_type == 'void' for data_type in {target_types}):",
+                                    "    raise TypeError('Stateful dynamic DO loop assignment columns must have concrete Spark data types.')",
+                                    f"{state_value}_types = []",
+                                    f"for data_type in {target_types}:",
+                                    "    if data_type.startswith('decimal('):",
+                                    f"        {state_value}_types.append("
+                                    "'decimal(38,' + data_type.split(',')[1].rstrip(')') + ')')",
+                                    "    else:",
+                                    f"        {state_value}_types.append(data_type)",
+                                    f"{frame} = {frame}.withColumn({post_value!r}, "
+                                    f"F.when({active}, F.col({last_value!r}) + "
+                                    f"F.lit({action.loop_step})).otherwise("
+                                    f"{start_integer}))",
+                                ]
+                            )
+                            field_by_name = {
+                                name: field_index
+                                for field_index, name in enumerate(assigned_names)
+                            }
+                            loop_iteration = (
+                                f"__sas2pyspark_loop_iteration_{action_index}"
+                            )
+                            step_state = f"__sas2pyspark_step_state_{action_index}"
+                            step_number = f"__sas2pyspark_step_number_{action_index}"
+                            state_fields = tuple(
+                                f"_v{field_index}"
+                                for field_index in range(len(assigned_names))
+                            )
+
+                            def replace_state_identifiers(part: str) -> str:
+                                translated = re.sub(
+                                    rf"(?<![\w.]){re.escape(action.column)}"
+                                    rf"(?![\w.(])",
+                                    loop_iteration,
+                                    part,
+                                    flags=re.IGNORECASE,
+                                )
+                                for field_name, field_index in sorted(
+                                    field_by_name.items(),
+                                    key=lambda entry: -len(entry[0]),
+                                ):
+                                    translated = re.sub(
+                                        rf"`{re.escape(field_name)}`",
+                                        f"{step_state}._v{field_index}",
+                                        translated,
+                                        flags=re.IGNORECASE,
+                                    )
+                                    translated = re.sub(
+                                        rf"(?<![\w.]){re.escape(field_name)}"
+                                        rf"(?![\w.(])",
+                                        f"{step_state}._v{field_index}",
+                                        translated,
+                                        flags=re.IGNORECASE,
+                                    )
+                                return translated
+
+                            rewritten_assignments = [
+                                (
+                                    field_by_name[column.casefold()],
+                                    _map_unquoted(
+                                        expression, replace_state_identifiers
+                                    ),
+                                )
+                                for column, expression in action.loop_assignments
+                            ]
+                            start_sql = (
+                                str(action.loop_start)
+                                if isinstance(action.loop_start, int)
+                                else action.loop_start
+                            )
+                            stop_sql = (
+                                str(action.loop_stop)
+                                if isinstance(action.loop_stop, int)
+                                else action.loop_stop
+                            )
+                            sequence_sql = (
+                                f"CASE WHEN ({start_sql}) "
+                                f"{'<=' if action.loop_step > 0 else '>='} "
+                                f"({stop_sql}) "
+                                f"THEN sequence(CAST(({start_sql}) AS BIGINT), "
+                                f"CAST(({stop_sql}) AS BIGINT), {action.loop_step}) "
+                                "ELSE CAST(array() AS ARRAY<BIGINT>) END"
+                            )
+                            loop_operations = action.loop_operations or tuple(
+                                ("assignment", assignment_index)
+                                for assignment_index in range(
+                                    len(action.loop_assignments)
+                                )
+                            )
+                            lines.extend(
+                                [
+                                    f"{state_value}_sequence_sql = {sequence_sql!r}",
+                                    f"{state_value}_initial_parts = []",
+                                    f"for __loop_field_{action_index}, "
+                                    f"__loop_column_{action_index} in enumerate({resolved_targets}):",
+                                    f"    __loop_quoted_{action_index} = "
+                                    f"'`' + __loop_column_{action_index}.replace('`', '``') + '`'",
+                                    f"    {state_value}_initial_parts.extend(("
+                                    f"repr({list(state_fields)!r}[__loop_field_{action_index}]), "
+                                    f"'CAST(' + __loop_quoted_{action_index} + ' AS ' + "
+                                    f"{state_value}_types[__loop_field_{action_index}] + ')'))",
+                                    f"{state_value}_initial_parts.extend((repr('_deleted'), 'false'))",
+                                    f"{state_value}_initial = 'named_struct(' + ', '.join("
+                                    f"{state_value}_initial_parts) + ')'",
+                                    f"{state_value}_branches = []",
+                                ]
+                            )
+                            for operation_index, (operation, value) in enumerate(
+                                loop_operations
+                            ):
+                                if operation == "assignment":
+                                    updated_field, expression = rewritten_assignments[
+                                        int(value)
+                                    ]
+                                    lines.extend(
+                                        [
+                                            f"{state_value}_fields_{operation_index} = []",
+                                            f"for __loop_state_field_{operation_index} in range({len(assigned_names)}):",
+                                            f"    if __loop_state_field_{operation_index} == {updated_field}:",
+                                            f"        __loop_field_value_{operation_index} = "
+                                            f"'CAST((' + {expression!r} + ') AS ' + "
+                                            f"{state_value}_types[{updated_field}] + ')'",
+                                            "    else:",
+                                            f"        __loop_field_value_{operation_index} = "
+                                            f"f'{step_state}._v{{__loop_state_field_{operation_index}}}'",
+                                            f"    {state_value}_fields_{operation_index}.extend(("
+                                            f"repr({list(state_fields)!r}[__loop_state_field_{operation_index}]), "
+                                            f"__loop_field_value_{operation_index}))",
+                                            f"{state_value}_fields_{operation_index}.extend(("
+                                            f"repr('_deleted'), f'{step_state}._deleted'))",
+                                            f"{state_value}_branches.append("
+                                            f"f'WHEN {step_number} = {operation_index} THEN "
+                                            f"named_struct(' + ', '.join("
+                                            f"{state_value}_fields_{operation_index}) + ')')",
+                                        ]
+                                    )
+                                elif operation == "delete":
+                                    delete_condition = _map_unquoted(
+                                        str(value), replace_state_identifiers
+                                    )
+                                    delete_fields = ", ".join(
+                                        f"repr({field_name!r}), "
+                                        f"f'{step_state}._v{field_index}'"
+                                        for field_index, field_name in enumerate(
+                                            state_fields
+                                        )
+                                    )
+                                    lines.extend(
+                                        [
+                                            f"{state_value}_delete_fields_{operation_index} = "
+                                            f"[{delete_fields}]",
+                                            f"{state_value}_delete_fields_{operation_index}.extend(("
+                                            f"repr('_deleted'), "
+                                            f"{f'{step_state}._deleted OR coalesce(({delete_condition}), false)'!r}))",
+                                            f"{state_value}_branches.append("
+                                            f"f'WHEN {step_number} = {operation_index} THEN "
+                                            f"named_struct(' + ', '.join("
+                                            f"{state_value}_delete_fields_{operation_index}) + ')')",
+                                        ]
+                                    )
+                                else:
+                                    raise AssertionError(
+                                        f"Unknown runtime DO loop operation: {operation!r}"
+                                    )
+                            lines.extend(
+                                [
+                                    f"{state_value}_step_sql = 'aggregate(array(' + "
+                                    f"', '.join(str(number) for number in "
+                                    f"range({len(loop_operations)})) + "
+                                    f"'), {state_value}_state, ({step_state}, "
+                                    f"{step_number}) -> CASE WHEN {step_state}._deleted "
+                                    f"THEN {step_state} ' + ' '.join("
+                                    f"{state_value}_branches) + ' ELSE {step_state} END)'",
+                                    f"{state_value}_sql = 'aggregate(' + "
+                                    f"{state_value}_sequence_sql + ', ' + "
+                                    f"{state_value}_initial + ', ({state_value}_state, "
+                                    f"{loop_iteration}) -> ' + {state_value}_step_sql + ')'",
+                                    f"{frame} = {frame}.withColumn({state_value!r}, "
+                                    f"F.expr({state_value}_sql))",
+                                    f"{frame} = {frame}.filter("
+                                    f"~F.col({state_value!r}).getField('_deleted'))",
+                                ]
+                            )
+                            for field_index in range(len(assigned_names)):
+                                lines.append(
+                                    f"{frame} = {frame}.withColumn("
+                                    f"{resolved_targets}[{field_index}], "
+                                    f"F.col({state_value!r}).getField("
+                                    f"{state_fields[field_index]!r}))"
+                                )
+                            lines.extend(
+                                [
+                                    f"{frame} = {frame}.withColumn({action.column!r}, "
+                                    f"F.col({post_value!r}))",
+                                    f"{frame} = {frame}.drop({state_value!r}, "
+                                    f"{post_value!r}, {last_value!r})",
+                                ]
+                            )
+                        elif action.loop_assignments:
+                            assigned_column, expression = action.loop_assignments[0]
+                            loop_reference = f"`{last_value}`"
+                            expression = _map_unquoted(
+                                expression,
+                                lambda part: re.sub(
+                                    rf"(?<![\w.]){re.escape(action.column)}"
+                                    rf"(?![\w.(])",
+                                    lambda _: loop_reference,
+                                    part,
+                                    flags=re.IGNORECASE,
+                                ),
+                            )
+                            lines.append(
+                                f"{frame} = {frame}.withColumn({assigned_column!r}, "
+                                f"F.when({active}, F.expr({expression!r})).otherwise("
+                                f"F.col({assigned_column!r}) if {assigned_column!r} "
+                                f"in {frame}.columns else F.lit(None)))"
+                            )
+                            lines.extend(
+                                [
+                                    f"{frame} = {frame}.withColumn({action.column!r}, "
+                                    f"F.when({active}, F.col({last_value!r}) + "
+                                    f"F.lit({action.loop_step})).otherwise("
+                                    f"{start_integer}))",
+                                    f"{frame} = {frame}.drop({last_value!r})",
+                                ]
+                            )
+                        else:
+                            lines.extend(
+                                [
+                                    f"{frame} = {frame}.withColumn("
+                                    f"{action.column!r}, F.when({active}, "
+                                    f"F.col({last_value!r}) + "
+                                    f"F.lit({action.loop_step})).otherwise("
+                                    f"{start_integer}))",
+                                    f"{frame} = {frame}.drop({last_value!r})",
+                                ]
+                            )
+                    else:
+                        lines.append(
+                            f"{frame} = {frame}.withColumn({action.column!r}, "
+                            f"F.explode(F.when({active}, F.sequence("
+                            f"{start_integer}, {stop_integer}, F.lit({action.loop_step})))"
+                            ".otherwise(F.array().cast('array<int>'))))"
+                        )
+                elif (
                     action.loop_step > 0
+                    and isinstance(action.loop_start, int)
+                    and isinstance(action.loop_stop, int)
                     and action.loop_start > action.loop_stop
                 ) or (
                     action.loop_step < 0
+                    and isinstance(action.loop_start, int)
+                    and isinstance(action.loop_stop, int)
                     and action.loop_start < action.loop_stop
                 ):
                     lines.append(
@@ -2037,6 +3184,7 @@ class SasToPySparkConverter:
                         f"F.lit({action.loop_start}), F.lit({action.loop_stop}), "
                         f"F.lit({action.loop_step}))))"
                     )
+                if action.kind == "do_output":
                     for column, expression in action.loop_assignments:
                         lines.append(
                             f"{_python_name(target)} = {_python_name(target)}.withColumn("
@@ -2098,9 +3246,8 @@ class SasToPySparkConverter:
         )
         if merge_action is not None and not any(merge_action.merge_order_keys):
             data_step_warnings.append(
-                "MERGE duplicate-key row pairing uses best-effort Spark input "
-                "order; specify ORDER_BY=(...) on every MERGE input for "
-                "deterministic pairing."
+                "MERGE execution rejects duplicate BY-key groups unless every "
+                "input supplies ORDER_BY=(...) for deterministic pairing."
             )
         if display_formats:
             data_step_warnings.append(
@@ -2166,6 +3313,19 @@ class SasToPySparkConverter:
             "            for __sas2pyspark_column, (_, __sas2pyspark_ascending) in zip(__sas2pyspark_merge_order_actual, __sas2pyspark_merge_order_names)",
             "        ]",
             "    else:",
+            "        __sas2pyspark_group_count_name = '__sas2pyspark_group_count'",
+            "        while __sas2pyspark_group_count_name.casefold() in {",
+            "                __sas2pyspark_column.casefold()",
+            "                for __sas2pyspark_column in __sas2pyspark_merge_frame.columns}:",
+            "            __sas2pyspark_group_count_name += '_'",
+            "        __sas2pyspark_group_counts = (",
+            "            __sas2pyspark_merge_frame",
+            "            .groupBy(*__sas2pyspark_merge_actual_keys)",
+            "            .agg(F.count(F.lit(1)).alias(__sas2pyspark_group_count_name)))",
+            "        if (__sas2pyspark_group_counts",
+            "                .filter(F.col(__sas2pyspark_group_count_name) > 1)",
+            "                .limit(1).count()):",
+            "            raise ValueError('SAS MERGE duplicate BY keys require ORDER_BY=(...) on every input for deterministic pairing.')",
             "        __sas2pyspark_merge_order_by = [F.monotonically_increasing_id()]",
             "    __sas2pyspark_merge_window = __sas2pyspark_window.partitionBy(*__sas2pyspark_merge_actual_keys)",
             "    __sas2pyspark_merge_numbered = (__sas2pyspark_merge_frame",

@@ -1,0 +1,19 @@
+{
+  "name": "retained_running_total_with_explicit_order",
+  "reference_origin": "curated",
+  "features": ["DATA step", "ORDER BY", "numeric RETAIN"],
+  "source": "data work.totals; set work.events; order by sequence; retain running 0; running = running + amount; keep sequence running; run;",
+  "inputs": {
+    "events": {
+      "schema": "sequence int, amount int",
+      "rows": [[3, 5], [1, 2], [2, 4]]
+    }
+  },
+  "outputs": {
+    "totals": {
+      "columns": ["sequence", "running"],
+      "types": ["int", "double"],
+      "rows": [[1, 2.0], [2, 6.0], [3, 11.0]]
+    }
+  }
+}

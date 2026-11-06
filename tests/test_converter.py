@@ -382,38 +382,28 @@ class ConverterTests(unittest.TestCase):
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
 
-    def test_retain_generates_numeric_running_total_and_warning(self):
+    def test_retain_generates_numeric_running_total_with_explicit_order(self):
         result = self.converter.convert(
             """
             data running;
+              order by sequence;
               retain total 10;
               set amounts;
               total = total + amount;
             run;
             """
         )
-        self.assertIn("F.monotonically_increasing_id()", result.code)
+        self.assertIn("F.col('sequence').asc()", result.code)
         self.assertIn("F.sum(F.col('__sas2pyspark_retain_delta')).over(", result.code)
         self.assertIn("F.lit(10.0)", result.code)
-        self.assertEqual(
-            sum(
-                not warning.startswith("SAS version profile:")
-                for warning in result.warnings
-            ),
-            1,
-        )
-        self.assertTrue(
-            any(
-                "Spark does not guarantee SAS observation order" in warning
-                for warning in result.warnings
-            )
-        )
+        self.assertFalse(any("RETAIN uses Spark" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_retain_generates_by_group_reset_running_total(self):
         result = self.converter.convert(
             """
             data running;
+              order by sequence;
               retain total 10;
               set amounts;
               by region department;
@@ -431,20 +421,13 @@ class ConverterTests(unittest.TestCase):
             "F.sum(F.col('__sas2pyspark_retain_delta')).over(",
             result.code,
         )
-        self.assertEqual(
-            sum(
-                not warning.startswith("SAS version profile:")
-                for warning in result.warnings
-            ),
-            2,
-        )
-        self.assertTrue(any("SAS observation order" in warning for warning in result.warnings))
-        self.assertTrue(any("row order is unspecified" in warning for warning in result.warnings))
+        self.assertFalse(any("best-effort" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_retain_multiple_declarations_and_rejections(self):
         result = self.converter.convert(
-            "data o; retain a b 0; retain c 5; set s; a = a + x; b = b + 1; c = c + x; run;"
+            "data o; order by sequence; retain a b 0; retain c 5; set s; "
+            "a = a + x; b = b + 1; c = c + x; run;"
         )
         self.assertEqual(result.code.count("F.sum("), 3)
         compile(result.code, "<generated-pyspark>", "exec")
@@ -518,12 +501,8 @@ class ConverterTests(unittest.TestCase):
         self.assertNotIn("marks[", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
 
-    def test_arrays_reject_dynamic_indexes_and_invalid_declarations(self):
+    def test_arrays_reject_dynamic_assignments_and_invalid_declarations(self):
         unsupported_sources = (
-            (
-                "data out; set source; array x[2] x1 x2; value=x[index]; run;",
-                "positive integer literal index",
-            ),
             (
                 "data out; set source; array x[2] x1 x2; value=x[3]; run;",
                 "outside 1..2",
@@ -551,6 +530,7 @@ class ConverterTests(unittest.TestCase):
         result = self.converter.convert(
             """
             data flagged;
+              order by sequence;
               set source;
               by region department;
               first_region = first.region;
@@ -572,9 +552,7 @@ class ConverterTests(unittest.TestCase):
         )
         self.assertIn("'__sas2pyspark_first_region'", result.code)
         self.assertIn("'__sas2pyspark_last_department'", result.code)
-        self.assertTrue(
-            any("row order is unspecified" in warning for warning in result.warnings)
-        )
+        self.assertFalse(any("best-effort" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
 
     def test_by_first_and_last_require_a_matching_by_statement(self):
@@ -599,6 +577,7 @@ class ConverterTests(unittest.TestCase):
         result = self.converter.convert(
             """
             data out;
+              order by sequence;
               set source;
               by descending region ascending department;
               is_first = first.region;
@@ -611,13 +590,20 @@ class ConverterTests(unittest.TestCase):
             "partitionBy(F.col('region'), F.col('department')).orderBy(",
             result.code,
         )
-        self.assertTrue(
-            any(
-                "best-effort observation order" in warning
-                for warning in result.warnings
-            )
-        )
+        self.assertFalse(any("best-effort" in warning for warning in result.warnings))
         compile(result.code, "<generated-pyspark>", "exec")
+
+    def test_by_first_and_last_require_explicit_order(self):
+        with self.assertRaisesRegex(ConversionError, "require an explicit ORDER BY"):
+            self.converter.convert(
+                "data out; set source; by group; is_first=first.group; run;"
+            )
+
+    def test_retained_state_requires_explicit_order(self):
+        with self.assertRaisesRegex(ConversionError, "explicit ORDER BY"):
+            self.converter.convert(
+                "data out; set source; retain total 0; total=total+amount; run;"
+            )
 
     def test_data_step_order_by_uses_explicit_unique_order_keys(self):
         result = self.converter.convert(
@@ -1062,7 +1048,7 @@ run;
     def test_lag_dif_and_set_options(self):
         code = SasToPySparkConverter().convert(
             "data b; set a(where=(x > 1) firstobs=2 obs=3 keep=id x rename=(x=amount)) c;"
-            " prev = lag(amount); d = dif2(amount); if lag(amount) > 1; run;"
+            " order by id; prev = lag(amount); d = dif2(amount); if lag(amount) > 1; run;"
         ).code
         self.assertIn("filter(F.expr('x > 1'))", code)
         self.assertIn("(F.col('__sas2pyspark_obs') >= 2) & (F.col('__sas2pyspark_obs') <= 3)", code)
@@ -1076,6 +1062,7 @@ run;
             "data b; set a(obs=0x); run;",
             "data b; set a(firstobs=0); run;",
             "data b; set a; y = lag(x, 1); run;",
+            "data b; set a; y = lag(x); order by id; order by group; run;",
             "data b; set a; y = lag101(x); run;",
         ):
             with self.assertRaises(ConversionError, msg=bad):
@@ -1135,7 +1122,7 @@ run;
     def test_nested_blocks_select_arrays_retain_and_length(self):
         converter = SasToPySparkConverter()
         code = converter.convert(
-            "data b; set a; retain carry ''; length tag $ 3; array q{*} q1-q3;"
+            "data b; set a; order by id; retain carry ''; length tag $ 3; array q{*} q1-q3;"
             " array m{2,2} m1-m4;"
             " do i = 1 to dim(q); q{i} = x * i; end; m{2,1} = 7;"
             " if x > 1 then do; if x > 4 then size = 'big'; else size = 'mid'; end;"
@@ -1152,10 +1139,11 @@ run;
         self.assertIn("substring(tag, 1, 3)", code)
         self.assertIn("drop(*['__sas2pyspark_retain_1'])", code)
         compile(code, "<generated-pyspark>", "exec")
+        with self.assertRaisesRegex(ConversionError, "_N_ requires a DATA-step ORDER BY"):
+            converter.convert("data out; set source; n = _N_; run;")
 
         for bad, message in (
             ("data b; set a; i = 0; do while (i < 3); i + 1; end; run;", "DO WHILE"),
-            ("data b; set a; do i = 1 to n; y = i; end; run;", "bounds must be integer"),
             ("data b; set a; array q{2} q1 q2; y = q{3}; run;", "outside 1..2"),
             ("data b; set a; array m{2,2} m1-m4; y = m{1}; run;", "subscript"),
             ("data b; set a; retain c ''; c = c || 'x'; run;", "own assignment"),
@@ -1168,6 +1156,53 @@ run;
                 converter.convert(bad)
             self.assertIn(message, caught.exception.message, bad)
 
+    def test_dynamic_array_reads_are_supported_and_checked(self):
+        converter = SasToPySparkConverter()
+        result = converter.convert(
+            "data out; set source; array values{3} v1-v3; selected = values[index]; run;"
+        )
+        self.assertIn(
+            "element_at(array(`v1`, `v2`, `v3`), CAST((index) AS INT))",
+            result.code,
+        )
+        self.assertIn("Dynamic SAS array index is missing, non-integer", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+        with self.assertRaisesRegex(ConversionError, "cannot be assigned in the same DATA step"):
+            converter.convert(
+                "data out; set source; array values{3} v1-v3; "
+                "index = 2; selected = values[index]; run;"
+            )
+        arithmetic = converter.convert(
+            "data out; set source; array values{3} v1-v3; "
+            "selected = values[index + 1]; run;"
+        )
+        self.assertIn("CAST((index + 1) AS INT)", arithmetic.code)
+        compile(arithmetic.code, "<generated-pyspark>", "exec")
+
+    def test_dynamic_array_writes_are_supported_and_checked(self):
+        converter = SasToPySparkConverter()
+        result = converter.convert(
+            "data out; set source; array values{3} v1-v3; values[index] = score; run;"
+        )
+        self.assertIn("Dynamic SAS array index", result.code)
+        self.assertIn("withColumn", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+        with self.assertRaisesRegex(
+            ConversionError, "identifiers, numeric literals"
+        ):
+            converter.convert(
+                "data out; set source; array values{3} v1-v3; "
+                "selected = values[index ** 2]; run;"
+            )
+        arithmetic = converter.convert(
+            "data out; set source; array values{3} v1-v3; "
+            "values[index + 1] = score; run;"
+        )
+        self.assertIn("array_index", arithmetic.code)
+        compile(arithmetic.code, "<generated-pyspark>", "exec")
+
     def test_datalines_and_row_number(self):
         source = """
 data a;
@@ -1178,7 +1213,7 @@ data a;
 2,Bob,
 ;
 run;
-data b; set a; rownum = _n_; if _n_ <= 1; keep id rownum; run;
+data b; set a; order by id; rownum = _n_; if _n_ <= 1; keep id rownum; run;
 """
         code = SasToPySparkConverter().convert(source).code
         self.assertIn("spark.createDataFrame([(1.0, 'Ann', 90.5), (2.0, 'Bob', None)]", code)
@@ -1200,9 +1235,16 @@ data b; set a; rownum = _n_; if _n_ <= 1; keep id rownum; run;
         )
         self.assertIn("F.lit(None).cast", result.code)
         compile(result.code, "<generated-pyspark>", "exec")
+        conditional = SasToPySparkConverter().convert(
+            "data out; set source; if clear_flag then call missing(score); run;"
+        )
+        self.assertIn("F.when(F.expr('clear_flag')", conditional.code)
+        self.assertIn(".otherwise(F.col(", conditional.code)
+        compile(conditional.code, "<generated-pyspark>", "exec")
         for source in (
             "data out; set source; call missing(); run;",
             "data out; set source; call missing(score + 1); run;",
+            "data out; set source; if clear_flag then call missing(score + 1); run;",
         ):
             with self.subTest(source=source):
                 with self.assertRaises(ConversionError):
@@ -1828,11 +1870,11 @@ run;
             ),
             (
                 "data out; set source; do index = 1.5 to 5; output; end; run;",
-                "integer literals or compile-time integer expressions",
+                "must reference an input column",
             ),
             (
-                "data out; set source; do index = 1 to limit; output; end; run;",
-                "bounds and step must be integer literals",
+                "data out; set source; do index = 1 to coalesce(limit, 5); output; end; run;",
+                "Dynamic DO loop bounds support identifiers",
             ),
             (
                 "data out; set source; do index = 1 to 5 by 2 - 2; output; end; run;",
@@ -1856,6 +1898,223 @@ run;
                 with self.assertRaises(ConversionError) as context:
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
+
+    def test_output_do_loop_accepts_runtime_numeric_bounds(self):
+        result = self.converter.convert(
+            """
+            data expanded;
+              set source;
+              do index = first_index to last_index by 2;
+                scaled = index * 10;
+                output;
+              end;
+            run;
+            """
+        )
+        self.assertIn("F.sequence(", result.code)
+        self.assertIn("F.expr('first_index')", result.code)
+        self.assertIn("F.expr('last_index')", result.code)
+        self.assertIn("NumericType", result.code)
+        self.assertIn("5000-iteration limit", result.code)
+        self.assertIn("F.expr('index * 10')", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+        arithmetic = self.converter.convert(
+            "data expanded; set source; do index = first_index + 1 to last_index; "
+            "output; end; run;"
+        )
+        self.assertIn("F.expr('first_index + 1')", arithmetic.code)
+        compile(arithmetic.code, "<generated-pyspark>", "exec")
+
+    def test_non_output_do_loop_accepts_restricted_runtime_bounds(self):
+        result = self.converter.convert(
+            """
+            data calculated;
+              set source;
+              do index = first_index to last_index by 2;
+                result = index * 10;
+              end;
+            run;
+            """
+        )
+        self.assertIn("Dynamic DO loop bound columns must be numeric", result.code)
+        self.assertIn("__sas2pyspark_loop_last_value", result.code)
+        self.assertIn("F.col('__sas2pyspark_loop_last_value_0')", result.code)
+        self.assertIn("withColumn('index'", result.code)
+        compile(result.code, "<generated-pyspark>", "exec")
+
+        array_read = self.converter.convert(
+            "data calculated; set source; array values{3} v1-v3; "
+            "selected = 0; do index = first_index to last_index; "
+            "selected = values[index]; end; run;"
+        )
+        self.assertIn("aggregate(CASE WHEN", array_read.code)
+        self.assertIn("element_at(array(`v1`, `v2`, `v3`)", array_read.code)
+        compile(array_read.code, "<generated-pyspark>", "exec")
+        array_write = self.converter.convert(
+            "data calculated; set source; array values{3} v1-v3; "
+            "do index = first_index to last_index; "
+            "values[index] = values[index] + 1; end; run;"
+        )
+        self.assertIn(
+            "CASE WHEN (__sas2pyspark_loop_iteration_0) = 1 THEN",
+            array_write.code,
+        )
+        self.assertIn("element_at(array(", array_write.code)
+        compile(array_write.code, "<generated-pyspark>", "exec")
+        conditional_array_write = self.converter.convert(
+            "data calculated; set source; array values{3} v1-v3; "
+            "do index = first_index to last_index; "
+            "if index = selected_index then values[index] = values[index] + 10; "
+            "else values[index] = values[index] + 1; end; run;"
+        )
+        self.assertIn("for name in ['v1', 'v2', 'v3']", conditional_array_write.code)
+        self.assertIn("= 1)) THEN", conditional_array_write.code)
+        compile(
+            conditional_array_write.code, "<generated-pyspark>", "exec"
+        )
+        nested_array_write = self.converter.convert(
+            "data calculated; set source; array values{3} v1-v3; "
+            "do index = first_index to last_index; "
+            "if index >= first_index then do; "
+            "if index = selected_index then do; "
+            "values[index] = values[index] + 10; end; "
+            "else do; values[index] = values[index] + 1; end; "
+            "end; end; run;"
+        )
+        self.assertIn("element_at(array(", nested_array_write.code)
+        compile(nested_array_write.code, "<generated-pyspark>", "exec")
+        with self.assertRaisesRegex(
+            ConversionError, "not supported in output-producing DO loops"
+        ):
+            self.converter.convert(
+                "data calculated; set source; array values{3} v1-v3; "
+                "do index = first_index to last_index; "
+                "values[index] = score; output; end; run;"
+            )
+        multiple = self.converter.convert(
+            "data calculated; set source; do index = first_index to last_index; "
+            "left_value = index; right_value = index + 1; end; run;"
+        )
+        compile(multiple.code, "<generated-pyspark>", "exec")
+        carried = self.converter.convert(
+            "data calculated; set source; do index = first_index to last_index; "
+            "total = total + index; doubled = total * 2; end; run;"
+        )
+        self.assertIn("_sequence_sql =", carried.code)
+        self.assertIn("aggregate(' +", carried.code)
+        compile(carried.code, "<generated-pyspark>", "exec")
+        single_carried = self.converter.convert(
+            "data calculated; set source; do index = first_index to last_index; "
+            "total = total + index; end; run;"
+        )
+        self.assertIn("_sequence_sql =", single_carried.code)
+        compile(single_carried.code, "<generated-pyspark>", "exec")
+        conditional_delete = self.converter.convert(
+            "data filtered; set source; "
+            "do index = first_index to last_index; "
+            "if index = cutoff then delete; end; run;"
+        )
+        self.assertIn(
+            "coalesce((__sas2pyspark_delete_iteration_0 = cutoff), false)",
+            conditional_delete.code,
+        )
+        self.assertIn(
+            "F.col('__sas2pyspark_loop_last_value_0') + F.lit(1)",
+            conditional_delete.code,
+        )
+        compile(conditional_delete.code, "<generated-pyspark>", "exec")
+        stateful_delete = self.converter.convert(
+            "data filtered; set source; "
+            "do index = first_index to last_index; "
+            "total = total + index; if total > 10 then delete; end; run;"
+        )
+        self.assertIn("._deleted OR coalesce", stateful_delete.code)
+        compile(stateful_delete.code, "<generated-pyspark>", "exec")
+        array_stateful_delete = self.converter.convert(
+            "data filtered; set source; array values{3} v1-v3; "
+            "do index = first_index to last_index; "
+            "values[index] = values[index] + 1; "
+            "if values[index] > cutoff then delete; end; run;"
+        )
+        self.assertIn("element_at(array(", array_stateful_delete.code)
+        self.assertIn(
+            "._deleted OR coalesce((element_at(array(",
+            array_stateful_delete.code,
+        )
+        compile(array_stateful_delete.code, "<generated-pyspark>", "exec")
+        with self.assertRaisesRegex(
+            ConversionError, "only in runtime-bounded non-OUTPUT"
+        ):
+            self.converter.convert(
+                "data filtered; set source; "
+                "do index = first_index to last_index; "
+                "if index = cutoff then delete; output; end; run;"
+            )
+        conditional = self.converter.convert(
+            "data calculated; set source; "
+            "do index = first_index to last_index; "
+            "if index = selected_index then total = total + increment; "
+            "else total = total + 1; end; run;"
+        )
+        self.assertIn("CASE WHEN", conditional.code)
+        self.assertIn("THEN (", conditional.code)
+        self.assertIn("ELSE (", conditional.code)
+        compile(conditional.code, "<generated-pyspark>", "exec")
+        else_if = self.converter.convert(
+            "data calculated; set source; "
+            "do index = first_index to last_index; "
+            "if index = 1 then total = 1; "
+            "else if index = 2 then total = 2; "
+            "else total = 3; end; run;"
+        )
+        self.assertIn("CASE WHEN", else_if.code)
+        self.assertIn("= 1) THEN (1)", else_if.code)
+        self.assertIn("= 2) THEN (2)", else_if.code)
+        compile(else_if.code, "<generated-pyspark>", "exec")
+        nested = self.converter.convert(
+            "data calculated; set source; "
+            "do index = first_index to last_index; "
+            "if index >= first_index then do; "
+            "total = total + index; "
+            "if index = selected_index then do; "
+            "total = total + increment; end; "
+            "else do; total = total + 1; end; "
+            "end; end; run;"
+        )
+        self.assertIn("CASE WHEN", nested.code)
+        compile(nested.code, "<generated-pyspark>", "exec")
+        different_targets = self.converter.convert(
+            "data calculated; set source; "
+            "do index = first_index to last_index; "
+            "if index = 1 then total = total + 1; "
+            "else if index = 2 then amount = amount + 2; "
+            "else total = total + 3; end; run;"
+        )
+        self.assertIn("for name in ['total', 'amount']", different_targets.code)
+        compile(different_targets.code, "<generated-pyspark>", "exec")
+        with self.assertRaisesRegex(
+            ConversionError, "only in runtime-bounded non-OUTPUT"
+        ):
+            self.converter.convert(
+                "data calculated; set source; "
+                "do index = first_index to last_index; "
+                "if index = 1 then total = 2; output; end; run;"
+            )
+        initialized = self.converter.convert(
+            "data calculated; set source; total = 0.0; doubled = 0; "
+            "do index = first_index to last_index; total = total + index; "
+            "doubled = total * 2; end; run;"
+        )
+        self.assertIn("withColumn('total', F.expr('0.0'))", initialized.code)
+        self.assertIn("withColumn('doubled', F.expr('0'))", initialized.code)
+        compile(initialized.code, "<generated-pyspark>", "exec")
+        with self.assertRaisesRegex(
+            ConversionError, "bounds cannot be assigned"
+        ):
+            self.converter.convert(
+                "data calculated; set source; do index = first_index to last_index; "
+                "last_index = last_index + 1; end; run;"
+            )
 
     def test_merge_by_generates_guarded_full_outer_match_merge(self):
         result = self.converter.convert(
@@ -1956,16 +2215,17 @@ run;
                     self.converter.convert(source)
                 self.assertIn(expected_message, str(context.exception))
 
-    def test_merge_without_input_order_keys_warns_about_pairing(self):
+    def test_merge_without_input_order_keys_guards_duplicate_groups(self):
         result = self.converter.convert(
             "data out; merge left right; by id; run;"
         )
         self.assertTrue(
             any(
-                "MERGE duplicate-key row pairing uses best-effort" in warning
+                "MERGE execution rejects duplicate BY-key groups" in warning
                 for warning in result.warnings
             )
         )
+        self.assertIn("duplicate BY keys require ORDER_BY", result.code)
 
     def test_merge_by_rejects_unsupported_forms(self):
         unsupported_sources = (

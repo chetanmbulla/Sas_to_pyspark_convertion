@@ -1,8 +1,7 @@
 """Support the automatic ``_N_`` variable in DATA steps.
 
-``_N_`` is rewritten to a helper column numbered by Spark's
-``monotonically_increasing_id()`` order, which is a best-effort stand-in for SAS
-observation order.
+``_N_`` is rewritten to a helper column numbered by an explicit DATA-step
+ORDER BY key because Spark does not preserve SAS observation order.
 """
 
 from __future__ import annotations
@@ -45,17 +44,23 @@ def rewrite_row_number(statements: list[MacroStatement]) -> list[MacroStatement]
             if parsed_order is not None:
                 order_keys = parsed_order
                 break
-        order_clause = (
-            order_by_sql(order_keys)
-            if order_keys
-            else "order by monotonically_increasing_id()"
-        )
-        if end >= len(statements) or not any(
+        uses_row_number = any(
             _N.search(_QUOTED.sub("''", item.text)) for item in body
-        ):
+        )
+        if end >= len(statements) or not uses_row_number:
             result.extend(statements[index : end + 1])
             index = end + 1
             continue
+        if order_keys is None:
+            statement = next(
+                item for item in body if _N.search(_QUOTED.sub("''", item.text))
+            )
+            raise MacroExpansionError(
+                "_N_ requires a DATA-step ORDER BY with unique keys; "
+                "Spark does not preserve SAS observation order.",
+                statement,
+            )
+        order_clause = order_by_sql(order_keys)
         last_input = max(
             (i for i, item in enumerate(body) if _INPUT_STATEMENT.match(item.text.strip())),
             default=-1,

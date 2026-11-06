@@ -1,0 +1,19 @@
+{
+  "name": "data_step_filter_and_upcase",
+  "reference_origin": "curated",
+  "features": ["DATA step", "WHERE", "UPCASE", "KEEP"],
+  "source": "data work.adults; set work.people; where age ge 18; full_name = upcase(name); keep full_name age; run;",
+  "inputs": {
+    "people": {
+      "schema": "name string, age int",
+      "rows": [["alice", 17], ["bob", 35], ["cara", 29]]
+    }
+  },
+  "outputs": {
+    "adults": {
+      "columns": ["full_name", "age"],
+      "types": ["string", "int"],
+      "rows": [["BOB", 35], ["CARA", 29]]
+    }
+  }
+}

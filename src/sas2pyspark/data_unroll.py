@@ -6,8 +6,9 @@
 * Constant array indexes (including simple integer arithmetic) become literals;
   two-dimensional indexes are flattened in row-major order.
 * Iterative ``DO i = a TO b [BY c]`` loops without ``OUTPUT`` are unrolled when the
-  bounds are constants or ``DIM(array)``. ``OUTPUT`` loops keep the dedicated
-  converter path. ``DO WHILE``/``DO UNTIL`` depend on run-time values and are rejected.
+  bounds are constants or ``DIM(array)``. Runtime-bound loops are preserved for the
+  converter's restricted Spark execution path. ``OUTPUT`` loops keep their dedicated
+  converter path. ``DO WHILE``/``DO UNTIL`` remain unsupported.
 """
 
 from __future__ import annotations
@@ -85,6 +86,17 @@ class _Step:
                 continue
             body = statements[index + 1 : end]
             if any(_has_output(part.text) for part in body):
+                output.extend(self._folded(part) for part in statements[index : end + 1])
+                index = end + 1
+                continue
+            if (
+                parse_constant_integer(header.group(2)) is None
+                or parse_constant_integer(header.group(3)) is None
+                or (
+                    header.group(4) is not None
+                    and parse_constant_integer(header.group(4)) is None
+                )
+            ):
                 output.extend(self._folded(part) for part in statements[index : end + 1])
                 index = end + 1
                 continue

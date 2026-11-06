@@ -15,6 +15,7 @@ reviewed and validated against representative data before production use.
 - [Use the Streamlit GUI](#use-the-streamlit-gui)
 - [Use the Python API](#use-the-python-api)
 - [Conversion process](docs/conversion_process.md)
+- [SAS coverage and compatibility policy](docs/sas-coverage.md)
 - [Examples](#examples)
 - [Progressive SAS and CSV examples](#progressive-gui-test-programs)
 - [Supported syntax and limitations](#supported-syntax)
@@ -193,7 +194,7 @@ and execute it.
 
 ## Supported syntax
 
-- DATA steps with one or more `SET` inputs and the supported dataset options, filters, assignments, `CALL MISSING` for explicit variable names, nested `IF`/`DO`/`SELECT`, numeric accumulator and character/conditional `RETAIN` subsets, static arrays and bounded loop unrolling, `BY` flags, `OUTPUT` routing, inline `DATALINES`, `_N_`, `LAG`/`DIF`, and the `ORDER BY` deterministic-order extension (see the detailed limitations below).
+- DATA steps with one or more `SET` inputs and the supported dataset options, filters, assignments, `CALL MISSING` for explicit variable names, nested `IF`/`DO`/`SELECT`, numeric accumulator and character/conditional `RETAIN` subsets, static arrays, checked dynamic-index array reads/writes and bounded loop unrolling, `BY` flags, `OUTPUT` routing, inline `DATALINES`, `_N_`, `LAG`/`DIF`, and the `ORDER BY` deterministic-order extension (see the detailed limitations below).
 - Sequential `%LET name=value` definitions and `&name` substitution.
 - User-defined `%MACRO`/`%MEND` macros with positional and keyword parameters, defaults, nested calls (including calls inside arguments), bounded recursion, and inline calls that expand to one statement. `%SYSGET` is opt-in through the Python API; dynamic `%INCLUDE` paths may use preceding `%LET` values.
 - Compile-time `%IF`/`%THEN`/`%ELSE` branches with simple comparisons and `AND`/`OR`/`NOT`, plus bounded integer `%DO` loops.
@@ -237,10 +238,12 @@ basic SAS tokens and macro references. It currently provides a lexical and
 statement-parsing foundation only; it is not a complete SAS grammar, and
 DATA-step/PROC semantics remain limited to the constructs listed above.
 
-The converter fails with `ConversionError` on syntax outside this subset instead of silently generating a misleading translation. Errors identify the SAS source line and offending statement when available. A `SET` statement with multiple simple datasets concatenates them with Spark `unionByName(allowMissingColumns=True)`; this fills columns absent from an input with `NULL`, but Spark row order is unspecified and type coercion may differ from SAS. Dataset options on `SET` are supported as described under "`LAG`/`DIF` and `SET` dataset options" below. `MERGE ... BY` follows SAS match-merge semantics: within each BY group, output has as many rows as the largest input group, and an input with fewer rows repeats its last row (one-to-many and many-to-many). It uses window functions plus left joins, preserves later-dataset overwrite behavior, and orders output by BY keys. Row order inside a duplicated key group follows Spark's incidental order (not guaranteed), so many-to-many pairings are only reproducible when inputs carry a deterministic order. `IN=` flags (`merge a(in=ina) b(in=inb);`) become boolean columns usable in `IF ina and inb;` / `IF ina = 1;` and are dropped from the output. Null BY keys match each other; normalize blank/padded character keys consistently in Spark inputs to match SAS fixed-width character behavior. Other dataset options and `WHERE` on MERGE are unsupported. Conditional branches must be simple assignments to the same column. `IF cond THEN col = expr;` without `ELSE` keeps the existing value of `col` (or `NULL` when the column does not exist yet), and `ELSE IF` chains are supported; `IF cond THEN DO; ... END;` blocks (with `ELSE IF ... THEN DO;` / `ELSE DO;`) are rewritten into per-statement conditionals, and `IF cond THEN DELETE;` becomes a filter that keeps rows whose condition is false or missing. Blocks may contain simple assignments, `DELETE`, nested `IF`/`ELSE` and nested `SELECT` (see "Nested blocks" below); `OUTPUT`, iterative `DO` loops and conditions that reference a column assigned inside the same block are rejected. Multi-dataset DATA steps and `OUTPUT` routing are supported when the routing statements (`IF c THEN OUTPUT ds;`, `ELSE IF ... OUTPUT`, `ELSE OUTPUT`, `OUTPUT [ds ...];`, bare `OUTPUT;` for all datasets) are the final statements; each target dataset becomes its own DATA step with a subsetting filter (rows whose condition is missing fall through to `ELSE`), so shared upstream logic is recomputed per target. A dataset written by more than one routing group (which would create duplicate rows), a dataset never written, `OUTPUT` followed by more statements, and `OUTPUT` inside `DO` blocks are rejected. Supported output-generating DO loops require integer literal or compile-time integer-expression bounds/step, a nonzero step, simple assignments, and exactly one final `OUTPUT`; stateful self-updating assignments, nested loops, and other OUTPUT patterns are rejected. `CAT` concatenates values without trimming and maps Spark `NULL` inputs to empty strings; `CATS` trims each input before concatenating. `CATX` trims values and skips missing/blank inputs. `STRIP` trims both ends and maps `NULL` to an empty string. `COALESCE` uses Spark null semantics for numeric values; `COALESCEC` treats `NULL` and whitespace-only strings as missing, returns the first non-missing value unchanged, and returns an empty string when all inputs are missing. These rules model character missing values as Spark `NULL`, empty, or whitespace-only strings. `COMPRESS` supports the optional character set but not SAS modifiers. `ROUND` supports a positive numeric literal as its rounding unit. `SUBSTR` uses Spark's one-based substring indexing; start positions and lengths must be positive for SAS-compatible results. Date values use SAS numeric day counts from 1960-01-01, and datetime values use numeric seconds from that date. Date literals such as `'01JAN2024'd` and datetime literals such as `'01JAN2024:12:34:56'dt` convert to those counts; invalid calendar dates/times are rejected. `MDY` (invalid dates give missing), `QTR`, `WEEKDAY` (Sunday=1), `DATDIF(...,'ACT/ACT')`, `DATEPART`, `TIMEPART`, `DHMS`, `DATE()`, `TODAY()`, `DATETIME()` and `TIME()` are supported. `INTCK` and `INTNX` support `DAY`, `WEEK` (Sunday start), `MONTH`, `QTR` and `YEAR` with a quoted literal interval, discrete boundary counting, and `INTNX` alignments `BEGINNING`/`END`/`SAME`. `YEAR`, `MONTH` and `DAY` accept SAS date counts. Date `PUT`/`INPUT` support `DATE9.`, `YYMMDD10.`, `YYMMDDN8.`, `MMDDYY10.`, `DDMMYY10.`; datetime `PUT`/`INPUT` support `DATETIME20.` and `E8601DT19.`; numeric `Zw.` and `w.d` formats/informats are also supported. User-defined `VALUE` formats work with `PUT`; simple exact-mapping `INVALUE` definitions work with `INPUT`; `PICTURE` supports simple digit masks with optional prefix/multiplier/rounding; `CNTLIN=` supports the standard control columns but collects rows to the driver and is only suitable for small tables. A `FORMAT var fmt.;` statement is display-only: values are unchanged and a warning is emitted, so use `PUT` where formatted text is needed. Date and datetime inputs remain numeric SAS values, not Spark `DATE`/`TIMESTAMP` columns. Advanced macro processing, advanced array behavior, other SAS-specific functions, and most non-SQL procedures are not implemented.
+The converter fails with `ConversionError` on syntax outside this subset instead of silently generating a misleading translation. Errors identify the SAS source line and offending statement when available. A `SET` statement with multiple simple datasets concatenates them with Spark `unionByName(allowMissingColumns=True)`; this fills columns absent from an input with `NULL`, but Spark row order is unspecified and type coercion may differ from SAS. Dataset options on `SET` are supported as described under "`LAG`/`DIF` and `SET` dataset options" below. `MERGE ... BY` follows SAS match-merge semantics: within each BY group, output has as many rows as the largest input group, and an input with fewer rows repeats its last row (one-to-many and many-to-many). It uses window functions plus left joins, preserves later-dataset overwrite behavior, and orders output by BY keys. Row order inside a duplicated key group follows Spark's incidental order (not guaranteed), so many-to-many pairings are only reproducible when inputs carry a deterministic order. `IN=` flags (`merge a(in=ina) b(in=inb);`) become boolean columns usable in `IF ina and inb;` / `IF ina = 1;` and are dropped from the output. Null BY keys match each other; normalize blank/padded character keys consistently in Spark inputs to match SAS fixed-width character behavior. Other dataset options and `WHERE` on MERGE are unsupported. Conditional branches must be simple assignments to the same column. `IF cond THEN col = expr;` without `ELSE` keeps the existing value of `col` (or `NULL` when the column does not exist yet), and `ELSE IF` chains are supported; `IF cond THEN DO; ... END;` blocks (with `ELSE IF ... THEN DO;` / `ELSE DO;`) are rewritten into per-statement conditionals, and `IF cond THEN DELETE;` becomes a filter that keeps rows whose condition is false or missing. Blocks may contain simple assignments, `DELETE`, nested `IF`/`ELSE` and nested `SELECT` (see "Nested blocks" below); `OUTPUT`, iterative `DO` loops and conditions that reference a column assigned inside the same block are rejected. Multi-dataset DATA steps and `OUTPUT` routing are supported when the routing statements (`IF c THEN OUTPUT ds;`, `ELSE IF ... OUTPUT`, `ELSE OUTPUT`, `OUTPUT [ds ...];`, bare `OUTPUT;` for all datasets) are the final statements; each target dataset becomes its own DATA step with a subsetting filter (rows whose condition is missing fall through to `ELSE`), so shared upstream logic is recomputed per target. A dataset written by more than one routing group (which would create duplicate rows), a dataset never written, `OUTPUT` followed by more statements, and `OUTPUT` inside `DO` blocks are rejected. Supported output-generating DO loops require a nonzero compile-time integer step and either compile-time bounds or runtime numeric input-column bounds (present integer values, capped at 5000 iterations per input row), simple assignments, and exactly one final `OUTPUT`; stateful self-updating assignments, nested loops, and other OUTPUT patterns are rejected. `CAT` concatenates values without trimming and maps Spark `NULL` inputs to empty strings; `CATS` trims each input before concatenating. `CATX` trims values and skips missing/blank inputs. `STRIP` trims both ends and maps `NULL` to an empty string. `COALESCE` uses Spark null semantics for numeric values; `COALESCEC` treats `NULL` and whitespace-only strings as missing, returns the first non-missing value unchanged, and returns an empty string when all inputs are missing. These rules model character missing values as Spark `NULL`, empty, or whitespace-only strings. `COMPRESS` supports the optional character set but not SAS modifiers. `ROUND` supports a positive numeric literal as its rounding unit. `SUBSTR` uses Spark's one-based substring indexing; start positions and lengths must be positive for SAS-compatible results. Date values use SAS numeric day counts from 1960-01-01, and datetime values use numeric seconds from that date. Date literals such as `'01JAN2024'd` and datetime literals such as `'01JAN2024:12:34:56'dt` convert to those counts; invalid calendar dates/times are rejected. `MDY` (invalid dates give missing), `QTR`, `WEEKDAY` (Sunday=1), `DATDIF(...,'ACT/ACT')`, `DATEPART`, `TIMEPART`, `DHMS`, `DATE()`, `TODAY()`, `DATETIME()` and `TIME()` are supported. `INTCK` and `INTNX` support `DAY`, `WEEK` (Sunday start), `MONTH`, `QTR` and `YEAR` with a quoted literal interval, discrete boundary counting, and `INTNX` alignments `BEGINNING`/`END`/`SAME`. `YEAR`, `MONTH` and `DAY` accept SAS date counts. Date `PUT`/`INPUT` support `DATE9.`, `YYMMDD10.`, `YYMMDDN8.`, `MMDDYY10.`, `DDMMYY10.`; datetime `PUT`/`INPUT` support `DATETIME20.` and `E8601DT19.`; numeric `Zw.` and `w.d` formats/informats are also supported. User-defined `VALUE` formats work with `PUT`; simple exact-mapping `INVALUE` definitions work with `INPUT`; `PICTURE` supports simple digit masks with optional prefix/multiplier/rounding; `CNTLIN=` supports the standard control columns but collects rows to the driver and is only suitable for small tables. A `FORMAT var fmt.;` statement is display-only: values are unchanged and a warning is emitted, so use `PUT` where formatted text is needed. Date and datetime inputs remain numeric SAS values, not Spark `DATE`/`TIMESTAMP` columns. Advanced macro processing, advanced array behavior, other SAS-specific functions, and most non-SQL procedures are not implemented.
 
 The `ORDER_BY=(...)` MERGE option described below is the supported exception to
 the preceding statement that other MERGE dataset options are unsupported.
+Without that option, MERGE inputs must have unique BY keys; duplicate groups
+fail at runtime rather than being paired in incidental Spark order.
 
 Macro support is a bounded compile-time expansion, not a complete SAS macro
 processor. It supports sequential `%LET name=value` declarations, `&name`
@@ -320,15 +323,17 @@ same chain, iterative `DO` loops inside blocks, and `OUTPUT` inside blocks are r
 **`CALL MISSING`.** `CALL MISSING(var1, var2, ...);` sets the named columns to Spark
 `NULL`. Existing column data types are preserved; an absent variable is created as a
 numeric nullable column unless `LENGTH`/`ATTRIB` declares it character. Only explicit
-simple variable names are supported; `OF` lists, ranges, expressions and conditional
-`CALL MISSING` are rejected.
+simple variable names are supported, both unconditionally and as
+`IF condition THEN CALL MISSING(...)`. A false or missing condition leaves existing
+values unchanged. `OF` lists, ranges, expressions and calls inside `DO`/`SELECT`
+blocks are rejected.
 
 **Character and conditional `RETAIN`.** A retained variable that is not the
 `v = v + expr` accumulator (for example `retain last ''; if x > 1 then last = name;`)
 keeps its previous value on rows where no assignment runs, with the `RETAIN` initial
 value (or missing) before the first assignment. It is computed with a window function
-over one Spark partition. Without the DATA-step `ORDER BY` extension it uses
-`monotonically_increasing_id()` and is best-effort on row order. The variable
+over one Spark partition. The DATA-step `ORDER BY` extension is required; its
+keys must be unique at runtime. The variable
 cannot appear in its own assignment, and the step cannot use `MERGE`. A `BY`
 statement is allowed; retained state carries across BY-group boundaries unless
 the program explicitly assigns a reset value. Use `ORDER BY` for deterministic
@@ -349,9 +354,8 @@ needs its own preceding reset of the form
 `if first.key then variable = numeric-literal;`; each running total is
 partitioned by the BY keys through `key`. The increment must evaluate to a
 nonmissing numeric value. Because Spark DataFrames do not preserve input row
-order, generated code uses `monotonically_increasing_id()` as a best-effort
-order and returns a warning unless the DATA-step `ORDER BY` extension provides
-unique keys. With explicit keys the cumulative order is deterministic for the
+order, conversion requires the DATA-step `ORDER BY` extension to provide unique
+keys. With explicit keys the cumulative order is deterministic for the
 same input values; this still does not prove equivalence to SAS physical
 observation order. Other numeric conditional updates/resets and
 retained-state patterns are unsupported. Character/conditional retention is
@@ -360,9 +364,9 @@ self-reference).
 
 **Report procedures.** `PROC PRINT` (`DATA=`, `OBS=`, `NOOBS`, `VAR`, `WHERE`) becomes `DataFrame.show()` (capped at 1000 rows when `OBS=` is absent; not SAS listing formatting). `PROC CONTENTS` supports `DATA=`, `OUT=`, `NOPRINT`, `SHORT` and `VARNUM`: it displays the Spark schema, or just column names with `SHORT`; `OUT=` creates a metadata DataFrame/view with `NAME`, `SPARK_TYPE`, `NULLABLE` and `POSITION` (Spark schema order), not the SAS `OUT=` schema. `PROC COPY IN= OUT=` requires a `SELECT` list and, because library prefixes are dropped, only aliases the views. `PROC COMPARE BASE= COMPARE=` prints row/column difference counts, not SAS's per-variable report. `TITLE`, `FOOTNOTE` and `ODS` are accepted and ignored with a warning. Dataset options and other statements on these procs are rejected; unsupported `PROC PRINT` flags are rejected rather than silently ignored.
 
-**Deterministic DATA-step order extension.** Add `ORDER BY sequence, event_time DESC;` inside a SET DATA step to define a stable iteration key for order-sensitive windows. It applies to `LAG`/`DIF`, `_N_`, numeric and character `RETAIN`, and `FIRST.`/`LAST.` flags. The converter checks at execution that every key exists exactly once and that the key combination is unique; otherwise it raises an error instead of silently choosing a row order. This is a sas2pyspark extension, not a SAS DATA-step statement. It does not sort the resulting DataFrame or alter `SET` dataset-option `FIRSTOBS`/`OBS` selection. Without it, existing best-effort `monotonically_increasing_id()` behavior remains. Calls to `LAG`/`DIF` inside conditionals still do not reproduce SAS's lag-queue behavior.
+**Deterministic DATA-step order extension.** Add `ORDER BY sequence, event_time DESC;` inside a SET DATA step to define a stable iteration key for order-sensitive windows. It applies to `LAG`/`DIF`, `_N_`, numeric and character `RETAIN`, and `FIRST.`/`LAST.` flags. Conversion fails if one of these constructs lacks `ORDER BY`; generated code checks that every key exists exactly once and the key combination is unique at runtime. This is a sas2pyspark extension, not a SAS DATA-step statement. It does not sort the resulting DataFrame or alter `SET` dataset-option `FIRSTOBS`/`OBS` selection. Calls to `LAG`/`DIF` inside conditionals still do not reproduce SAS's lag-queue behavior.
 
-**Deterministic MERGE input order extension.** Specify `ORDER_BY=(key1, key2 DESC)` on every input in the `MERGE` statement, for example `merge left(order_by=(left_seq)) right(in=found order_by=(right_seq descending));`. Each input is ordered independently within its BY groups. At execution, the converter verifies the order columns exist and that BY-key plus order-key combinations are unique in each input; missing or duplicate values fail explicitly. This is a sas2pyspark dataset-option extension, not standard SAS syntax. Without per-input `ORDER_BY`, duplicate-key pairing remains best-effort and a warning is emitted. `WHERE=` and other MERGE dataset options remain unsupported.
+**Deterministic MERGE input order extension.** Specify `ORDER_BY=(key1, key2 DESC)` on every input in the `MERGE` statement, for example `merge left(order_by=(left_seq)) right(in=found order_by=(right_seq descending));`. Each input is ordered independently within its BY groups. At execution, the converter verifies the order columns exist and that BY-key plus order-key combinations are unique in each input; missing or duplicate values fail explicitly. This is a sas2pyspark dataset-option extension, not standard SAS syntax. Without per-input `ORDER_BY`, generated code permits inputs with unique BY keys, but raises at runtime if an input has duplicate BY-key groups rather than selecting rows in incidental Spark order. `WHERE=` and other MERGE dataset options remain unsupported.
 
 **`SET` dataset options.** `SET a(where=(...) firstobs=n obs=m keep=|drop= rename=(old=new))` is applied in this order: `WHERE`, `FIRSTOBS`/`OBS` (counted over the filtered rows; `OBS` is the last observation number), `KEEP`/`DROP`, `RENAME`. Other options are rejected. Row order is best effort unless the dataset is sorted by the source itself; the DATA-step `ORDER BY` extension does not change `FIRSTOBS`/`OBS` input selection.
 
@@ -374,10 +378,9 @@ with fewer values than variables are padded with missing values, and rows with m
 are an error. Informats, column or pointer input (`@`, `:`, `1-10`), `INFILE` for
 external files, quoted values with spaces in whitespace-delimited data, and extra
 statements after `DATALINES` are unsupported. `data _null_;` with `DATALINES` produces
-nothing. The automatic variable `_N_` is available in `SET`/`MERGE` steps as a row
-number derived from `monotonically_increasing_id()`, so it is only as reliable as
-Spark's row order without the DATA-step `ORDER BY` extension. `ORDER BY` does not
-apply to MERGE.
+nothing. The automatic variable `_N_` is available in `SET` steps only when a
+DATA-step `ORDER BY` provides unique keys; it is not supported with `MERGE`.
+`ORDER BY` does not sort output rows or change `FIRSTOBS`/`OBS` input selection.
 
 DATA-step `ARRAY` declarations support `{n}`, `{*}` and multi-dimensional sizes such
 as `{2,3}` (stored row-major), character arrays (`$` with an optional length), implicit
@@ -388,18 +391,47 @@ and `DIM`, `HBOUND` and `LBOUND` of a declared array become integer literals.
 Iterative `DO i = a TO b [BY c]` loops without `OUTPUT` are unrolled when the bounds
 are integer constants or `DIM(array)`, so `do i = 1 to dim(q); q{i} = ...; end;` works;
 the index variable is left at its final SAS value. Unrolling is capped at 5000
-statements. Variable bounds, `DO WHILE`/`DO UNTIL`, run-time array indexes,
-`_TEMPORARY_` arrays and initial-value lists are rejected because they depend on
-run-time values.
+statements. Array reads may use numeric arithmetic expressions over input columns,
+numeric literals, parentheses, and `+`, `-`, `*`, `/`, or `%`; the converter checks
+at runtime that referenced columns are numeric and the computed index is present,
+integral, and in range, and that array elements exist with one Spark type. Dynamic
+array assignment targets such as `values[index + 1] = score;` update only the selected
+element after the same validation. Outside runtime loops, index columns must be input
+columns and cannot be assigned in that DATA step; inside runtime-bounded loops, the
+loop index is also allowed and is validated across each iteration.
+Output-generating loops may use runtime numeric input-column bounds, with integer
+arithmetic expressions and a compile-time integer step; the converter checks that
+bounds are present integers and that each row expands to at most 5000 iterations.
+Non-`OUTPUT` loops may also use runtime bounds and execute ordered simple and
+conditional assignments for each iteration, carrying assigned values between
+iterations. A conditional assignment may have a simple `ELSE` to the same target;
+`ELSE IF` chains may update different existing or initialized state columns, and a
+final `ELSE` may target a different column; the
+selected branch updates only its target. Without a final `ELSE`, no matching or
+missing conditions preserve all current values. The loop
+body may include nested `IF ... THEN DO`/`ELSE DO` blocks, which are evaluated in
+source order as guarded assignments, including dynamic array-element assignments.
+Conditional `DELETE` stops processing and removes the input observation when its
+predicate matches during an iteration, including predicates that use loop-carried
+values. The predicate is evaluated at its source position, so earlier assignments
+in the iteration are visible; missing predicates do not delete. DELETE is not
+supported in output-generating loops.
+variable is left at its final SAS value. Stateful or multiple assignments require their target
+columns to exist in the input or to be initialized earlier in the DATA step; initialized
+columns are supported as loop state. Decimal loop-state columns retain their scale and
+widen to precision 38 to accommodate repeated arithmetic; other state fields retain
+their Spark types. One stateless assignment may create a new column.
+Runtime-bound non-`OUTPUT` loops support dynamic array reads and writes with numeric
+arithmetic indexes; the index is checked on every loop iteration, and writes carry
+forward in statement order. Dynamic array writes are limited to non-`OUTPUT` loops.
+Other non-`OUTPUT` loops require compile-time bounds and are unrolled at conversion
+time.
+`DO WHILE`/`DO UNTIL`, `_TEMPORARY_` arrays and initial-value lists remain unsupported.
 
 For a `SET` DATA step, one `BY` statement with simple column names enables
 `FIRST.key` and `LAST.key` flags in supported expressions. Spark input order is
-unspecified; by default the generated code assigns a best-effort order using
-`monotonically_increasing_id()` and emits a warning. Add the sas2pyspark
-`ORDER BY` extension to provide a unique stable key for deterministic window
-results. Thus without the extension, flags identify one row per relevant BY
-group for a given execution, but which row is first or last can differ from SAS
-or change across executions. Descending BY keys and
+unspecified, so conversion requires the sas2pyspark `ORDER BY` extension to
+provide a unique stable key for deterministic window results. Descending BY keys and
 `FIRST.`/`LAST.` processing with `RETAIN` beyond the single numeric reset
 pattern described above is not supported. DATA-step BY statements accept
 `ASCENDING` and `DESCENDING` modifiers, but Spark input order is still
@@ -808,6 +840,12 @@ The Spark integration test executes a sample DATA step, PROC SORT, and PROC SQL
 conversion against small in-memory DataFrames and checks the resulting rows and
 aggregates. It skips with a clear message if PySpark or a compatible Java
 runtime is unavailable. PySpark 4 requires Java 17 or newer.
+
+`tests/fixtures/parity/` contains JSON-driven semantic fixtures. Each fixture
+records the SAS source, input schemas and rows, expected output schemas and
+rows, and reference provenance. Curated fixtures run against local Spark; when
+SAS-generated reference data is available, mark and retain that provenance in
+the fixture instead of relying only on generated-code assertions.
 
 ### Windows Spark worker troubleshooting
 

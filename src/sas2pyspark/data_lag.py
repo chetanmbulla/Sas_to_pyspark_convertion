@@ -2,8 +2,8 @@
 
 Each ``LAGn(expr)`` or ``DIFn(expr)`` call is replaced by a helper column that is
 assigned immediately before the statement that uses it, so earlier assignments and
-subsetting statements are visible, as in SAS. Rows are ordered by
-``monotonically_increasing_id()``, a best-effort stand-in for SAS observation order.
+subsetting statements are visible, as in SAS. An explicit DATA-step ORDER BY key
+is required because Spark does not preserve SAS observation order.
 """
 
 from __future__ import annotations
@@ -43,6 +43,17 @@ def rewrite_lag(statements: list[MacroStatement]) -> list[MacroStatement]:
             result.extend(statements[index : end + 1])
             index = end + 1
             continue
+        if order_keys is None:
+            call = next(
+                item
+                for item in body
+                if _CALL.search(_QUOTED.sub("''", item.text))
+            )
+            raise MacroExpansionError(
+                "LAG/DIF requires a DATA-step ORDER BY with unique keys; "
+                "Spark does not preserve SAS observation order.",
+                call,
+            )
         result.append(statement)
         helpers: list[str] = []
         for item in body:
