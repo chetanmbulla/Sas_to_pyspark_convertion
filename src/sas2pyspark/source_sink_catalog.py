@@ -42,6 +42,9 @@ _SENSITIVE = re.compile(
     r"(?i)(password|passwd|pwd|user(name)?|uid|token|secret|credential|"
     r"access[._-]?key)\s*=\s*('[^']*'|\"[^\"]*\"|[^;\s,)]+)"
 )
+_LOCAL_IO_MODES = frozenset(
+    {"file_import", "file_export", "file_read", "file_write", "ods_output", "host_command"}
+)
 _URI_USERINFO = re.compile(r"(?i)(://)[^/@\s:]+(?::[^/@\s]*)?@")
 
 
@@ -186,6 +189,7 @@ def _source_systems(
             "sources",
             "librefs",
             "operations",
+            "directions",
         ):
             existing[field] = sorted(
                 set(existing.get(field, ())) | set(record.get(field, ())),
@@ -245,9 +249,13 @@ def _source_systems(
                     else []
                 ),
                 "sources": [str(connection.get("source", ""))],
+                "directions": (
+                    [connection["direction"]] if connection.get("direction") else []
+                ),
                 "status": (
                     "mapped"
                     if connection.get("target_server")
+                    or mode in _LOCAL_IO_MODES
                     else "unknown_endpoint"
                 ),
             },

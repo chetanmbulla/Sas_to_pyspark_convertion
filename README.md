@@ -658,7 +658,11 @@ supplied corpus), and `drive_relative_paths: "drive_root"` (resolve
 `drive_relative_assumed_root` issue). Includes of a fileref the same script
 writes with `FILE` are reported as `runtime_generated`, and waived ones as
 `waived`; neither counts as unresolved, but their contents are not analyzed.
-`%INC` is treated like `%INCLUDE`. Remote aliases come from `remote_aliases`
+`%INC` is treated like `%INCLUDE`. File and device I/O is reported under
+`external_connections` with a `direction` (`input`, `output`, `both`) and a mode
+of `file_import`, `file_export`, `file_read`, `file_write`, `ods_output`,
+`email` (recipients are never recorded), `ftp`, `url`, `pipe`, `socket` or
+`host_command` (non-`cd` `X`/`%SYSEXEC`); credentials in targets are redacted. Remote aliases come from `remote_aliases`
 or, when the alias is set with `%LET alias = host port`, from `remote_hosts`
 (host → server); the endpoint (never credentials such as `tcpsec`) is listed
 under `remote_endpoints`. `%LET`s made inside a mapped `RSUBMIT` are reported as

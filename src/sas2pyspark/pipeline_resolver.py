@@ -60,12 +60,50 @@ _JAMS_JOB_FIELDS = frozenset(
 )
 _SENSITIVE_NAME = re.compile(r"(?i)pass|pwd|secret|token|tcpsec|credential|key")
 _FILE_OUTPUT = re.compile(r"^\s*file\s+([A-Za-z_]\w*)\b", re.I)
+_PROC_IMPORT_EXPORT = re.compile(r"^\s*proc\s+(import|export)\b(.*)$", re.I | re.S)
+_IO_PATH = re.compile(
+    r"\b(?:outfile|datafile|file)\s*=\s*('[^']*'|\"[^\"]*\"|[^\s;]+)", re.I
+)
+_IO_DBMS = re.compile(r"\bdbms\s*=\s*([A-Za-z0-9_]+)", re.I)
+_FILENAME_DEVICE = re.compile(
+    r"^\s*filename\s+([A-Za-z_]\w*)\s+(email|ftp|url|pipe|socket)\b(.*)$",
+    re.I | re.S,
+)
+_FILENAME_DEVICE_DIRECTION = {
+    "email": "output",
+    "ftp": "both",
+    "url": "input",
+    "pipe": "both",
+    "socket": "both",
+}
+_ODS_OUTPUT = re.compile(
+    r"^\s*ods\s+(?!listing\b|results\b|graphics\b|select\b|exclude\b|trace\b|"
+    r"output\b|path\b|noproctitle\b|escapechar\b)([A-Za-z_][\w.]*)\b(.*)$",
+    re.I | re.S,
+)
+_ODS_PATH = re.compile(
+    r"\b(?:body|file|path)\s*=\s*('[^']*'|\"[^\"]*\"|[^\s;()]+)", re.I
+)
+_HOST_COMMAND = re.compile(r"^\s*(?:x|%sysexec)\s+(.+)$", re.I | re.S)
+_INFILE_FILE = re.compile(
+    r"^\s*(infile|file)\s+('[^']*'|\"[^\"]*\"|[A-Za-z_]\w*)", re.I
+)
 _DRIVE_RELATIVE_POLICIES = ("reject", "drive_root")
 _SENSITIVE_OPTION = re.compile(
     r"(?i)(password|passwd|pwd|user(name)?|uid|token|secret|credential|"
     r"access[._-]?key)\s*=\s*('[^']*'|\"[^\"]*\"|[^;\s,)]+)"
 )
 _URI_USERINFO = re.compile(r"(?i)(://)[^/@\s:]+(?::[^/@\s]*)?@")
+
+
+_FILENAME_DEVICE_TARGET = re.compile(r"('[^']*'|\"[^\"]*\")")
+
+
+def _quoted_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
 
 
 def _safe_report_value(value: str) -> str:
@@ -248,6 +286,7 @@ class PipelineExternalConnection:
     local_libref: str | None
     remote_libref: str | None
     target_server: str | None
+    direction: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -259,6 +298,7 @@ class PipelineExternalConnection:
             "local_libref": self.local_libref,
             "remote_libref": self.remote_libref,
             "target_server": self.target_server,
+            "direction": self.direction,
         }
 
 
@@ -1046,6 +1086,34 @@ def _resolve_pipeline_once(
                 )
             return mapped_server
 
+        def record_io(
+            mode: str,
+            target: str,
+            direction: str | None,
+            line_number: int,
+            *,
+            local_libref: str | None = None,
+            dbms: str | None = None,
+        ) -> None:
+            try:
+                target = _expand_macro_variables(target, macro_vars)
+            except PipelineResolverError:
+                pass
+            system = _safe_report_value(target)
+            external_connections[
+                (key, line_number, mode, system.casefold(), local_libref)
+            ] = PipelineExternalConnection(
+                actual_paths[key],
+                line_number,
+                current_server or "unknown",
+                mode,
+                system,
+                local_libref,
+                dbms,
+                None,
+                direction,
+            )
+
         def resolve_server_path(reference: str, working_directory: str | None) -> Path:
             if current_server is None:
                 raise PipelineResolverError(
@@ -1189,6 +1257,8 @@ def _resolve_pipeline_once(
                         )
                     else:
                         cwd = requested
+                else:
+                    record_io("host_command", command[:200], None, line)
                 continue
 
             filename = _FILENAME.match(text)
@@ -1198,6 +1268,18 @@ def _resolve_pipeline_once(
                     filename_refs.pop(fileref, None)
                 else:
                     filename_refs[fileref] = filename.group(3)
+                continue
+            device = _FILENAME_DEVICE.match(text)
+            if device:
+                device_name = device.group(2).casefold()
+                target = _FILENAME_DEVICE_TARGET.search(device.group(3))
+                record_io(
+                    device_name,
+                    _quoted_value(target.group(1)) if target and device_name != "email" else device_name,
+                    _FILENAME_DEVICE_DIRECTION[device_name],
+                    line,
+                    local_libref=device.group(1).casefold(),
+                )
                 continue
             if lowered.startswith("filename "):
                 add_issue(
@@ -1502,6 +1584,53 @@ def _resolve_pipeline_once(
                 continue
 
             sql_connection = _SQL_CONNECT.search(text)
+            proc_io = _PROC_IMPORT_EXPORT.match(text)
+            if proc_io:
+                io_kind = proc_io.group(1).casefold()
+                io_path = _IO_PATH.search(proc_io.group(2))
+                io_dbms = _IO_DBMS.search(proc_io.group(2))
+                record_io(
+                    f"file_{io_kind}",
+                    _quoted_value(io_path.group(1))
+                    if io_path
+                    else (io_dbms.group(1).casefold() if io_dbms else "unspecified"),
+                    "input" if io_kind == "import" else "output",
+                    line,
+                    dbms=io_dbms.group(1).casefold() if io_dbms else None,
+                )
+            ods = _ODS_OUTPUT.match(text)
+            if ods:
+                ods_path = _ODS_PATH.search(ods.group(2))
+                if ods_path:
+                    record_io(
+                        "ods_output",
+                        _quoted_value(ods_path.group(1)),
+                        "output",
+                        line,
+                        dbms=ods.group(1).casefold(),
+                    )
+            host_command = _HOST_COMMAND.match(text)
+            if host_command and not _X_CD.fullmatch(text):
+                record_io(
+                    "host_command",
+                    " ".join(host_command.group(1).split())[:200],
+                    None,
+                    line,
+                )
+            stream = _INFILE_FILE.match(text)
+            if stream and stream.group(2).casefold() not in {"print", "log"}:
+                stream_kind = stream.group(1).casefold()
+                stream_target = _quoted_value(stream.group(2))
+                if stream.group(2)[0] not in "'\"":
+                    stream_target = filename_refs.get(
+                        stream_target.casefold(), f"fileref:{stream_target}"
+                    )
+                record_io(
+                    "file_read" if stream_kind == "infile" else "file_write",
+                    stream_target,
+                    "input" if stream_kind == "infile" else "output",
+                    line,
+                )
             if sql_connection:
                 engine = sql_connection.group(1).casefold()
                 external_connections[

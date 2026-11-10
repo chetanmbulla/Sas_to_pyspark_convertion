@@ -10,6 +10,37 @@ from sas2pyspark.cli import main
 
 
 class PipelineResolverTests(unittest.TestCase):
+    def test_detects_file_email_ods_and_host_io_with_direction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(
+                Path(directory),
+                "%let out = v:\\out;\n"
+                "proc export data=a outfile=\"&out.\\a.xlsx\" dbms=xlsx replace; run;\n"
+                "proc import datafile='v:\\in.csv' out=b dbms=csv; run;\n"
+                "filename mail email type='text/html' to='x@y.z';\n"
+                "filename f ftp 'data.txt' host='h.example.com' user='u' pass='p';\n"
+                "ods html body='v:\\r.html';\n"
+                "ods html close;\n"
+                "x 'del v:\\old.txt';\n"
+                "data _null_; infile 'v:\\raw.txt'; file print; run;\n",
+            )
+            report = resolve_pipeline(directory, config).to_dict()
+
+        found = {
+            (c["mode"], c["direction"]): c["system"]
+            for c in report["external_connections"]
+        }
+        self.assertEqual(found[("file_export", "output")], "v:\\out\\a.xlsx")
+        self.assertIn(("file_import", "input"), found)
+        self.assertIn(("email", "output"), found)
+        self.assertIn(("ftp", "both"), found)
+        self.assertEqual(found[("ods_output", "output")], "v:\\r.html")
+        self.assertIn(("host_command", None), found)
+        self.assertIn(("file_read", "input"), found)
+        self.assertFalse(any(m == "file_write" for m, _ in found))
+        self.assertFalse(any(i["kind"] == "filename" for i in report["issues"]))
+        self.assertNotIn("x@y.z", json.dumps(report))
+        self.assertNotIn("'p'", json.dumps(report))
     def test_uses_configured_server_initialization_for_macro_based_fileref(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
