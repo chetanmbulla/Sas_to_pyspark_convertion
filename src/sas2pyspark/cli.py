@@ -29,6 +29,7 @@ from .source_sink_catalog import (
     build_source_sink_catalog,
     load_pipeline_report,
 )
+from .complexity import ComplexityError
 from .project_report import ProjectReportError, build_project_report_from_files
 from .phase1_analysis import Phase1AnalysisError, run_phase1_analysis
 from .schema_assets import SchemaAssetError, load_schema_assets
@@ -173,6 +174,10 @@ def _project_main(argv: list[str]) -> int:
     report_parser.add_argument("--catalog-report", required=True)
     report_parser.add_argument("--plan-report", required=True)
     report_parser.add_argument("--conversion-report", required=True)
+    report_parser.add_argument("--weights", help="JSON file overriding complexity weights")
+    report_parser.add_argument(
+        "--actuals", help="CSV with path,hours columns to calibrate complexity"
+    )
     report_parser.add_argument(
         "--output",
         required=True,
@@ -666,6 +671,8 @@ def _project_main(argv: list[str]) -> int:
                 catalog_report_path=args.catalog_report,
                 plan_report_path=args.plan_report,
                 conversion_report_path=args.conversion_report,
+                weights_path=args.weights,
+                actuals_path=args.actuals,
             )
             report_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path: Path | None = None
@@ -1245,6 +1252,7 @@ def _project_main(argv: list[str]) -> int:
         PipelineResolverError,
         SourceSinkCatalogError,
         ProjectReportError,
+        ComplexityError,
         SyntheticDataError,
         Phase1AnalysisError,
         SchemaAssetError,

@@ -82,6 +82,7 @@ def run_phase1_analysis(
         "plan": out / "plan.json",
         "conversion": out / "conversion.json",
         "report": out / "project-report.md",
+        "complexity": out / "complexity.json",
         "synthetic_data": out / "synthetic-data",
         "generated_code": out / "code",
     }
@@ -150,6 +151,28 @@ def run_phase1_analysis(
         conversion_report_path=files["conversion"],
     )
     files["report"].write_text(report["markdown"], encoding="utf-8", newline="\n")
+    files["complexity"].write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "project": report["complexity_model"],
+                "scripts": [
+                    {
+                        "path": item["path"],
+                        "complexity_score": item["complexity_score"],
+                        "complexity": item["complexity"],
+                        "factors": item["complexity_factors"],
+                    }
+                    for item in report["programs"]
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     synthetic = generate_synthetic_data(
         load_catalog_report(files["catalog"]),
@@ -173,6 +196,8 @@ def run_phase1_analysis(
         "conversion": conversion.to_dict()["summary"],
         "report": {
             "complexity_score": report["complexity_score"],
+            "complexity": report["complexity"],
+            "complexity_confidence": report["complexity_model"]["confidence"],
             "summary": report["summary"],
         },
         "synthetic_data": synthetic["summary"],

@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import complexity as complexity_model
+
 _SENSITIVE_VALUE = re.compile(
     r"(?i)(password|passwd|pwd|user(name)?|uid|token|secret|credential|"
     r"access[._-]?key)\s*=\s*('[^']*'|\"[^\"]*\"|[^;\s,)]+)"
@@ -63,6 +65,9 @@ def build_project_report(
     catalog_report: Mapping[str, Any],
     plan_report: Mapping[str, Any],
     conversion_report: Mapping[str, Any],
+    *,
+    weights_path: str | Path | None = None,
+    actuals_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Combine the existing project reports into a Markdown report and score."""
     for label, report in (
@@ -97,6 +102,8 @@ def build_project_report(
                 _path_key(evidence.get("source")), []
             ).append(resource)
 
+    weights = complexity_model.load_weights(weights_path)
+    evidence = complexity_model.script_evidence(pipeline_report, catalog_report)
     programs: list[dict[str, Any]] = []
     for script in pipeline_report.get("scripts", []):
         path = str(script.get("path", ""))
@@ -115,7 +122,21 @@ def build_project_report(
             raise ProjectReportError(
                 f"Unknown conversion status {outcome!r} for {path!r}."
             )
-        score = min(100, base_score + conversion_adjustment)
+        signals = evidence.get(
+            _path_key(path),
+            {"connections": 0, "remote": 0, "uncertain": 0, "derived": 0, "findings": 0},
+        )
+        factors = complexity_model.script_factors(
+            plan_score=base_score,
+            conversion_adjustment=conversion_adjustment,
+            external_connections=signals["connections"],
+            remote_blocks=signals["remote"],
+            uncertain_schemas=signals["uncertain"],
+            derived_columns=signals["derived"],
+            unresolved_findings=signals["findings"],
+            weights=weights["script"],
+        )
+        score = min(100, round(sum(item["points"] for item in factors.values())))
         programs.append(
             {
                 "path": path,
@@ -127,7 +148,9 @@ def build_project_report(
                 "conversion_warning_count": len(warnings),
                 "conversion_adjustment": conversion_adjustment,
                 "complexity_score": score,
-                "complexity": _complexity_label(score),
+                "complexity_factors": factors,
+                "statement_count": int(plan.get("statement_count", 0)),
+                "complexity": complexity_model.band(score),
                 "resources": sorted(
                     {
                         item["name"]
@@ -141,14 +164,25 @@ def build_project_report(
     scored_programs = [
         item for item in programs if item["reachability"] == "reachable"
     ]
-    project_score = (
-        round(
-            sum(item["complexity_score"] for item in scored_programs)
-            / len(scored_programs)
-        )
-        if scored_programs
-        else 0
+    attempted = sum(
+        1 for item in scored_programs if item["conversion_status"] != "not_run"
     )
+    project_model = complexity_model.project_factors(
+        script_scores=[
+            (item["complexity_score"], item["statement_count"] + 1)
+            for item in scored_programs
+        ],
+        pipeline_report=pipeline_report,
+        catalog_report=catalog_report,
+        attempted=attempted,
+        weights=weights["project"],
+    )
+    project_model["version"] = complexity_model.MODEL_VERSION
+    if actuals_path is not None:
+        project_model["calibration"] = complexity_model.calibrate(
+            programs, complexity_model.read_actuals(actuals_path)
+        )
+    project_score = project_model["score"]
 
     includes = pipeline_report.get("includes", [])
     dependencies = plan_report.get("dependencies", [])
@@ -179,9 +213,19 @@ def build_project_report(
         f"- **Catalogued resources:** {len(datasets)}",
         f"- **External and physical systems:** {len(catalog_report.get('systems', []))}",
         f"- **Unresolved findings:** {len(unresolved)}",
-        f"- **Project complexity:** {project_score}/100 — {_complexity_label(project_score)}",
+        f"- **Project complexity:** {project_score}/100 — {project_model['band']} (confidence {project_model['confidence']:.0%})",
         "",
-        "Complexity is a prioritization heuristic, not a delivery estimate. Each reachable script starts with the static plan score; failed conversions add 10 points, conversions not yet run add 5, and successful conversions add up to 5 points for warnings. Scores are not evidence of runtime equivalence.",
+        "Complexity is a prioritization heuristic, not a delivery estimate. Each script's score is the sum of capped, weighted factors (static plan score, conversion outcome, external connections, remote blocks, schema uncertainty, derived columns, unresolved findings). The project score is the size-weighted mean of reachable script scores plus project-level factors (unmapped libraries, unknown-schema ratio, unresolved lineage, system count). Confidence falls as schemas are unknown, findings are unresolved, or scripts are not yet converted. Scores are not evidence of runtime equivalence.",
+        "",
+        "### Project complexity factors",
+        "",
+        "| Factor | Raw | Points |",
+        "|---|---:|---:|",
+        f"| Size-weighted script score | | {project_model['size_weighted_script_score']} |",
+        *[
+            f"| {name.replace('_', ' ')} | {item['raw']} | {item['points']} |"
+            for name, item in project_model["factors"].items()
+        ],
         "",
         "## Conversion and complexity by script",
         "",
@@ -347,7 +391,8 @@ def build_project_report(
         "schema_version": 1,
         "project_name": project_name,
         "complexity_score": project_score,
-        "complexity": _complexity_label(project_score),
+        "complexity": project_model["band"],
+        "complexity_model": project_model,
         "programs": programs,
         "markdown": "\n".join(lines),
         "summary": {
@@ -356,6 +401,7 @@ def build_project_report(
             "resource_count": len(datasets),
             "unresolved_finding_count": len(unresolved),
             "complexity_score": project_score,
+            "complexity_confidence": project_model["confidence"],
         },
     }
 
@@ -366,10 +412,14 @@ def build_project_report_from_files(
     catalog_report_path: str | Path,
     plan_report_path: str | Path,
     conversion_report_path: str | Path,
+    weights_path: str | Path | None = None,
+    actuals_path: str | Path | None = None,
 ) -> dict[str, Any]:
     return build_project_report(
         _read_report(pipeline_report_path, "Pipeline report"),
         _read_report(catalog_report_path, "Catalog report"),
         _read_report(plan_report_path, "Plan report"),
         _read_report(conversion_report_path, "Conversion report"),
+        weights_path=weights_path,
+        actuals_path=actuals_path,
     )

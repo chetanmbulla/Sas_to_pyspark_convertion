@@ -767,9 +767,19 @@ comments or JAMS metadata list that as an open question.
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`
 combines pipeline, resource, plan, and conversion evidence into project-level
-Markdown with a Mermaid data-flow graph. Its per-script and project complexity
-scores start from the static plan score and incorporate observed conversion
-failures, not-yet-run programs, and warnings. Scores are prioritization
+Markdown with a Mermaid data-flow graph. Complexity (model version 2) is a
+transparent sum of capped, weighted factors per script: static plan score,
+conversion outcome, external connections, remote blocks, schema uncertainty,
+derived columns, and unresolved findings. The project score is the
+size-weighted mean of reachable script scores plus project factors (unmapped
+libraries, unknown-schema ratio, unresolved lineage, system count), banded
+low/medium/high/very_high with a confidence value that drops as schemas are
+unknown or findings are open. `--weights weights.json` overrides
+`{"script": {factor: {"weight", "cap"}}, "project": {...}}`; `--actuals
+hours.csv` (columns `path,hours`) adds a calibration block (Spearman rank
+correlation and hours-per-point fit; needs 3+ matched scripts) to
+`complexity_model`. `project analyze` also writes `complexity.json` with the
+per-script factor breakdown. Scores are prioritization
 heuristics, not effort estimates or evidence of runtime equivalence. Existing
 Markdown reports are protected; use `--force` to replace one.
 

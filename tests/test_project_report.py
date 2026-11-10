@@ -89,7 +89,9 @@ class ProjectReportTests(unittest.TestCase):
         )
 
         self.assertEqual(report["complexity_score"], 12)
-        self.assertEqual(report["complexity"], "high")
+        self.assertEqual(report["complexity"], "low")
+        self.assertIn("complexity_model", report)
+        self.assertIn("confidence", report["complexity_model"])
         self.assertIn("script0 --> resource0", report["markdown"])
         self.assertIn("Conversion adjustment", report["markdown"])
         self.assertIn("does not execute SAS", report["markdown"])
