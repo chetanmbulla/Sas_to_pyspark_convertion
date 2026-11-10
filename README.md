@@ -720,6 +720,19 @@ the dataset schema. KEEP/DROP/RENAME dataset options, macro-generated code and
 `CALCULATED` references are not traced. `sas2pyspark.column_lineage.trace_column_lineage`
 walks edges upstream to ultimate source columns.
 
+The catalog also classifies every discovered script and resource. 
+`script_classification` gives each script a `role` (`entrypoint`, `included`,
+`unreached`) and, for reachable scripts, an `activity` (`producer` writes a
+non-WORK dataset or file, `work_only`, `read_only`, `no_io`) with its inputs and
+outputs; unreached scripts are the unused code, and `suspect_name` marks
+backup/test/dated names that are likely obsolete rather than a missing job.
+Unreached scripts are not scanned for I/O. `resource_roles` marks each dataset or file
+as `ultimate_source` (read, never written by reachable code), `intermediate` or
+`final_output`, flags WORK datasets as `temporary`, and lists the
+`ultimate_sources` upstream of each written dataset. Upstream tracing follows
+DATA-step SET/MERGE and PROC SQL lineage only; outputs written by other PROCs
+(`APPEND`, `SORT OUT=`, imports) have no traced upstream sources.
+
 `project report --pipeline-report pipeline.pipeline.json --catalog-report
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`

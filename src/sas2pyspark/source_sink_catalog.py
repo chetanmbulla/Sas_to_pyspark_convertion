@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from .discovery import _decode_source
 from .sas_parser import SasParseError, parse_program
 from .column_lineage import build_column_lineage, extract_assignments
+from .pipeline_roles import classify_resources, classify_scripts, summarize_roles
 from .schema_inference import infer_schemas, parse_sql_statement
 
 
@@ -462,6 +463,7 @@ def build_source_sink_catalog(
                 {
                     **ResourceEvidence(source_path, line, operation).to_dict(),
                     "server": execution_server,
+                    "direction": direction,
                 }
             )
 
@@ -496,7 +498,7 @@ def build_source_sink_catalog(
                 else next(iter(directions))
             )
             entry["evidence"].append(
-                ResourceEvidence(source_path, line, operation).to_dict()
+                {**ResourceEvidence(source_path, line, operation).to_dict(), "direction": direction}
             )
             if not location_known or re.search(r"&|%|^temp$", safe_name, re.I):
                 status = "unknown"
@@ -918,6 +920,18 @@ def build_source_sink_catalog(
         )
     unused_assets = sorted(set(asset_map) - set(datasets))
 
+    all_resources = [*datasets.values(), *files.values()]
+    dataset_edges: dict[str, set[str]] = {}
+    for output, inputs in data_lineage.items():
+        dataset_edges.setdefault(output, set()).update(inputs)
+    for create in sql_creates:
+        dataset_edges.setdefault(create["target"], set()).update(
+            name for name, _alias in create["tables"]
+        )
+    script_roles = classify_scripts(pipeline_report, all_resources)
+    resource_roles = classify_resources(all_resources, dataset_edges)
+    role_summary = summarize_roles(script_roles, resource_roles)
+
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
         "project_name": pipeline_report.get("project_name"),
@@ -931,6 +945,8 @@ def build_source_sink_catalog(
         ),
         "schemas": sorted(catalog_schemas, key=lambda item: item["dataset"]),
         "column_lineage": column_lineage,
+        "script_classification": script_roles,
+        "resource_roles": resource_roles,
         "dynamic_references": sorted(
             dynamic_references,
             key=lambda item: (
@@ -967,6 +983,7 @@ def build_source_sink_catalog(
             ),
             "unused_schema_assets": unused_assets,
             "column_lineage_edge_count": len(column_lineage),
+            **role_summary,
             "unresolved_column_lineage_count": sum(
                 not edge["resolved"] for edge in column_lineage
             ),
