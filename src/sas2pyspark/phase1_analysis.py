@@ -23,6 +23,9 @@ from .business_context import build_business_context, build_prompts, render_mark
 from .source_sink_catalog import build_source_sink_catalog, load_pipeline_report
 from .schema_assets import load_schema_assets
 from .synthetic_data import generate_synthetic_data, load_catalog_report
+from .validation import validate_generated_code
+from .enterprise_guide import build_enterprise_guide_inventory
+from .coverage_report import build_coverage_report
 
 _SIMPLE_LET = re.compile(
     r"^[ \t]*%let[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*([^;&%\r\n]*);",
@@ -89,6 +92,9 @@ def run_phase1_analysis(
         "conversion": out / "conversion.json",
         "report": out / "project-report.md",
         "complexity": out / "complexity.json",
+        "validation": out / "validation.json",
+        "enterprise_guide": out / "enterprise-guide.json",
+        "coverage": out / "coverage.json",
         "synthetic_data": out / "synthetic-data",
         "generated_code": out / "code",
     }
@@ -103,6 +109,8 @@ def run_phase1_analysis(
     for item in inventory.programs:
         project.add_program(item.path)
     inventory.save(files["inventory"])
+    enterprise_guide = build_enterprise_guide_inventory(repository_root)
+    _write_json(files["enterprise_guide"], enterprise_guide)
 
     pipeline = resolve_pipeline(repository_root, load_pipeline_config(config_file))
     pipeline.save(files["pipeline_report"])
@@ -180,6 +188,14 @@ def run_phase1_analysis(
         macro_variables=macro_variables,
     )
     conversion.save(files["conversion"])
+    validation = validate_generated_code(
+        conversion.to_dict(),
+        source_root=repository_root,
+        code_root=files["generated_code"],
+    )
+    _write_json(files["validation"], validation)
+    coverage = build_coverage_report(conversion.to_dict())
+    _write_json(files["coverage"], coverage)
     project.validate()
     project.save(files["project"])
 
@@ -233,6 +249,9 @@ def run_phase1_analysis(
         "business_context": context["summary"],
         "plan": plan.to_dict()["summary"],
         "conversion": conversion.to_dict()["summary"],
+        "validation": validation["summary"],
+        "enterprise_guide": enterprise_guide["summary"],
+        "coverage": coverage["summary"],
         "report": {
             "complexity_score": report["complexity_score"],
             "complexity": report["complexity"],

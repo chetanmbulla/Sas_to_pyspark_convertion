@@ -78,6 +78,9 @@ from .review_workflow import (
     build_review_report,
     record_review_decision,
 )
+from .validation import CodeValidationError, load_conversion_report, validate_generated_code
+from .enterprise_guide import EnterpriseGuideError, build_enterprise_guide_inventory
+from .coverage_report import CoverageReportError, build_coverage_report
 
 
 def _project_main(argv: list[str]) -> int:
@@ -188,6 +191,29 @@ def _project_main(argv: list[str]) -> int:
         action="store_true",
         help="Replace an existing Markdown report",
     )
+    code_validation_parser = commands.add_parser(
+        "validate-code",
+        help="Statically validate generated Python syntax and source freshness",
+    )
+    code_validation_parser.add_argument("--conversion-report", required=True)
+    code_validation_parser.add_argument("--source-root", required=True)
+    code_validation_parser.add_argument("--code-root", required=True)
+    code_validation_parser.add_argument("--report", required=True)
+    code_validation_parser.add_argument("--force", action="store_true")
+    eg_parser = commands.add_parser(
+        "enterprise-guide-inventory",
+        help="Inventory Enterprise Guide packages and stored-process markers",
+    )
+    eg_parser.add_argument("--root", required=True)
+    eg_parser.add_argument("--report", required=True)
+    eg_parser.add_argument("--force", action="store_true")
+    coverage_parser = commands.add_parser(
+        "coverage",
+        help="Summarize observed conversion outcomes without claiming general SAS coverage",
+    )
+    coverage_parser.add_argument("--conversion-report", required=True)
+    coverage_parser.add_argument("--output", required=True)
+    coverage_parser.add_argument("--force", action="store_true")
     synthetic_parser = commands.add_parser(
         "synthesize",
         help="Generate deterministic synthetic CSV fixtures from catalog schemas",
@@ -700,6 +726,74 @@ def _project_main(argv: list[str]) -> int:
                 f"(complexity {report['complexity_score']}/100, "
                 f"{report['summary']['unresolved_finding_count']} finding(s))."
             )
+        elif args.command == "validate-code":
+            report_path = Path(args.report).resolve(strict=False)
+            if report_path.exists() and not args.force:
+                raise CodeValidationError(
+                    f"Validation report already exists: {report_path}. Use --force to replace it."
+                )
+            result = validate_generated_code(
+                load_conversion_report(args.conversion_report),
+                source_root=args.source_root,
+                code_root=args.code_root,
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            print(
+                f"Statically validated {result['summary']['passed']} of "
+                f"{result['summary']['validated']} generated file(s); "
+                f"{result['summary']['failed']} failed."
+            )
+            print(f"Validation report: {report_path}")
+            if result["summary"]["failed"]:
+                return 1
+        elif args.command == "enterprise-guide-inventory":
+            report_path = Path(args.report).resolve(strict=False)
+            if report_path.exists() and not args.force:
+                raise EnterpriseGuideError(
+                    f"Inventory report already exists: {report_path}. Use --force to replace it."
+                )
+            result = build_enterprise_guide_inventory(args.root)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            summary = result["summary"]
+            print(
+                f"Inventoried {summary['package_count']} EG package(s) and "
+                f"{summary['stored_process_count']} stored-process marker(s); "
+                f"{summary['web_output_candidate_count']} web-output candidate(s)."
+            )
+            print(f"Enterprise Guide inventory: {report_path}")
+            if summary["issue_count"]:
+                return 1
+        elif args.command == "coverage":
+            output_path = Path(args.output).resolve(strict=False)
+            if output_path.exists() and not args.force:
+                raise CoverageReportError(
+                    f"Coverage report already exists: {output_path}. Use --force to replace it."
+                )
+            conversion_report = load_conversion_report(args.conversion_report)
+            result = build_coverage_report(conversion_report)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            summary = result["summary"]
+            print(
+                f"Observed conversion rate: {summary['succeeded']}/"
+                f"{summary['program_count']} ({summary['observed_conversion_rate']:.1%}); "
+                f"{summary['blocker_category_count']} blocker category/categories."
+            )
+            print(f"Coverage report: {output_path}")
         elif args.command == "synthesize":
             catalog = load_catalog_report(args.catalog)
             report = generate_synthetic_data(
@@ -1258,6 +1352,9 @@ def _project_main(argv: list[str]) -> int:
         SchemaAssetError,
         KnowledgeGraphError,
         BusinessContextError,
+        CodeValidationError,
+        EnterpriseGuideError,
+        CoverageReportError,
     ) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)
         return 2

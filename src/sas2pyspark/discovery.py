@@ -27,6 +27,7 @@ DEFAULT_ASSET_EXTENSIONS = (
     ".csv",
     ".dat",
     ".dbf",
+    ".egp",
     ".ini",
     ".json",
     ".parquet",

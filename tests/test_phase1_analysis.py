@@ -45,6 +45,11 @@ class Phase1AnalysisTests(unittest.TestCase):
         self.assertEqual(index, json.loads((self.out / "phase1-index.json").read_text("utf-8")))
         self.assertEqual(index["summaries"]["pipeline"]["script_count"], 1)
         self.assertTrue((self.out / "code" / "pyspark").is_dir())
+        self.assertTrue((self.out / "validation.json").is_file())
+        self.assertTrue((self.out / "enterprise-guide.json").is_file())
+        self.assertTrue((self.out / "coverage.json").is_file())
+        self.assertIn("validation", index["summaries"])
+        self.assertIn("coverage", index["summaries"])
         self.assertEqual(before, sorted(path.name for path in self.root.rglob("*")))
 
     def test_refuses_non_empty_output_without_force(self):

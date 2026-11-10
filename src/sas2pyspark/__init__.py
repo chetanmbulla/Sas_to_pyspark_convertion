@@ -99,6 +99,12 @@ from .synthetic_data import (
     generate_synthetic_data,
     load_catalog_report,
 )
+from .validation import CodeValidationError, validate_generated_code
+from .enterprise_guide import (
+    EnterpriseGuideError,
+    build_enterprise_guide_inventory,
+)
+from .coverage_report import CoverageReportError, build_coverage_report
 
 __all__ = [
     "AssetInventory",
@@ -111,6 +117,8 @@ __all__ = [
     "Conversion",
     "ConversionError",
     "ConversionResult",
+    "CodeValidationError",
+    "CoverageReportError",
     "Dataset",
     "Dependency",
     "DependencyAnalysisError",
@@ -122,6 +130,7 @@ __all__ = [
     "ExecutionInput",
     "ExecutionReport",
     "ExecutionWorkflowError",
+    "EnterpriseGuideError",
     "EVIDENCE_CATEGORIES",
     "EvidenceRecord",
     "GovernanceError",
@@ -158,6 +167,8 @@ __all__ = [
     "SasToPySparkConverter",
     "UnresolvedReference",
     "build_migration_plan",
+    "build_coverage_report",
+    "build_enterprise_guide_inventory",
     "build_readiness_report",
     "build_source_sink_catalog",
     "build_project_report",
@@ -165,6 +176,7 @@ __all__ = [
     "generate_synthetic_data",
     "convert_sas",
     "convert_project",
+    "validate_generated_code",
     "discover_repository",
     "build_review_report",
     "load_pipeline_config",

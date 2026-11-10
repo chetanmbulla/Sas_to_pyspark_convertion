@@ -804,6 +804,28 @@ that the resolver follows are also inlined by the converter. Library-level
 `%INCLUDE` accepts CRLF sources, and PROC SORT/APPEND/DATASETS/FREQ headers
 accept blanks around `=`.
 
+Phase 1 also writes `validation.json`, `coverage.json`, and
+`enterprise-guide.json`. Validation parses successful generated Python with
+`ast` and checks each source hash; it never executes generated code.
+`project validate-code --conversion-report conversion.json --source-root
+<sas-root> --code-root <generated-code-root> --report validation.json` runs the
+same checks independently. Spark semantic execution and output reconciliation
+remain separate validation stages.
+
+`project enterprise-guide-inventory --root <sas-root> --report
+enterprise-guide.json` inventories `.egp` archive members without extracting
+or executing the package. It reports embedded SAS/XML member names and detects
+stored-process markers (`%STPBEGIN`/`%STPEND`) or lower-confidence web-output
+markers. This is metadata discovery only; it does not convert EG flows,
+resolve SAS Metadata Server definitions, or prove that a candidate is a
+deployable stored process.
+
+`project coverage --conversion-report conversion.json --output coverage.json`
+summarizes the observed corpus conversion outcomes by blocker category. Its
+conversion rate applies only to that report's programs, not to general SAS
+syntax coverage. Inspect `coverage.json` alongside `conversion.json` before
+planning additional converter support.
+
 `project synthesize --catalog project.catalog.json --output-dir test-data
 --rows 100 --seed 0` creates deterministic CSV fixtures and a
 `synthetic-data-manifest.json`. Only numeric and character columns with known

@@ -21,6 +21,7 @@ listed as supported or approximate should be treated as unsupported.
 | Area | Status | Current boundary |
 |---|---|---|
 | Lexing and diagnostics | Partial | Comments, strings, tokens, semicolon-terminated statements, and source spans; not a complete SAS grammar. |
+| Enterprise Guide and stored processes | Inventory only | `.egp` archives are listed without extraction; embedded SAS/XML member names and stored-process/web-output markers are inventoried. EG flow graphs, metadata-server bindings, and stored-process deployment semantics are not converted. |
 | DATA steps | Partial | Documented `SET`/`MERGE`, assignments, filters, selected blocks, arrays, loops, `OUTPUT`, `RETAIN`, `BY`, and dataset options only. Unsupported forms fail conversion. |
 | Macros | Partial | Bounded macro expansion and selected macro statements/functions; not the complete macro facility. |
 | Procedures | Partial | Selected forms of `SORT`, `FREQ`, `MEANS`/`SUMMARY`, `TRANSPOSE`, `IMPORT`, `EXPORT`, `SQL`, `FORMAT`, and report procedures. Most PROCs are unsupported. |
@@ -29,6 +30,12 @@ listed as supported or approximate should be treated as unsupported.
 | Sort tie behavior | Approximate | `PROC SORT NODUPKEY` may retain a different tied row than SAS. |
 | Missing values and types | Approximate | SAS missing values, fixed-width character behavior, implicit conversions, and Spark schema/type coercion are not universally equivalent. |
 | Execution and comparison | Separate from conversion | Generated code needs Spark; syntax validity alone does not establish runtime or business-result parity. Reconciliation requires reference outputs. |
+
+`project validate-code` syntax-checks generated Python without executing it and
+verifies that each successful conversion still matches its source hash.
+`project coverage` groups observed conversion failures for the supplied corpus.
+Neither report certifies general SAS syntax coverage or behavioral equivalence.
+Spark semantic fixtures and reference-data reconciliation remain separate gates.
 
 Use the [README supported-syntax section](../README.md#supported-syntax) as
 the detailed inventory of implemented statements, options, limitations, and
