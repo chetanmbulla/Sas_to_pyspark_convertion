@@ -150,6 +150,31 @@ not validate business equivalence against SAS automatically. Performance
 notices are heuristics, and timings on small samples are not production
 benchmarks.
 
+### Project analysis
+
+Select **Project Analysis** in the sidebar to upload a ZIP containing a SAS
+project and run Phase 1. ZIP uploads are limited to 100 MiB compressed, 512 MiB
+extracted, and 10,000 members. Optionally upload a pipeline configuration JSON
+whose paths are relative to the ZIP root (see
+[pipeline configuration](#migration-project-foundation)). Without a configuration,
+every SAS file is treated as an entrypoint on a placeholder server; job
+reachability and server drive mappings are not authoritative.
+
+The page displays Phase 1 summaries, conversion counts and failure reasons,
+and offers report downloads. It also generates synthetic CSV fixtures from
+known catalog schemas; unknown schemas are skipped and partial schemas may
+omit required columns. Adjust the row count and seed to generate new fixtures.
+Select the fixtures to use as inputs and confirm that the project is trusted
+before executing converted programs. Each program runs independently, not as
+a chained pipeline; review per-program status and stderr for failures. Programs
+that failed conversion are not executed. Execution success does not establish
+SAS equivalence.
+
+Project uploads, reports, generated code, fixtures, and execution logs are
+stored in a persistent local temporary workspace shown on the page. Remove
+these workspaces manually when no longer needed, especially if they contain
+sensitive data.
+
 **Security:** Testing runs Python code with the permissions of the account
 running Streamlit; the worker process and timeout are not a security sandbox.
 Only run code you trust, keep the app local, and use an externally managed

@@ -17,6 +17,7 @@ st.write(
     "Convert SAS source, review or edit the generated PySpark, and test it "
     "against sample data."
 )
+st.info("For ZIP projects and Phase 1 reports, open **Project Analysis** in the sidebar.")
 st.warning(
     "Testing executes Python code under the account running this app. "
     "This is not a security sandbox; only run code you trust, and keep the "
