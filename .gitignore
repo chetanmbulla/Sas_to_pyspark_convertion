@@ -19,3 +19,6 @@ runs/
 /output*.py
 /migration.project*.json
 /test-input1.project*.json
+
+Source_Data/
+Phase1_Output/

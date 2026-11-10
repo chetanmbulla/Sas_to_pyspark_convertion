@@ -226,6 +226,157 @@ class PipelineResolverTests(unittest.TestCase):
         )
         self.assertTrue(any(item["kind"] == "filename" for item in report["issues"]))
 
+    def _write_job(self, root: Path, source: str) -> dict:
+        base = root / "server" / "V"
+        base.mkdir(parents=True)
+        (base / "a.sas").write_text(source, encoding="utf-8")
+        (base / "inc.sas").write_text("data x; run;", encoding="utf-8")
+        return {
+            "schema_version": 1,
+            "servers": {"DI": {"drives": {"V": "server/V"}}},
+            "entrypoints": [{"server": "DI", "path": "server/V/a.sas"}],
+        }
+
+    def test_include_of_file_written_by_same_script_is_runtime_generated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(
+                Path(directory),
+                "filename tmp '&temp'; data _null_; file tmp; put 'x;'; run; %include tmp;",
+            )
+            report = resolve_pipeline(directory, config).to_dict()
+
+        statuses = [item["status"] for item in report["includes"]]
+        self.assertEqual(statuses, ["runtime_generated"])
+        self.assertEqual(report["summary"]["runtime_generated_include_count"], 1)
+        self.assertEqual(report["summary"]["unresolved_include_count"], 0)
+        self.assertFalse(any(item["kind"] == "include" for item in report["issues"]))
+
+    def test_config_macro_variables_resolve_includes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "%include '&base.\\inc.sas';")
+            report = resolve_pipeline(directory, config).to_dict()
+            self.assertEqual(report["summary"]["unresolved_include_count"], 1)
+            config["macro_variables"] = {"BASE": "v:"}
+            report = resolve_pipeline(directory, config).to_dict()
+
+        self.assertEqual(report["summary"]["resolved_include_count"], 1)
+        self.assertEqual(report["summary"]["unresolved_include_count"], 0)
+
+    def test_waived_include_is_recorded_with_reason_and_not_unresolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "%include 'V:\\Admin\\missing.sas';")
+            config["waived_includes"] = [
+                {"reference": "v:/admin/MISSING.sas", "reason": "Not provided by client."}
+            ]
+            report = resolve_pipeline(directory, config).to_dict()
+
+        self.assertEqual(report["includes"][0]["status"], "waived")
+        self.assertEqual(report["includes"][0]["reason"], "Not provided by client.")
+        self.assertEqual(report["summary"]["waived_include_count"], 1)
+        self.assertEqual(report["summary"]["unresolved_include_count"], 0)
+
+    def test_drive_relative_include_requires_opt_in_and_records_assumption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "%include 'V:inc.sas';")
+            rejected = resolve_pipeline(directory, config).to_dict()
+            config["drive_relative_paths"] = "drive_root"
+            accepted = resolve_pipeline(directory, config).to_dict()
+
+        self.assertEqual(rejected["summary"]["unresolved_include_count"], 1)
+        self.assertEqual(accepted["summary"]["resolved_include_count"], 1)
+        self.assertTrue(
+            any(item["kind"] == "drive_relative_assumed_root" for item in accepted["issues"])
+        )
+
+    def test_inc_abbreviation_and_remote_host_mapping_with_seeding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            di = root / "di" / "V"
+            bi = root / "bi" / "U"
+            di.mkdir(parents=True)
+            bi.mkdir(parents=True)
+            (di / "macro.sas").write_text(
+                "%let tcpsec = user.pwd;\n"
+                "%let node = bi.example.net 1473;\n"
+                "options remote=node; signon node;\n"
+                "rsubmit node; %let enduse = u: ; endrsubmit node;\n",
+                encoding="utf-8",
+            )
+            (di / "a.sas").write_text(
+                "%inc 'v:\\macro.sas'; rsubmit node; libname l 'u:\\x'; endrsubmit node;",
+                encoding="utf-8",
+            )
+            (bi / "b.sas").write_text(
+                "libname d '&enduse.\\data';", encoding="utf-8"
+            )
+            config = {
+                "schema_version": 1,
+                "servers": {
+                    "DI": {"drives": {"V": "di/V"}},
+                    "BI": {"drives": {"U": "bi/U"}},
+                },
+                "entrypoints": [
+                    {"server": "DI", "path": "di/V/a.sas"},
+                    {"server": "BI", "path": "bi/U/b.sas"},
+                ],
+                "remote_hosts": {"BI.example.net": "BI"},
+                "seed_remote_macro_variables": True,
+                "jams_jobs": [
+                    {
+                        "name": "JOB_A",
+                        "entrypoint": "di/V/a.sas",
+                        "depends_on": [],
+                        "parameters": {"password": "x", "mode": "full"},
+                    }
+                ],
+            }
+            report = resolve_pipeline(directory, config).to_dict()
+
+        self.assertEqual(report["summary"]["resolved_remote_block_count"], 2)
+        self.assertTrue(all(b["status"] == "resolved" for b in report["remote_blocks"]))
+        self.assertEqual(report["remote_endpoints"][0]["target_server"], "BI")
+        self.assertEqual(report["remote_endpoints"][0]["port"], 1473)
+        self.assertNotIn("user.pwd", json.dumps(report))
+        self.assertEqual(report["summary"]["unresolved_library_count"], 0)
+        self.assertTrue(
+            any(i["kind"] == "remote_macro_variable_seeded" for i in report["issues"])
+        )
+        job = next(j for j in report["jobs"] if j["name"] == "JOB_A")
+        self.assertEqual(job["jams"]["parameters"]["password"], "<redacted>")
+
+    def test_unmapped_drive_is_summarized_with_reason_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "libname q 'W:\\data';")
+            report = resolve_pipeline(directory, config).to_dict()
+
+        self.assertEqual(report["libraries"][0]["reason_code"], "drive_not_mapped")
+        self.assertEqual(
+            report["summary"]["unmapped_drives"],
+            [{"server": "DI", "drive": "W", "library_count": 1}],
+        )
+
+    def test_jams_job_dependency_must_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "data x; run;")
+            config["jams_jobs"] = [
+                {"name": "A", "entrypoint": "server/V/a.sas", "depends_on": ["B"]}
+            ]
+            with self.assertRaises(PipelineResolverError):
+                resolve_pipeline(directory, config)
+
+    def test_rejects_invalid_resolution_options(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._write_job(Path(directory), "data x; run;")
+            for key, value in (
+                ("drive_relative_paths", "guess"),
+                ("waived_includes", [{"reference": "a.sas"}]),
+                ("macro_variables", {"1bad": "x"}),
+            ):
+                with self.subTest(key=key):
+                    broken = {**config, key: value}
+                    with self.assertRaises(PipelineResolverError):
+                        resolve_pipeline(directory, broken)
+
     def test_rejects_unsafe_drive_mappings_and_unknown_entrypoint_server(self):
         config = {
             "schema_version": 1,

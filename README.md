@@ -650,6 +650,27 @@ branches are not executed, and dynamic paths, unsupported `FILENAME` forms,
 or unresolved remote aliases are reported for review. It does not execute SAS
 or establish that an unreached script is unused outside the configured
 entrypoints.
+Optional config keys make remaining gaps explicit instead of silent:
+`macro_variables` (values for `&name` references the code cannot define),
+`waived_includes` (`reference` + mandatory `reason`, for includes outside the
+supplied corpus), and `drive_relative_paths: "drive_root"` (resolve
+`U:folder\file.sas` against the drive root; each use is reported as a
+`drive_relative_assumed_root` issue). Includes of a fileref the same script
+writes with `FILE` are reported as `runtime_generated`, and waived ones as
+`waived`; neither counts as unresolved, but their contents are not analyzed.
+`%INC` is treated like `%INCLUDE`. Remote aliases come from `remote_aliases`
+or, when the alias is set with `%LET alias = host port`, from `remote_hosts`
+(host → server); the endpoint (never credentials such as `tcpsec`) is listed
+under `remote_endpoints`. `%LET`s made inside a mapped `RSUBMIT` are reported as
+`remote_macro_variables`; with `seed_remote_macro_variables: true` they are
+used as a flagged fallback for that server's scripts (issue
+`remote_macro_variable_seeded`). `server_macro_variables` supplies per-server
+values. Unresolved libraries carry a `reason_code` and the summary lists
+`unmapped_drives` (server, drive, count) to request from the client. `jobs`
+lists each entrypoint's declared job name/source, ordered includes and
+commented-out includes; optional `jams_jobs` (`name`, `entrypoint`, `schedule`,
+`depends_on`, `parameters`; sensitive parameter names are redacted) attaches
+JAMS metadata. A native JAMS export parser needs a sample export.
 The resolver records each remote block's target and source lines, but does not
 reproduce SAS/CONNECT sessions, transfer state, credentials, or remote runtime
 behavior. `project convert` rejects SAS/CONNECT control statements rather than
@@ -679,6 +700,17 @@ scores start from the static plan score and incorporate observed conversion
 failures, not-yet-run programs, and warnings. Scores are prioritization
 heuristics, not effort estimates or evidence of runtime equivalence. Existing
 Markdown reports are protected; use `--force` to replace one.
+
+`project analyze --root <repo> --config pipeline.json --out <folder>` runs
+discover, resolve-pipeline, catalog, plan, convert, report and synthesize in one
+step. Everything lands in `<folder>`: `inventory.json`, `pipeline-report.json`,
+`catalog.json`, `plan.json`, `conversion.json`, `project.json`,
+`project-report.md`, `synthetic-data/`, generated PySpark under `code/`, and
+`phase1-index.json` (artifact paths, per-step summaries, and limitations). The
+output folder must be outside `--root`, so the SAS tree is never modified, and a
+non-empty folder is reused only with `--force`. It accepts `--sas-version`,
+`--rows`, and `--seed`. The same static-analysis limits as the individual
+commands apply.
 
 `project synthesize --catalog project.catalog.json --output-dir test-data
 --rows 100 --seed 0` creates deterministic CSV fixtures and a

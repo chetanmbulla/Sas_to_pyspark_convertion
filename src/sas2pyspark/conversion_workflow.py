@@ -139,8 +139,12 @@ def convert_project(
     converter_version: str = "0.1.0",
     force: bool = False,
     sas_version: str = "auto",
+    output_base: str | Path | None = None,
 ) -> BatchConversionReport:
-    """Convert each registered program independently and record its outcome."""
+    """Convert each registered program independently and record its outcome.
+
+    Generated files are written under ``output_base`` (default: the repository root).
+    """
     project.validate()
     try:
         root = Path(repository_root).resolve(strict=True)
@@ -153,9 +157,14 @@ def convert_project(
             f"Repository root is not a directory: {str(root)!r}."
         )
     output_relative = _output_directory(output_directory)
-    output_root = (root / Path(output_relative)).resolve(strict=False)
+    if output_base is None:
+        base = root
+    else:
+        base = Path(output_base).resolve(strict=False)
+        base.mkdir(parents=True, exist_ok=True)
+    output_root = (base / Path(output_relative)).resolve(strict=False)
     try:
-        output_root.relative_to(root)
+        output_root.relative_to(base)
     except ValueError:
         raise BatchConversionError("Output directory escapes the repository root.") from None
 
@@ -184,9 +193,9 @@ def convert_project(
         output_relative_path = (
             PurePosixPath(output_relative) / PurePosixPath(source_relative)
         ).with_suffix(".py").as_posix()
-        output_path = (root / Path(output_relative_path)).resolve(strict=False)
+        output_path = (base / Path(output_relative_path)).resolve(strict=False)
         try:
-            output_path.relative_to(root)
+            output_path.relative_to(base)
         except ValueError:
             outcomes.append(
                 ProgramConversionOutcome(

@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
@@ -17,9 +17,11 @@ from .sas_parser import SasParseError, parse_program
 
 PIPELINE_REPORT_SCHEMA_VERSION = 1
 _DRIVE = re.compile(r"^[A-Za-z]$")
-_DIRECT_INCLUDE = re.compile(r"^\s*%include\s+(['\"])(.*?)\1(?:\s+.*)?$", re.I | re.S)
+_DIRECT_INCLUDE = re.compile(
+    r"^\s*%inc(?:lude)?\s+(['\"])(.*?)\1(?:\s+.*)?$", re.I | re.S
+)
 _FILEREF_INCLUDE = re.compile(
-    r"^\s*%include\s+([A-Za-z_]\w*)\s*\(\s*([^)]+?)\s*\)\s*$",
+    r"^\s*%inc(?:lude)?\s+([A-Za-z_]\w*)\s*\(\s*([^)]+?)\s*\)\s*$",
     re.I | re.S,
 )
 _FILENAME = re.compile(
@@ -46,7 +48,19 @@ _LIBNAME_ENGINE = re.compile(
 _SQL_CONNECT = re.compile(r"^\s*connect\s+to\s+([A-Za-z_]\w*)\b", re.I)
 _LET = re.compile(r"^\s*%let\s+([A-Za-z_]\w*)\s*=\s*(.*?)\s*$", re.I | re.S)
 _MACRO_VARIABLE = re.compile(r"&([A-Za-z_]\w*)\.?")
-_FILEREF_INCLUDE_FILE = re.compile(r"^\s*%include\s+([A-Za-z_]\w*)\s*$", re.I)
+_FILEREF_INCLUDE_FILE = re.compile(r"^\s*%inc(?:lude)?\s+([A-Za-z_]\w*)\s*$", re.I)
+_ANY_INCLUDE = re.compile(r"^\s*%inc(?:lude)?\b", re.I)
+_COMMENTED_INCLUDE = re.compile(r"%inc(?:lude)?\s+[^;]+", re.I)
+_COMMENT_BLOCK = re.compile(r"/\*.*?\*/|^[ \t]*\*[^;]*;", re.S | re.M)
+_ENDPOINT = re.compile(r"^\s*([A-Za-z0-9_.\-]+)(?:\s+(\d{1,5}))?\s*$")
+_JOB_NAME = re.compile(r"\bjobname\s*=\s*(['\"])(.*?)\1", re.I)
+_JOB_SOURCE = re.compile(r"\bsource\s*=\s*(['\"])(.*?)\1", re.I)
+_JAMS_JOB_FIELDS = frozenset(
+    {"name", "entrypoint", "schedule", "depends_on", "parameters"}
+)
+_SENSITIVE_NAME = re.compile(r"(?i)pass|pwd|secret|token|tcpsec|credential|key")
+_FILE_OUTPUT = re.compile(r"^\s*file\s+([A-Za-z_]\w*)\b", re.I)
+_DRIVE_RELATIVE_POLICIES = ("reject", "drive_root")
 _SENSITIVE_OPTION = re.compile(
     r"(?i)(password|passwd|pwd|user(name)?|uid|token|secret|credential|"
     r"access[._-]?key)\s*=\s*('[^']*'|\"[^\"]*\"|[^;\s,)]+)"
@@ -112,6 +126,7 @@ class PipelineLibrary:
     physical_path: str
     repository_path: str | None
     status: str
+    reason_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +137,62 @@ class PipelineLibrary:
             "physical_path": self.physical_path,
             "repository_path": self.repository_path,
             "status": self.status,
+            "reason_code": self.reason_code,
+        }
+
+
+def _reason_code(message: str) -> str:
+    lowered = message.casefold()
+    if "is not mapped for server" in lowered:
+        return "drive_not_mapped"
+    if "statically known value" in lowered or lowered.startswith("macro variable"):
+        return "macro_variable_unknown"
+    if "remote server is unknown" in lowered:
+        return "remote_server_unknown"
+    if "drive-relative" in lowered:
+        return "drive_relative_unsupported"
+    if "unc or unmapped" in lowered:
+        return "unc_unsupported"
+    if "working directory" in lowered:
+        return "no_working_directory"
+    return "unresolved"
+
+
+@dataclass(frozen=True)
+class PipelineRemoteEndpoint:
+    source: str
+    line: int
+    alias: str
+    host: str
+    port: int | None
+    target_server: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "line": self.line,
+            "alias": self.alias,
+            "host": self.host,
+            "port": self.port,
+            "target_server": self.target_server,
+        }
+
+
+@dataclass(frozen=True)
+class PipelineRemoteMacroVariable:
+    server: str
+    name: str
+    value: str
+    source: str
+    line: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "server": self.server,
+            "name": self.name,
+            "value": self.value,
+            "source": self.source,
+            "line": self.line,
         }
 
 
@@ -221,7 +292,22 @@ class PipelineReport:
     remote_blocks: tuple[PipelineRemoteBlock, ...]
     external_connections: tuple[PipelineExternalConnection, ...]
     issues: tuple[PipelineIssue, ...]
+    remote_endpoints: tuple[PipelineRemoteEndpoint, ...] = ()
+    remote_macro_variables: tuple[PipelineRemoteMacroVariable, ...] = ()
+    jobs: tuple[dict[str, Any], ...] = ()
     schema_version: int = PIPELINE_REPORT_SCHEMA_VERSION
+
+    def _unmapped_drives(self) -> list[dict[str, Any]]:
+        counts: dict[tuple[str, str], int] = {}
+        for library in self.libraries:
+            if library.reason_code != "drive_not_mapped":
+                continue
+            drive = PureWindowsPath(library.physical_path).drive.rstrip(":").upper()
+            counts[(library.server, drive)] = counts.get((library.server, drive), 0) + 1
+        return [
+            {"server": server, "drive": drive, "library_count": count}
+            for (server, drive), count in sorted(counts.items())
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         reachable = sum(item.status == "reachable" for item in self.scripts)
@@ -230,6 +316,7 @@ class PipelineReport:
             "repository_root": self.repository_root,
             "generated_at": self.generated_at,
             "entrypoints": [dict(item) for item in self.entrypoints],
+            "jobs": [dict(item) for item in self.jobs],
             "scripts": [item.to_dict() for item in self.scripts],
             "includes": [item.to_dict() for item in self.includes],
             "libraries": [item.to_dict() for item in self.libraries],
@@ -237,23 +324,41 @@ class PipelineReport:
                 item.to_dict() for item in self.remote_references
             ],
             "remote_blocks": [item.to_dict() for item in self.remote_blocks],
+            "remote_endpoints": [item.to_dict() for item in self.remote_endpoints],
+            "remote_macro_variables": [
+                item.to_dict() for item in self.remote_macro_variables
+            ],
             "external_connections": [
                 item.to_dict() for item in self.external_connections
             ],
             "issues": [item.to_dict() for item in self.issues],
             "summary": {
                 "script_count": len(self.scripts),
+                "job_count": len(self.jobs),
                 "reachable_script_count": reachable,
                 "unreached_script_count": len(self.scripts) - reachable,
                 "resolved_include_count": sum(
                     item.status == "resolved" for item in self.includes
                 ),
                 "unresolved_include_count": sum(
-                    item.status != "resolved" for item in self.includes
+                    item.status == "unresolved" for item in self.includes
+                ),
+                "runtime_generated_include_count": sum(
+                    item.status == "runtime_generated" for item in self.includes
+                ),
+                "waived_include_count": sum(
+                    item.status == "waived" for item in self.includes
                 ),
                 "library_count": len(self.libraries),
+                "unresolved_library_count": sum(
+                    item.status != "mapped" for item in self.libraries
+                ),
+                "unmapped_drives": self._unmapped_drives(),
                 "remote_reference_count": len(self.remote_references),
                 "remote_block_count": len(self.remote_blocks),
+                "resolved_remote_block_count": sum(
+                    item.status == "resolved" for item in self.remote_blocks
+                ),
                 "external_connection_count": len(self.external_connections),
                 "issue_count": len(self.issues),
             },
@@ -264,6 +369,9 @@ class PipelineReport:
                 "as a mapping between server names.",
                 "Dynamic macro-generated paths and unsupported FILENAME forms "
                 "remain unresolved.",
+                "Includes of files written by the same script at run time "
+                "(runtime_generated) and includes waived in the configuration "
+                "(waived) are not analyzed; their contents are unknown.",
             ],
         }
 
@@ -298,17 +406,166 @@ def _relative_path(value: Any, field: str) -> str:
     return normalized
 
 
+@dataclass(frozen=True)
+class _ResolverOptions:
+    macro_variables: Mapping[str, str]
+    waived_includes: tuple[tuple[str, str], ...]
+    drive_relative_root: bool
+    remote_hosts: Mapping[str, str] = field(default_factory=dict)
+    seed_remote_macro_variables: bool = False
+    server_macro_variables: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
+    jams_jobs: tuple[dict[str, Any], ...] = ()
+
+
+def _normalize_reference(value: str) -> str:
+    return value.strip().strip("'\"").replace("/", "\\").casefold()
+
+
+def _load_options(config: Mapping[str, Any]) -> _ResolverOptions:
+    raw_macros = config.get("macro_variables", {})
+    if not isinstance(raw_macros, dict):
+        raise PipelineResolverError("macro_variables must be an object.")
+    macros: dict[str, str] = {}
+    for name, value in raw_macros.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_]\w*", name):
+            raise PipelineResolverError(f"Invalid macro variable name {name!r}.")
+        if not isinstance(value, str):
+            raise PipelineResolverError(
+                f"Macro variable {name!r} must have a string value."
+            )
+        macros[name.casefold()] = value
+
+    raw_waivers = config.get("waived_includes", [])
+    if not isinstance(raw_waivers, list):
+        raise PipelineResolverError("waived_includes must be a list.")
+    waivers: list[tuple[str, str]] = []
+    for item in raw_waivers:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"reference", "reason"}
+            or not all(isinstance(item[field], str) and item[field].strip() for field in item)
+        ):
+            raise PipelineResolverError(
+                "Each waived include requires a non-empty reference and reason."
+            )
+        waivers.append((_normalize_reference(item["reference"]), item["reason"].strip()))
+
+    policy = config.get("drive_relative_paths", "reject")
+    if policy not in _DRIVE_RELATIVE_POLICIES:
+        raise PipelineResolverError(
+            f"drive_relative_paths must be one of {list(_DRIVE_RELATIVE_POLICIES)}."
+        )
+    raw_hosts = config.get("remote_hosts", {})
+    if not isinstance(raw_hosts, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+        for k, v in raw_hosts.items()
+    ):
+        raise PipelineResolverError(
+            "remote_hosts must map host names to configured server names."
+        )
+    hosts = {k.strip().casefold(): v for k, v in raw_hosts.items()}
+
+    seeding = config.get("seed_remote_macro_variables", False)
+    if not isinstance(seeding, bool):
+        raise PipelineResolverError("seed_remote_macro_variables must be a boolean.")
+
+    raw_server_macros = config.get("server_macro_variables", {})
+    if not isinstance(raw_server_macros, dict):
+        raise PipelineResolverError("server_macro_variables must be an object.")
+    server_macros: dict[str, dict[str, str]] = {}
+    for server, values in raw_server_macros.items():
+        if not isinstance(values, dict) or not all(
+            isinstance(n, str)
+            and re.fullmatch(r"[A-Za-z_]\w*", n)
+            and isinstance(v, str)
+            for n, v in values.items()
+        ):
+            raise PipelineResolverError(
+                f"server_macro_variables.{server} must map macro names to strings."
+            )
+        server_macros[str(server).casefold()] = {
+            n.casefold(): v for n, v in values.items()
+        }
+
+    raw_jobs = config.get("jams_jobs", [])
+    if not isinstance(raw_jobs, list):
+        raise PipelineResolverError("jams_jobs must be a list.")
+    jobs: list[dict[str, Any]] = []
+    for item in raw_jobs:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not item["name"].strip()
+            or not isinstance(item.get("entrypoint"), str)
+            or set(item).difference(_JAMS_JOB_FIELDS)
+        ):
+            raise PipelineResolverError(
+                "Each jams_jobs item requires name and entrypoint; optional fields: "
+                + ", ".join(sorted(_JAMS_JOB_FIELDS - {"name", "entrypoint"}))
+                + "."
+            )
+        depends = item.get("depends_on", [])
+        params = item.get("parameters", {})
+        if not isinstance(depends, list) or not all(isinstance(d, str) for d in depends):
+            raise PipelineResolverError("jams_jobs depends_on must be a list of names.")
+        if not isinstance(params, dict):
+            raise PipelineResolverError("jams_jobs parameters must be an object.")
+        jobs.append(
+            {
+                "name": item["name"].strip(),
+                "entrypoint": _normalize_reference(item["entrypoint"]),
+                "schedule": item.get("schedule"),
+                "depends_on": list(depends),
+                "parameters": {
+                    str(k): "<redacted>" if _SENSITIVE_NAME.search(str(k)) else str(v)
+                    for k, v in params.items()
+                },
+            }
+        )
+    names = [job["name"].casefold() for job in jobs]
+    if len(set(names)) != len(names):
+        raise PipelineResolverError("jams_jobs names must be unique.")
+    for job in jobs:
+        for dependency in job["depends_on"]:
+            if dependency.casefold() not in names:
+                raise PipelineResolverError(
+                    f"JAMS job {job['name']!r} depends on unknown job {dependency!r}."
+                )
+    return _ResolverOptions(
+        macros,
+        tuple(waivers),
+        policy == "drive_root",
+        hosts,
+        seeding,
+        server_macros,
+        tuple(jobs),
+    )
+
+
 def _load_config(config: Mapping[str, Any]) -> tuple[
     tuple[_ServerConfig, ...], tuple[dict[str, str], ...], dict[str, str]
 ]:
     expected = {"schema_version", "servers", "entrypoints"}
-    optional = {"remote_aliases"}
+    optional = {
+        "remote_aliases",
+        "macro_variables",
+        "waived_includes",
+        "drive_relative_paths",
+        "remote_hosts",
+        "seed_remote_macro_variables",
+        "server_macro_variables",
+        "jams_jobs",
+    }
     if not isinstance(config, Mapping):
         raise PipelineResolverError("Pipeline config must be a JSON object.")
     if set(config).difference(expected | optional) or expected.difference(config):
         raise PipelineResolverError(
             "Pipeline config requires schema_version, servers, and entrypoints; "
-            "only remote_aliases is optional."
+            "only remote_aliases, remote_hosts, macro_variables, "
+            "server_macro_variables, seed_remote_macro_variables, "
+            "waived_includes, drive_relative_paths, and jams_jobs are optional."
         )
     if type(config["schema_version"]) is not int or config["schema_version"] != 1:
         raise PipelineResolverError(
@@ -396,8 +653,15 @@ def _load_config(config: Mapping[str, Any]) -> tuple[
 
 
 class _PathResolver:
-    def __init__(self, root: Path, servers: tuple[_ServerConfig, ...]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        servers: tuple[_ServerConfig, ...],
+        *,
+        drive_relative_root: bool = False,
+    ) -> None:
         self.root = root
+        self.drive_relative_root = drive_relative_root
         self.drives: dict[str, dict[str, Path]] = {}
         self.mapped_roots: list[tuple[str, str, Path]] = []
         for server in servers:
@@ -427,7 +691,7 @@ class _PathResolver:
                 raise PipelineResolverError(
                     f"Drive {drive}: is not mapped for server {server!r}."
                 )
-            if not windows.is_absolute():
+            if not windows.is_absolute() and not self.drive_relative_root:
                 raise PipelineResolverError(
                     f"Drive-relative path {value!r} is not supported."
                 )
@@ -520,6 +784,35 @@ def resolve_pipeline(
     repository_root: str | Path, config: Mapping[str, Any]
 ) -> PipelineReport:
     """Resolve include reachability from configured server-specific entrypoints."""
+    report = _resolve_pipeline_once(repository_root, config, {})
+    options = _load_options(config)
+    if not options.seed_remote_macro_variables or not report.remote_macro_variables:
+        return report
+    seed: dict[str, dict[str, str]] = {}
+    for variable in report.remote_macro_variables:
+        seed.setdefault(variable.server, {}).setdefault(
+            variable.name.casefold(), variable.value
+        )
+    second = _resolve_pipeline_once(repository_root, config, seed)
+    notes = tuple(
+        PipelineIssue(
+            variable.source,
+            variable.line,
+            "remote_macro_variable_seeded",
+            variable.name,
+            f"Assumed &{variable.name}={variable.value} from a remote session "
+            f"on server {variable.server!r} when resolving that server's scripts.",
+        )
+        for variable in report.remote_macro_variables
+    )
+    return replace(second, issues=tuple(second.issues) + notes)
+
+
+def _resolve_pipeline_once(
+    repository_root: str | Path,
+    config: Mapping[str, Any],
+    remote_seed: Mapping[str, Mapping[str, str]],
+) -> PipelineReport:
     try:
         root = Path(repository_root).resolve(strict=True)
     except OSError as error:
@@ -532,7 +825,21 @@ def resolve_pipeline(
         )
 
     servers, entrypoints, remote_aliases = _load_config(config)
-    resolver = _PathResolver(root, servers)
+    resolution_options = _load_options(config)
+    known_server_names = {item.name.casefold(): item.name for item in servers}
+    remote_hosts: dict[str, str] = {}
+    for host, server_name in resolution_options.remote_hosts.items():
+        if server_name.casefold() not in known_server_names:
+            raise PipelineResolverError(
+                f"remote_hosts maps {host!r} to an unknown configured server."
+            )
+        remote_hosts[host] = known_server_names[server_name.casefold()]
+    remote_endpoints: dict[tuple[str, int, str], PipelineRemoteEndpoint] = {}
+    remote_variables: dict[tuple[str, str], PipelineRemoteMacroVariable] = {}
+    learned_alias_servers: dict[str, str] = {}
+    resolver = _PathResolver(
+        root, servers, drive_relative_root=resolution_options.drive_relative_root
+    )
     files = _scan_sas_files(root)
     actual_paths = {
         key: path.relative_to(root).as_posix() for key, path in files.items()
@@ -555,6 +862,27 @@ def resolve_pipeline(
     ) -> None:
         issue = PipelineIssue(source, line, kind, reference, reason)
         issues[(source, line, kind, reference)] = issue
+
+    def record_failed_include(
+        source_key: str, line_number: int, reference: str, error: object
+    ) -> None:
+        waiver = next(
+            (
+                reason
+                for pattern, reason in resolution_options.waived_includes
+                if pattern == _normalize_reference(reference)
+            ),
+            None,
+        )
+        if waiver is not None:
+            includes[(source_key, line_number, reference)] = PipelineInclude(
+                actual_paths[source_key], line_number, reference, None, "waived", waiver
+            )
+            return
+        includes[(source_key, line_number, reference)] = PipelineInclude(
+            actual_paths[source_key], line_number, reference, None, "unresolved", str(error)
+        )
+        add_issue(actual_paths[source_key], line_number, "include", reference, str(error))
 
     for entrypoint in entrypoints:
         key = entrypoint["path"].casefold()
@@ -660,6 +988,7 @@ def resolve_pipeline(
             return
 
         current_server: str | None = executing_server
+        written_filerefs: set[str] = set()
         active_remote_alias: str | None = None
         remote_context_stack: list[
             tuple[str | None, dict[str, str], dict[str, str], str | None, int, str | None, str | None]
@@ -669,6 +998,26 @@ def resolve_pipeline(
             mapped_server = (
                 remote_aliases.get(alias.casefold()) if alias else None
             )
+            endpoint_value = macro_vars.get(alias.casefold()) if alias else None
+            if alias and mapped_server is None and endpoint_value is None:
+                mapped_server = learned_alias_servers.get(alias.casefold())
+            endpoint = _ENDPOINT.match(endpoint_value) if endpoint_value else None
+            if alias and endpoint:
+                host = endpoint.group(1)
+                if mapped_server is None:
+                    mapped_server = remote_hosts.get(host.casefold())
+                if mapped_server is not None:
+                    learned_alias_servers[alias.casefold()] = mapped_server
+                remote_endpoints[(key, line_number, alias.casefold())] = (
+                    PipelineRemoteEndpoint(
+                        actual_paths[key],
+                        line_number,
+                        alias,
+                        host,
+                        int(endpoint.group(2)) if endpoint.group(2) else None,
+                        mapped_server,
+                    )
+                )
             remotes[
                 (key, line_number, operation, alias.casefold() if alias else None)
             ] = PipelineRemoteReference(
@@ -790,10 +1139,24 @@ def resolve_pipeline(
                 record_remote("options_remote", active_remote_alias, line)
 
             macro_assignment = _LET.fullmatch(text)
+            file_output = _FILE_OUTPUT.match(text)
+            if file_output and file_output.group(1).casefold() not in {"print", "log"}:
+                written_filerefs.add(file_output.group(1).casefold())
             if macro_assignment:
-                macro_vars[macro_assignment.group(1).casefold()] = (
-                    macro_assignment.group(2).strip()
-                )
+                name = macro_assignment.group(1).casefold()
+                value = macro_assignment.group(2).strip()
+                macro_vars[name] = value
+                if remote_context_stack and current_server is not None:
+                    remote_variables.setdefault(
+                        (current_server, name),
+                        PipelineRemoteMacroVariable(
+                            current_server,
+                            name,
+                            _safe_report_value(value),
+                            actual_paths[key],
+                            line,
+                        ),
+                    )
                 continue
 
             cd = _X_CD.fullmatch(text)
@@ -892,6 +1255,7 @@ def resolve_pipeline(
                 libref = library.group(1).casefold()
                 if library.group(3) is not None:
                     physical = library.group(3)
+                    reason_code: str | None = None
                     try:
                         physical = _expand_macro_variables(
                             library.group(3), macro_vars
@@ -908,6 +1272,7 @@ def resolve_pipeline(
                         report_physical = _safe_report_value(physical)
                         repository_path = None
                         status = "unresolved"
+                        reason_code = _reason_code(str(error))
                         add_issue(
                             actual_paths[key],
                             line,
@@ -923,6 +1288,7 @@ def resolve_pipeline(
                         report_physical,
                         repository_path,
                         status,
+                        reason_code,
                     )
                 continue
             if lowered.startswith("libname "):
@@ -988,15 +1354,26 @@ def resolve_pipeline(
                             f"Included file {reference!r} is not in the scanned SAS inventory."
                         )
                 except (PipelineResolverError, ValueError) as error:
-                    includes[(key, line, reference)] = PipelineInclude(
-                        actual_paths[key], line, reference, None, "unresolved", str(error)
-                    )
-                    add_issue(actual_paths[key], line, "include", reference, str(error))
+                    record_failed_include(key, line, reference, error)
                 else:
                     target_path = actual_paths[target_key]
                     includes[(key, line, reference)] = PipelineInclude(
                         actual_paths[key], line, reference, target_path, "resolved"
                     )
+                    reference_drive = PureWindowsPath(reference)
+                    if (
+                        resolution_options.drive_relative_root
+                        and reference_drive.drive
+                        and not reference_drive.is_absolute()
+                    ):
+                        add_issue(
+                            actual_paths[key],
+                            line,
+                            "drive_relative_assumed_root",
+                            reference,
+                            "Drive-relative path was resolved against the drive root "
+                            "by configuration (drive_relative_paths=drive_root).",
+                        )
                     visit(
                         target_key,
                         current_server,
@@ -1012,6 +1389,17 @@ def resolve_pipeline(
             include_file = _FILEREF_INCLUDE_FILE.fullmatch(text)
             if include_file:
                 fileref = include_file.group(1).casefold()
+                if fileref in written_filerefs:
+                    includes[(key, line, text)] = PipelineInclude(
+                        actual_paths[key],
+                        line,
+                        text,
+                        None,
+                        "runtime_generated",
+                        f"Fileref {fileref!r} is written by this script (FILE {fileref}) "
+                        "before it is included; its contents are generated at run time.",
+                    )
+                    continue
                 physical_path = filename_refs.get(fileref)
                 try:
                     if current_server is None:
@@ -1035,10 +1423,7 @@ def resolve_pipeline(
                             "scanned SAS file."
                         )
                 except (PipelineResolverError, ValueError) as error:
-                    includes[(key, line, text)] = PipelineInclude(
-                        actual_paths[key], line, text, None, "unresolved", str(error)
-                    )
-                    add_issue(actual_paths[key], line, "include", text, str(error))
+                    record_failed_include(key, line, text, error)
                 else:
                     includes[(key, line, text)] = PipelineInclude(
                         actual_paths[key],
@@ -1092,10 +1477,7 @@ def resolve_pipeline(
                             f"FILENAME {fileref} path {physical_base!r}."
                         )
                 except (PipelineResolverError, ValueError) as error:
-                    includes[(key, line, text)] = PipelineInclude(
-                        actual_paths[key], line, text, None, "unresolved", str(error)
-                    )
-                    add_issue(actual_paths[key], line, "include", text, str(error))
+                    record_failed_include(key, line, text, error)
                 else:
                     target_path = actual_paths[target_key]
                     includes[(key, line, text)] = PipelineInclude(
@@ -1113,13 +1495,10 @@ def resolve_pipeline(
                     )
                 continue
 
-            if lowered.startswith("%include"):
+            if _ANY_INCLUDE.match(text):
                 reference = text
                 reason = "Dynamic or unsupported %INCLUDE form."
-                includes[(key, line, reference)] = PipelineInclude(
-                    actual_paths[key], line, reference, None, "unresolved", reason
-                )
-                add_issue(actual_paths[key], line, "include", reference, reason)
+                record_failed_include(key, line, text, reason)
                 continue
 
             sql_connection = _SQL_CONNECT.search(text)
@@ -1162,7 +1541,16 @@ def resolve_pipeline(
     for entrypoint in entrypoint_rows:
         key = entrypoint["path"].casefold()
         filename_refs: dict[str, str] = {}
-        macro_vars: dict[str, str] = {}
+        macro_vars: dict[str, str] = {
+            **resolution_options.macro_variables,
+            **resolution_options.server_macro_variables.get(
+                entrypoint["server"].casefold(), {}
+            ),
+        }
+        for seeded_name, seeded_value in remote_seed.get(
+            entrypoint["server"], {}
+        ).items():
+            macro_vars.setdefault(seeded_name, seeded_value)
         cwd: str | None = None
         server_config = server_configs[entrypoint["server"].casefold()]
         for initialization_script in server_config.initialization_scripts:
@@ -1234,9 +1622,23 @@ def resolve_pipeline(
                 "overlapping mappings for multiple servers.",
             )
 
+    job_rows = _build_jobs(
+        files, entrypoint_rows, actual_paths, includes, resolution_options.jams_jobs
+    )
+
     return PipelineReport(
         repository_root=str(root),
         generated_at=datetime.now(timezone.utc).isoformat(),
+        jobs=tuple(job_rows),
+        remote_endpoints=tuple(
+            sorted(
+                remote_endpoints.values(),
+                key=lambda item: (item.source.casefold(), item.line, item.alias),
+            )
+        ),
+        remote_macro_variables=tuple(
+            sorted(remote_variables.values(), key=lambda item: (item.server, item.name))
+        ),
         entrypoints=tuple(
             sorted(entrypoint_rows, key=lambda item: (item["server"].casefold(), item["path"].casefold()))
         ),
@@ -1274,6 +1676,74 @@ def resolve_pipeline(
             )
         ),
     )
+
+
+def _build_jobs(
+    files: Mapping[str, Path],
+    entrypoints: list[dict[str, str]],
+    actual_paths: Mapping[str, str],
+    includes: Mapping[Any, PipelineInclude],
+    configured: tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    by_entrypoint = {job["entrypoint"]: job for job in configured}
+    matched: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for entrypoint in entrypoints:
+        path = entrypoint["path"]
+        source_text = ""
+        decoded = _decode_source(files[path.casefold()].read_bytes())[0]
+        if decoded:
+            source_text = decoded
+        job_name = _JOB_NAME.search(source_text)
+        job_source = _JOB_SOURCE.search(source_text)
+        header = re.match(r"\s*/\*(.*?)\*/", source_text, re.S)
+        disabled = sorted(
+            {
+                m.group(0).strip()
+                for block in _COMMENT_BLOCK.findall(source_text)
+                for m in _COMMENTED_INCLUDE.finditer(block)
+            }
+        )
+        direct = [
+            {"line": item.line, "reference": item.reference, "status": item.status}
+            for item in sorted(includes.values(), key=lambda i: i.line)
+            if item.source == actual_paths[path.casefold()]
+        ]
+        declared = by_entrypoint.get(_normalize_reference(path))
+        if declared:
+            matched.add(declared["entrypoint"])
+        rows.append(
+            {
+                "name": declared["name"]
+                if declared
+                else (job_name.group(2) if job_name else Path(path).stem),
+                "entrypoint": path,
+                "server": entrypoint["server"],
+                "declared_job_name": job_name.group(2) if job_name else None,
+                "declared_source": job_source.group(2) if job_source else None,
+                "header_comment": " ".join(header.group(1).split())[:500]
+                if header
+                else None,
+                "direct_includes": direct,
+                "disabled_includes": disabled,
+                "jams": (
+                    {
+                        "schedule": declared["schedule"],
+                        "depends_on": declared["depends_on"],
+                        "parameters": declared["parameters"],
+                    }
+                    if declared
+                    else None
+                ),
+            }
+        )
+    for entrypoint_key, declared in by_entrypoint.items():
+        if entrypoint_key not in matched:
+            raise PipelineResolverError(
+                f"JAMS job {declared['name']!r} references an entrypoint that is "
+                "not configured."
+            )
+    return rows
 
 
 def load_pipeline_config(path: str | Path) -> dict[str, Any]:

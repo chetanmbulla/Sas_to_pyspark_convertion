@@ -29,6 +29,7 @@ from .source_sink_catalog import (
     load_pipeline_report,
 )
 from .project_report import ProjectReportError, build_project_report_from_files
+from .phase1_analysis import Phase1AnalysisError, run_phase1_analysis
 from .synthetic_data import (
     SyntheticDataError,
     generate_synthetic_data,
@@ -164,6 +165,20 @@ def _project_main(argv: list[str]) -> int:
     synthetic_parser.add_argument("--rows", type=int, default=100)
     synthetic_parser.add_argument("--seed", type=int, default=0)
     synthetic_parser.add_argument("--force", action="store_true")
+    analyze_parser = commands.add_parser(
+        "analyze",
+        help="Run the full Phase 1 analysis and write all artifacts to one folder",
+    )
+    analyze_parser.add_argument("--root", required=True, help="Repository directory with the SAS server trees")
+    analyze_parser.add_argument("--config", required=True, help="Pipeline JSON configuration")
+    analyze_parser.add_argument("--out", required=True, help="Output folder (outside --root)")
+    analyze_parser.add_argument("--name", default="phase1-analysis", help="Project name")
+    analyze_parser.add_argument(
+        "--sas-version", choices=("auto", "9.4M4", "9.4M8", "Viya"), default="auto"
+    )
+    analyze_parser.add_argument("--rows", type=int, default=100)
+    analyze_parser.add_argument("--seed", type=int, default=0)
+    analyze_parser.add_argument("--force", action="store_true", help="Reuse a non-empty output folder")
     plan_parser = commands.add_parser(
         "plan", help="Analyze dependencies and generate an ordered migration plan"
     )
@@ -607,6 +622,30 @@ def _project_main(argv: list[str]) -> int:
                 f"{report['summary']['partial_schema_count']} from partial schemas."
             )
             print(f"Synthetic data manifest: {Path(args.output_dir).resolve() / 'synthetic-data-manifest.json'}")
+        elif args.command == "analyze":
+            index = run_phase1_analysis(
+                args.root,
+                args.config,
+                args.out,
+                project_name=args.name,
+                sas_version=args.sas_version,
+                rows=args.rows,
+                seed=args.seed,
+                force=args.force,
+            )
+            pipeline = index["summaries"]["pipeline"]
+            catalog = index["summaries"]["catalog"]
+            conversion = index["summaries"]["conversion"]
+            print(
+                f"Phase 1 analysis: {pipeline['reachable_script_count']} of "
+                f"{pipeline['script_count']} script(s) reachable; "
+                f"{pipeline['unresolved_include_count']} unresolved include(s); "
+                f"{catalog['dataset_count']} dataset(s), {catalog['system_count']} system(s), "
+                f"{catalog['unknown_schema_count']} unknown schema(s); "
+                f"{conversion['succeeded']} of {conversion['program_count']} converted; "
+                f"complexity {index['summaries']['report']['complexity_score']}/100."
+            )
+            print(f"Phase 1 index: {Path(args.out).resolve() / 'phase1-index.json'}")
         elif args.command == "plan":
             manifest_path = Path(args.path).resolve(strict=True)
             report_path = (
@@ -1013,7 +1052,7 @@ def _project_main(argv: list[str]) -> int:
         SourceSinkCatalogError,
         ProjectReportError,
         SyntheticDataError,
-        ReviewWorkflowError,
+        Phase1AnalysisError,
         GovernanceError,
         ReadinessError,
     ) as error:
