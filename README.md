@@ -695,6 +695,19 @@ instead of guessed. This report does not inspect SAS datasets or execute
 connection code, so it is an inventory to be enriched with authoritative
 `PROC CONTENTS` or platform metadata—not a complete schema extract.
 
+Authoritative schemas can be supplied with `--schemas <file-or-dir>` on
+`project catalog` and `project analyze`. Accepted inputs are `PROC CONTENTS
+OUT=` CSV exports (`NAME` plus `MEMNAME`/`DATASET`/`TABLE`, optional `LIBNAME`,
+`TYPE`, `LENGTH`, `VARNUM`, `LABEL`, `FORMAT`, `INFORMAT`), JSON
+(`{"datasets":[{"name","library","columns":[...]}]}`), and `CREATE TABLE`
+`.sql`/`.ddl` files. Each dataset schema gets a status: `complete` (from a
+supplied asset), `inferred` (derived from SQL select lists, `*` / `alias.*`
+expansion, and SET/MERGE inheritance, or from referenced columns, which have
+type `unknown`), `partial` (explicit DATA-step declarations only), or
+`unknown`. KEEP/DROP/RENAME are not applied during inference. Duplicate
+datasets across asset files keep the first and are reported as warnings;
+assets matching no dataset are listed as `unused_schema_assets`.
+
 `project report --pipeline-report pipeline.pipeline.json --catalog-report
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`

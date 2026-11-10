@@ -18,6 +18,7 @@ from .pipeline_resolver import load_pipeline_config, resolve_pipeline
 from .project import Dependency, MigrationProject
 from .project_report import build_project_report_from_files
 from .source_sink_catalog import build_source_sink_catalog, load_pipeline_report
+from .schema_assets import load_schema_assets
 from .synthetic_data import generate_synthetic_data, load_catalog_report
 
 INDEX_NAME = "phase1-index.json"
@@ -42,6 +43,7 @@ def run_phase1_analysis(
     rows: int = 100,
     seed: int = 0,
     force: bool = False,
+    schemas: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run discover, resolve, catalog, plan, convert, report and synthesize.
 
@@ -92,9 +94,13 @@ def run_phase1_analysis(
     pipeline = resolve_pipeline(repository_root, load_pipeline_config(config_file))
     pipeline.save(files["pipeline_report"])
 
-    catalog = build_source_sink_catalog(
-        repository_root, load_pipeline_report(files["pipeline_report"])
+    assets, asset_warnings = (
+        load_schema_assets(schemas) if schemas else ({}, [])
     )
+    catalog = build_source_sink_catalog(
+        repository_root, load_pipeline_report(files["pipeline_report"]), assets
+    )
+    catalog["schema_asset_warnings"] = asset_warnings
     _write_json(files["catalog"], catalog)
 
     plan = build_migration_plan(project, repository_root)

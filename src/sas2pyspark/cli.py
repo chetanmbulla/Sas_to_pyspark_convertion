@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .converter import ConversionError, SasToPySparkConverter
 from .discovery import (
@@ -30,6 +31,7 @@ from .source_sink_catalog import (
 )
 from .project_report import ProjectReportError, build_project_report_from_files
 from .phase1_analysis import Phase1AnalysisError, run_phase1_analysis
+from .schema_assets import SchemaAssetError, load_schema_assets
 from .synthetic_data import (
     SyntheticDataError,
     generate_synthetic_data,
@@ -138,6 +140,10 @@ def _project_main(argv: list[str]) -> int:
         "--report",
         help="Catalog JSON destination; defaults beside the pipeline report",
     )
+    catalog_parser.add_argument(
+        "--schemas",
+        help="Schema assets: a file or folder of PROC CONTENTS CSV, JSON or SQL DDL",
+    )
     report_parser = commands.add_parser(
         "report",
         help="Generate project Markdown documentation and a Mermaid pipeline graph",
@@ -177,6 +183,10 @@ def _project_main(argv: list[str]) -> int:
         "--sas-version", choices=("auto", "9.4M4", "9.4M8", "Viya"), default="auto"
     )
     analyze_parser.add_argument("--rows", type=int, default=100)
+    analyze_parser.add_argument(
+        "--schemas",
+        help="Schema assets: a file or folder of PROC CONTENTS CSV, JSON or SQL DDL",
+    )
     analyze_parser.add_argument("--seed", type=int, default=0)
     analyze_parser.add_argument("--force", action="store_true", help="Reuse a non-empty output folder")
     plan_parser = commands.add_parser(
@@ -554,7 +564,16 @@ def _project_main(argv: list[str]) -> int:
                     "Catalog report path conflicts with the pipeline report or a SAS source file."
                 )
             pipeline_report = load_pipeline_report(pipeline_report_path)
-            report = build_source_sink_catalog(repository_root, pipeline_report)
+            assets: dict[str, Any] | None = None
+            if args.schemas:
+                assets, asset_warnings = load_schema_assets(args.schemas)
+                for warning in asset_warnings:
+                    print(
+                        f"warning: {warning['dataset']} defined in {warning['kept']} and "
+                        f"{warning['ignored']}; kept {warning['kept']}.",
+                        file=sys.stderr,
+                    )
+            report = build_source_sink_catalog(repository_root, pipeline_report, assets)
             report_path.write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -632,6 +651,7 @@ def _project_main(argv: list[str]) -> int:
                 rows=args.rows,
                 seed=args.seed,
                 force=args.force,
+                schemas=args.schemas,
             )
             pipeline = index["summaries"]["pipeline"]
             catalog = index["summaries"]["catalog"]
@@ -1053,7 +1073,7 @@ def _project_main(argv: list[str]) -> int:
         ProjectReportError,
         SyntheticDataError,
         Phase1AnalysisError,
-        GovernanceError,
+        SchemaAssetError,
         ReadinessError,
     ) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)

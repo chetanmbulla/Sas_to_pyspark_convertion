@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from .discovery import _decode_source
 from .sas_parser import SasParseError, parse_program
+from .schema_inference import infer_schemas, parse_sql_statement
 
 
 CATALOG_SCHEMA_VERSION = 1
@@ -78,6 +79,13 @@ def _dataset_name(value: str) -> str:
     if "." not in normalized:
         normalized = f"WORK.{normalized}"
     return normalized.casefold()
+
+
+def _ordered_columns(columns: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    values = [dict(column) for column in columns.values()]
+    if values and all("position" in column for column in values):
+        return sorted(values, key=lambda column: column["position"])
+    return sorted(values, key=lambda column: column["name"].casefold())
 
 
 def _statement_datasets(text: str, keyword: str) -> tuple[list[str], list[str]]:
@@ -315,9 +323,15 @@ def _source_systems(
 
 
 def build_source_sink_catalog(
-    repository_root: str | Path, pipeline_report: Mapping[str, Any]
+    repository_root: str | Path,
+    pipeline_report: Mapping[str, Any],
+    schema_assets: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build a catalog of statically observed SAS datasets and their systems."""
+    """Build a catalog of statically observed SAS datasets and their systems.
+
+    ``schema_assets`` maps ``library.dataset`` to authoritative column lists (see
+    ``schema_assets.load_schema_assets``); those datasets get a ``complete`` schema.
+    """
     if pipeline_report.get("schema_version") != 1:
         raise SourceSinkCatalogError(
             "Pipeline report has an unsupported schema version."
@@ -338,6 +352,9 @@ def build_source_sink_catalog(
     files: dict[str, dict[str, Any]] = {}
     dynamic_references: list[dict[str, Any]] = []
     schemas: dict[str, dict[str, Any]] = {}
+    sql_creates: list[dict[str, Any]] = []
+    data_lineage: dict[str, list[str]] = {}
+    column_refs: dict[str, dict[str, str]] = {}
     scripts = [
         item
         for item in pipeline_report.get("scripts", [])
@@ -403,6 +420,7 @@ def build_source_sink_catalog(
 
         data_step_outputs: list[str] = []
         data_step_statements: list[Any] = []
+        data_step_inputs: list[str] = []
         in_data_step = False
         filename_refs_by_server: dict[str, dict[str, str | None]] = {}
         execution_server: str | None = script_servers.get(source_path.casefold())
@@ -548,6 +566,7 @@ def build_source_sink_catalog(
                         }
                     )
                 data_step_statements = [statement]
+                data_step_inputs = []
                 in_data_step = True
                 continue
 
@@ -555,6 +574,7 @@ def build_source_sink_catalog(
                 data_step_statements.append(statement)
                 for keyword in ("set", "merge"):
                     inputs, dynamic = _statement_datasets(text, keyword)
+                    data_step_inputs.extend(inputs)
                     for name in inputs:
                         record_dataset(name, "input", line, keyword.upper())
                     for reference in dynamic:
@@ -581,6 +601,10 @@ def build_source_sink_catalog(
                             location_known=location is not None,
                         )
                 if lower in {"run", "quit"}:
+                    for output in data_step_outputs:
+                        data_lineage.setdefault(output, []).extend(
+                            name for name in data_step_inputs if name not in data_lineage.get(output, [])
+                        )
                     explicit = _explicit_columns(data_step_statements)
                     if explicit:
                         declaration_sources = [
@@ -642,6 +666,7 @@ def build_source_sink_catalog(
             if lower.startswith("proc sql"):
                 continue
             sql_create = _SQL_CREATE.search(text)
+            create_target: str | None = None
             if sql_create:
                 try:
                     name = _dataset_name(sql_create.group(1))
@@ -655,7 +680,17 @@ def build_source_sink_catalog(
                         }
                     )
                 else:
+                    create_target = name
                     record_dataset(name, "output", line, "PROC SQL CREATE")
+            if re.match(r"^\s*(create|select)\b", text, re.I):
+                parsed_sql = parse_sql_statement(text, _dataset_name)
+                if parsed_sql:
+                    if create_target:
+                        sql_creates.append({**parsed_sql, "target": create_target})
+                    for dataset_name, column_names in parsed_sql["references"].items():
+                        known = column_refs.setdefault(dataset_name, {})
+                        for column_name in column_names:
+                            known.setdefault(column_name.casefold(), column_name)
             if re.match(r"^\s*(proc\s+sql|select|create|insert|update|delete)\b", text, re.I):
                 for sql_match in _SQL_REFERENCE.finditer(text):
                     try:
@@ -765,6 +800,17 @@ def build_source_sink_catalog(
                         },
                     )
 
+    asset_map = {
+        str(name).casefold(): value for name, value in (schema_assets or {}).items()
+    }
+    inferred_schemas = infer_schemas(
+        {name: list(value["columns"]) for name, value in asset_map.items()},
+        {name: value["columns"] for name, value in schemas.items()},
+        sql_creates,
+        data_lineage,
+        column_refs,
+    )
+
     system_by_libref: dict[tuple[str, str], list[str]] = {}
     for system_id, system in systems.items():
         if system.get("kind") not in {"sas_library", "sas_connect_libref", "sas_access"}:
@@ -819,7 +865,7 @@ def build_source_sink_catalog(
                         "reason": f"Libref {libref!r} maps to multiple systems on this server.",
                     }
                 )
-        schema = schemas.get(dataset["name"])
+        schema = inferred_schemas.get(dataset["name"])
         if schema is None:
             dataset["schema"] = {"status": "unknown", "columns": []}
             issues.append(
@@ -833,30 +879,24 @@ def build_source_sink_catalog(
             )
         else:
             dataset["schema"] = {
-                "status": "partial",
-                "columns": sorted(
-                    schema["columns"].values(), key=lambda item: item["name"].casefold()
-                ),
+                "status": schema["status"],
+                "columns": _ordered_columns(schema["columns"]),
             }
 
     catalog_schemas = []
     for dataset_name, dataset in datasets.items():
-        schema = schemas.get(dataset_name)
+        schema = inferred_schemas.get(dataset_name)
+        code_schema = schemas.get(dataset_name)
         catalog_schemas.append(
             {
                 "dataset": dataset_name,
-                "status": "partial" if schema else "unknown",
-                "columns": (
-                    sorted(
-                        schema["columns"].values(),
-                        key=lambda item: item["name"].casefold(),
-                    )
-                    if schema
-                    else []
-                ),
-                "evidence": schema["evidence"] if schema else [],
+                "status": schema["status"] if schema else "unknown",
+                "columns": _ordered_columns(schema["columns"]) if schema else [],
+                "evidence": code_schema["evidence"] if code_schema else [],
+                "origin": (asset_map.get(dataset_name) or {}).get("origin"),
             }
         )
+    unused_assets = sorted(set(asset_map) - set(datasets))
 
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
@@ -896,12 +936,21 @@ def build_source_sink_catalog(
                 for item in datasets.values()
             ),
             "partial_schema_count": len(schemas),
+            "complete_schema_count": sum(
+                item.get("schema", {}).get("status") == "complete"
+                for item in datasets.values()
+            ),
+            "inferred_schema_count": sum(
+                item.get("schema", {}).get("status") == "inferred"
+                for item in datasets.values()
+            ),
+            "unused_schema_assets": unused_assets,
             "dynamic_reference_count": len(dynamic_references),
             "issue_count": len(issues),
         },
         "limitations": [
             "Dataset usage and direction are inferred statically from SAS statements.",
-            "Schema fields are partial source declarations, not authoritative PROC CONTENTS metadata.",
+            "Schema fields come from supplied assets (complete), SQL select lists, SET/MERGE inheritance and alias-qualified references (inferred; KEEP/DROP/RENAME are not applied), or source declarations (partial).",
             "External connection engines may be identified without a host, database, or verified direction.",
             "No dataset contents are read; generated files are not treated as production metadata.",
         ],
