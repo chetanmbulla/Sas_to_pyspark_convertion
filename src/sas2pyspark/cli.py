@@ -32,6 +32,13 @@ from .source_sink_catalog import (
 from .project_report import ProjectReportError, build_project_report_from_files
 from .phase1_analysis import Phase1AnalysisError, run_phase1_analysis
 from .schema_assets import SchemaAssetError, load_schema_assets
+from .business_context import (
+    BusinessContextError,
+    build_business_context,
+    build_prompts,
+    load_responses,
+    render_markdown,
+)
 from .knowledge_graph import (
     KnowledgeGraphError,
     NODE_TYPES,
@@ -215,6 +222,22 @@ def _project_main(argv: list[str]) -> int:
     )
     lineage_parser.add_argument("--json", action="store_true", help="Print JSON instead of text")
     lineage_parser.add_argument("--mermaid", help="Also write the result sub-graph as Mermaid to this file")
+    context_parser = commands.add_parser(
+        "context",
+        help="Generate offline business context (templates, AI prompt export, response merge)",
+    )
+    context_parser.add_argument("--pipeline-report", required=True)
+    context_parser.add_argument("--catalog-report", required=True)
+    context_parser.add_argument("--root", help="Repository root for script header comments (default: catalog root)")
+    context_parser.add_argument("--output", required=True, help="business-context.json destination")
+    context_parser.add_argument("--markdown", help="Also write a Markdown document")
+    context_parser.add_argument(
+        "--prompts", help="Write one AI prompt per evidence packet to this JSON file (nothing is sent)"
+    )
+    context_parser.add_argument(
+        "--responses", help="JSON of AI or human descriptions to merge (human entries win)"
+    )
+    context_parser.add_argument("--force", action="store_true")
     analyze_parser = commands.add_parser(
         "analyze",
         help="Run the full Phase 1 analysis and write all artifacts to one folder",
@@ -761,6 +784,37 @@ def _project_main(argv: list[str]) -> int:
                     flag = " [temporary]" if node.get("temporary") else ""
                     print(f"{depth}{node['type']}: {node['label']}{flag}")
                 print(f"{len(payload['nodes'])} node(s).")
+        elif args.command == "context":
+            targets = [Path(p).resolve(strict=False) for p in (args.output, args.markdown, args.prompts) if p]
+            existing = [p for p in targets if p.exists()]
+            if existing and not args.force:
+                raise BusinessContextError(
+                    f"Output already exists: {existing[0]}. Use --force to replace it."
+                )
+            context = build_business_context(
+                load_pipeline_report(args.pipeline_report),
+                load_catalog_report(args.catalog_report),
+                root=args.root,
+                responses=load_responses(args.responses) if args.responses else None,
+            )
+            for target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).resolve(strict=False).write_text(
+                json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            if args.markdown:
+                Path(args.markdown).resolve(strict=False).write_text(
+                    render_markdown(context), encoding="utf-8", newline="\n"
+                )
+            if args.prompts:
+                Path(args.prompts).resolve(strict=False).write_text(
+                    json.dumps(build_prompts(context["packets"]), indent=2) + "\n", encoding="utf-8"
+                )
+            summary = context["summary"]
+            print(
+                f"Business context: {summary['record_count']} record(s) {summary['by_source']}; "
+                f"{summary['stale_count']} stale, {summary['needs_review_count']} need review."
+            )
         elif args.command == "analyze":
             index = run_phase1_analysis(
                 args.root,
@@ -1195,7 +1249,7 @@ def _project_main(argv: list[str]) -> int:
         Phase1AnalysisError,
         SchemaAssetError,
         KnowledgeGraphError,
-        ReadinessError,
+        BusinessContextError,
     ) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)
         return 2

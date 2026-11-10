@@ -749,6 +749,20 @@ rejected with candidates. Lineage follows data flow through scripts
 the catalog (macro-generated code and non-SQL/DATA-step PROC outputs are not
 traced).
 
+`project context --pipeline-report P --catalog-report C --output business-context.json`
+builds an evidence packet per job, reachable script and final-output dataset
+(header comment with emails redacted, JAMS metadata, inputs/outputs capped at 12
+with totals, ultimate sources, column-derivation counts) and a rule-based
+description that restates only those facts. `--markdown` writes a readable
+document and `--prompts` writes one ready-to-use AI prompt per packet; nothing is
+ever sent anywhere. Descriptions written by an external AI or by a reviewer are
+merged back with `--responses` (a list of `{"id", "description", "packet_hash",
+"source": "ai"|"human", "model"}`): AI entries are marked `needs_review` and
+`stale` when the packet changed since the prompt, and human entries always win.
+`project analyze` writes `business-context.json`, `business-context.md` and
+`ai-prompts.json`. Template text is not business meaning—jobs without header
+comments or JAMS metadata list that as an open question.
+
 `project report --pipeline-report pipeline.pipeline.json --catalog-report
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`
