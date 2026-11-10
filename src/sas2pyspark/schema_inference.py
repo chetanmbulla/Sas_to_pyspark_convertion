@@ -33,6 +33,44 @@ _STAR = re.compile(r"^(?:([A-Za-z_]\w*)\.)?\*$")
 _BARE_KEYWORDS = frozenset({"null", "distinct", "all", "case", "missing"})
 
 
+_STRING_LITERAL = re.compile(r"(?:'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")[dtnDTN]?")
+_CALCULATED = re.compile(r"\bcalculated\s+[A-Za-z_]\w*", re.I)
+_EXPRESSION_IDENT = re.compile(r"(?<![\w.&$])([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?(?!\w)(\s*\()?")
+_EXPRESSION_KEYWORDS = frozenset(
+    {
+        "and", "or", "not", "in", "eq", "ne", "lt", "gt", "le", "ge", "case", "when",
+        "then", "else", "end", "is", "null", "missing", "between", "like", "contains",
+        "distinct", "as", "by", "asc", "desc", "do", "to", "if", "_n_", "_error_",
+        "calculated",
+    }
+)
+
+
+def expression_refs(expression: str) -> list[tuple[str | None, str]]:
+    """Return ordered unique (qualifier, column) identifiers read by a SAS expression.
+
+    Function calls, keywords, literals, macro variables, ``first.``/``last.`` flags and
+    ``CALCULATED`` references are excluded.
+    """
+    cleaned = _CALCULATED.sub(" ", _STRING_LITERAL.sub("''", expression))
+    found: list[tuple[str | None, str]] = []
+    for match in _EXPRESSION_IDENT.finditer(cleaned):
+        first, second, call = match.groups()
+        if call:
+            continue
+        if not second and cleaned[match.end() : match.end() + 1] == ".":
+            continue  # SAS format name such as d_month. or best12.
+        qualifier, column = (first, second) if second else (None, first)
+        if qualifier and qualifier.casefold() in {"first", "last"}:
+            continue
+        if column.casefold() in _EXPRESSION_KEYWORDS:
+            continue
+        entry = (qualifier.casefold() if qualifier else None, column)
+        if entry not in found:
+            found.append(entry)
+    return found
+
+
 def _mask_strings(text: str) -> str:
     return _STRING.sub(lambda match: "'" + "x" * (len(match.group()) - 2) + "'", text)
 
@@ -116,6 +154,7 @@ def parse_sql_statement(
                 item["length"] = int(length.group(1))
             if fmt:
                 item["format"] = fmt.group(1)
+        item["expression"] = expression
         bare = _SQL_BARE.match(expression)
         if bare and bare.group(2).casefold() not in _BARE_KEYWORDS:
             item.setdefault("name", bare.group(2))
@@ -125,6 +164,8 @@ def parse_sql_statement(
             item["type"] = "character"
         elif re.fullmatch(r"-?\d+(?:\.\d+)?", expression):
             item["type"] = "numeric"
+        else:
+            item["refs"] = expression_refs(expression)
         if "name" in item:
             items.append(item)
 
@@ -160,6 +201,7 @@ def infer_schemas(
     sql_creates: list[dict[str, Any]],
     data_lineage: Mapping[str, list[str]],
     references: Mapping[str, Mapping[str, str]],
+    data_steps: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Merge declared, code-declared, inherited and referenced columns per dataset.
 
@@ -179,6 +221,24 @@ def infer_schemas(
         target = final.setdefault(name, {})
         for key, column in columns.items():
             target.setdefault(key, {**column, "origin": "code"})
+    for step in data_steps or []:
+        for output in step["outputs"]:
+            if output in complete:
+                continue
+            target = final.setdefault(output, {})
+            for assignment in step["assignments"]:
+                expression = assignment["expression"].strip()
+                column_type = (
+                    "character"
+                    if _STRING_LITERAL.fullmatch(expression)
+                    else "numeric"
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", expression)
+                    else "unknown"
+                )
+                target.setdefault(
+                    assignment["column"].casefold(),
+                    {"name": assignment["column"], "type": column_type, "origin": "assigned"},
+                )
 
     def lookup(sources: list[str], key: str) -> dict[str, Any] | None:
         for source in sources:

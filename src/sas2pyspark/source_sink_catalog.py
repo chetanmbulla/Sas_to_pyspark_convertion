@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from .discovery import _decode_source
 from .sas_parser import SasParseError, parse_program
+from .column_lineage import build_column_lineage, extract_assignments
 from .schema_inference import infer_schemas, parse_sql_statement
 
 
@@ -353,6 +354,7 @@ def build_source_sink_catalog(
     dynamic_references: list[dict[str, Any]] = []
     schemas: dict[str, dict[str, Any]] = {}
     sql_creates: list[dict[str, Any]] = []
+    data_steps: list[dict[str, Any]] = []
     data_lineage: dict[str, list[str]] = {}
     column_refs: dict[str, dict[str, str]] = {}
     scripts = [
@@ -601,6 +603,20 @@ def build_source_sink_catalog(
                             location_known=location is not None,
                         )
                 if lower in {"run", "quit"}:
+                    data_steps.append(
+                        {
+                            "outputs": list(data_step_outputs),
+                            "inputs": list(dict.fromkeys(data_step_inputs)),
+                            "assignments": extract_assignments(
+                                [
+                                    (item.text, item.span.start_line)
+                                    for item in data_step_statements[1:]
+                                ]
+                            ),
+                            "source": source_path,
+                            "line": data_step_statements[0].span.start_line,
+                        }
+                    )
                     for output in data_step_outputs:
                         data_lineage.setdefault(output, []).extend(
                             name for name in data_step_inputs if name not in data_lineage.get(output, [])
@@ -686,7 +702,9 @@ def build_source_sink_catalog(
                 parsed_sql = parse_sql_statement(text, _dataset_name)
                 if parsed_sql:
                     if create_target:
-                        sql_creates.append({**parsed_sql, "target": create_target})
+                        sql_creates.append(
+                            {**parsed_sql, "target": create_target, "source": source_path, "line": line}
+                        )
                     for dataset_name, column_names in parsed_sql["references"].items():
                         known = column_refs.setdefault(dataset_name, {})
                         for column_name in column_names:
@@ -809,7 +827,9 @@ def build_source_sink_catalog(
         sql_creates,
         data_lineage,
         column_refs,
+        data_steps,
     )
+    column_lineage = build_column_lineage(inferred_schemas, sql_creates, data_steps)
 
     system_by_libref: dict[tuple[str, str], list[str]] = {}
     for system_id, system in systems.items():
@@ -910,6 +930,7 @@ def build_source_sink_catalog(
             key=lambda item: (item["kind"], item["name"].casefold()),
         ),
         "schemas": sorted(catalog_schemas, key=lambda item: item["dataset"]),
+        "column_lineage": column_lineage,
         "dynamic_references": sorted(
             dynamic_references,
             key=lambda item: (
@@ -945,6 +966,10 @@ def build_source_sink_catalog(
                 for item in datasets.values()
             ),
             "unused_schema_assets": unused_assets,
+            "column_lineage_edge_count": len(column_lineage),
+            "unresolved_column_lineage_count": sum(
+                not edge["resolved"] for edge in column_lineage
+            ),
             "dynamic_reference_count": len(dynamic_references),
             "issue_count": len(issues),
         },

@@ -708,6 +708,18 @@ type `unknown`), `partial` (explicit DATA-step declarations only), or
 datasets across asset files keep the first and are reported as warnings;
 assets matching no dataset are listed as `unused_schema_assets`.
 
+The catalog also carries `column_lineage`: one edge per target column with its
+source `dataset`/`column` pairs, derived from `PROC SQL CREATE TABLE ... AS
+SELECT` lists (`copy`, `rename`, `star`, `expression`, `aggregate`, `constant`)
+and DATA-step statements (assignments, `IF/ELSE` conditional assignments with
+`control_sources`, and `inherited` SET/MERGE pass-through). Unqualified
+references resolve only against known schemas or a single input table;
+anything else stays `resolved: false` and is counted in
+`unresolved_column_lineage_count`. Assigned DATA-step variables are added to
+the dataset schema. KEEP/DROP/RENAME dataset options, macro-generated code and
+`CALCULATED` references are not traced. `sas2pyspark.column_lineage.trace_column_lineage`
+walks edges upstream to ultimate source columns.
+
 `project report --pipeline-report pipeline.pipeline.json --catalog-report
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`
