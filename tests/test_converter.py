@@ -71,6 +71,48 @@ class ConverterTests(unittest.TestCase):
             any("selected by source marker" in warning for warning in result.warnings)
         )
 
+    def test_sas_94m4_marker_and_override_select_profile(self):
+        marked = self.converter.convert(
+            "/* sas2pyspark: sas-version=9.4M4 */ "
+            "data out; set source; run;"
+        )
+        self.assertEqual(marked.source_version, "9.4M4")
+        self.assertEqual(marked.version_source, "marker")
+        self.assertIn("df_out = df_source", marked.code)
+        self.assertTrue(
+            any(
+                "per-release syntax and semantic gates" in item.casefold()
+                for item in marked.warnings
+            )
+        )
+
+        overridden = self.converter.convert(
+            "data out; set source; run;", sas_version="9.4m4"
+        )
+        self.assertEqual(overridden.source_version, "9.4M4")
+        self.assertEqual(overridden.version_source, "override")
+
+    def test_sas_connect_control_is_rejected_instead_of_flattened(self):
+        with self.assertRaises(ConversionError) as context:
+            self.converter.convert(
+                "signon dwh02; rsubmit dwh02; data remote; set source; run; "
+                "endrsubmit;"
+            )
+
+        self.assertIn("cannot be flattened into local PySpark", str(context.exception))
+        self.assertEqual(context.exception.line, 1)
+
+    def test_sas_connect_control_inside_macro_is_rejected(self):
+        source = (
+            "%macro remote_job; "
+            "rsubmit dwh02; data remote; set source; run; endrsubmit; "
+            "%mend; %remote_job;"
+        )
+        with self.assertRaises(ConversionError) as context:
+            self.converter.convert(source)
+
+        self.assertIn("cannot be flattened into local PySpark", str(context.exception))
+
     def test_sas_version_marker_text_inside_a_string_is_ignored(self):
         result = self.converter.convert(
             "data out; set source; note='/* sas2pyspark: sas-version=9.4M8 */'; run;"

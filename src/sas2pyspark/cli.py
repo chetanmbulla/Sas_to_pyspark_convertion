@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 from .converter import ConversionError, SasToPySparkConverter
@@ -16,6 +18,22 @@ from .discovery import (
 from .dependency import DependencyAnalysisError, build_migration_plan
 from .conversion_workflow import BatchConversionError, convert_project
 from .execution_workflow import ExecutionWorkflowError, run_project
+from .pipeline_resolver import (
+    PipelineResolverError,
+    load_pipeline_config,
+    resolve_pipeline,
+)
+from .source_sink_catalog import (
+    SourceSinkCatalogError,
+    build_source_sink_catalog,
+    load_pipeline_report,
+)
+from .project_report import ProjectReportError, build_project_report_from_files
+from .synthetic_data import (
+    SyntheticDataError,
+    generate_synthetic_data,
+    load_catalog_report,
+)
 from .reconciliation import ReconciliationError, reconcile_project
 from .project import Dependency, MigrationProject, ProjectError
 from .governance import (
@@ -83,6 +101,69 @@ def _project_main(argv: list[str]) -> int:
             "several, replacing the default list"
         ),
     )
+    pipeline_parser = commands.add_parser(
+        "resolve-pipeline",
+        help="Resolve include reachability from configured SAS server entrypoints",
+    )
+    pipeline_parser.add_argument(
+        "--root",
+        required=True,
+        help="Repository directory containing the server folder trees",
+    )
+    pipeline_parser.add_argument(
+        "--config",
+        required=True,
+        help="JSON configuration with server drive mappings and job entrypoints",
+    )
+    pipeline_parser.add_argument(
+        "--report",
+        help="Pipeline report destination; defaults beside the config file",
+    )
+    catalog_parser = commands.add_parser(
+        "catalog",
+        help="Catalog dataset sources, sinks, external systems, and known schema details",
+    )
+    catalog_parser.add_argument(
+        "--root",
+        required=True,
+        help="Repository directory containing the pipeline SAS sources",
+    )
+    catalog_parser.add_argument(
+        "--pipeline-report",
+        required=True,
+        help="JSON report produced by project resolve-pipeline",
+    )
+    catalog_parser.add_argument(
+        "--report",
+        help="Catalog JSON destination; defaults beside the pipeline report",
+    )
+    report_parser = commands.add_parser(
+        "report",
+        help="Generate project Markdown documentation and a Mermaid pipeline graph",
+    )
+    report_parser.add_argument("--pipeline-report", required=True)
+    report_parser.add_argument("--catalog-report", required=True)
+    report_parser.add_argument("--plan-report", required=True)
+    report_parser.add_argument("--conversion-report", required=True)
+    report_parser.add_argument(
+        "--output",
+        required=True,
+        help="Markdown report destination",
+    )
+    report_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing Markdown report",
+    )
+    synthetic_parser = commands.add_parser(
+        "synthesize",
+        help="Generate deterministic synthetic CSV fixtures from catalog schemas",
+    )
+    synthetic_parser.add_argument("--catalog", required=True)
+    synthetic_parser.add_argument("--output-dir", required=True)
+    synthetic_parser.add_argument("--rows", type=int, default=100)
+    synthetic_parser.add_argument("--seed", type=int, default=0)
+    synthetic_parser.add_argument("--force", action="store_true")
     plan_parser = commands.add_parser(
         "plan", help="Analyze dependencies and generate an ordered migration plan"
     )
@@ -116,7 +197,7 @@ def _project_main(argv: list[str]) -> int:
     )
     convert_parser.add_argument(
         "--sas-version",
-        choices=("auto", "9.4M8", "Viya"),
+        choices=("auto", "9.4M4", "9.4M8", "Viya"),
         default="auto",
         help=(
             "Source SAS release profile; auto reads the source marker or defaults "
@@ -416,6 +497,116 @@ def _project_main(argv: list[str]) -> int:
             print(f"Inventory report: {report_path}")
             if report.issues:
                 return 1
+        elif args.command == "resolve-pipeline":
+            repository_root = Path(args.root).resolve(strict=True)
+            config_path = Path(args.config).resolve(strict=True)
+            report_path = (
+                Path(args.report).resolve(strict=False)
+                if args.report
+                else config_path.with_suffix(".pipeline.json")
+            )
+            if report_path == config_path or report_path.suffix.casefold() == ".sas":
+                raise PipelineResolverError(
+                    "Pipeline report path conflicts with the config or a SAS source file."
+                )
+            config = load_pipeline_config(config_path)
+            report = resolve_pipeline(repository_root, config)
+            report.save(report_path)
+            summary = report.to_dict()["summary"]
+            print(
+                f"Resolved {summary['reachable_script_count']} of "
+                f"{summary['script_count']} SAS script(s); "
+                f"{summary['resolved_include_count']} include(s) resolved, "
+                f"{summary['unresolved_include_count']} unresolved; "
+                f"{summary['external_connection_count']} external connection(s) recorded."
+            )
+            print(f"Pipeline report: {report_path}")
+            if summary["unresolved_include_count"] or summary["issue_count"]:
+                return 1
+        elif args.command == "catalog":
+            repository_root = Path(args.root).resolve(strict=True)
+            pipeline_report_path = Path(args.pipeline_report).resolve(strict=True)
+            report_path = (
+                Path(args.report).resolve(strict=False)
+                if args.report
+                else pipeline_report_path.with_suffix(".catalog.json")
+            )
+            if (
+                report_path == pipeline_report_path
+                or report_path.suffix.casefold() == ".sas"
+            ):
+                raise SourceSinkCatalogError(
+                    "Catalog report path conflicts with the pipeline report or a SAS source file."
+                )
+            pipeline_report = load_pipeline_report(pipeline_report_path)
+            report = build_source_sink_catalog(repository_root, pipeline_report)
+            report_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            summary = report["summary"]
+            print(
+                f"Catalogued {summary['dataset_count']} dataset(s), "
+                f"{summary['file_resource_count']} file resource(s), and "
+                f"{summary['system_count']} system(s); "
+                f"{summary['unknown_schema_count']} schema(s) unknown."
+            )
+            print(f"Source/sink catalog: {report_path}")
+        elif args.command == "report":
+            report_path = Path(args.output).resolve(strict=False)
+            if report_path.suffix.casefold() != ".md":
+                raise ProjectReportError("Project report output must use a .md extension.")
+            if report_path.exists() and not args.force:
+                raise ProjectReportError(
+                    f"Project report already exists: {report_path}. Use --force to replace it."
+                )
+            report = build_project_report_from_files(
+                pipeline_report_path=args.pipeline_report,
+                catalog_report_path=args.catalog_report,
+                plan_report_path=args.plan_report,
+                conversion_report_path=args.conversion_report,
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="\n",
+                    dir=report_path.parent,
+                    prefix=f".{report_path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary.write(report["markdown"])
+                    temporary_path = Path(temporary.name)
+                if args.force:
+                    temporary_path.replace(report_path)
+                else:
+                    temporary_path.rename(report_path)
+            finally:
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
+            print(
+                f"Project report: {report_path} "
+                f"(complexity {report['complexity_score']}/100, "
+                f"{report['summary']['unresolved_finding_count']} finding(s))."
+            )
+        elif args.command == "synthesize":
+            catalog = load_catalog_report(args.catalog)
+            report = generate_synthetic_data(
+                catalog,
+                args.output_dir,
+                rows=args.rows,
+                seed=args.seed,
+                force=args.force,
+            )
+            print(
+                f"Generated {report['summary']['generated_count']} dataset fixture(s); "
+                f"{report['summary']['skipped_count']} skipped, "
+                f"{report['summary']['partial_schema_count']} from partial schemas."
+            )
+            print(f"Synthetic data manifest: {Path(args.output_dir).resolve() / 'synthetic-data-manifest.json'}")
         elif args.command == "plan":
             manifest_path = Path(args.path).resolve(strict=True)
             report_path = (
@@ -818,6 +1009,10 @@ def _project_main(argv: list[str]) -> int:
         BatchConversionError,
         ExecutionWorkflowError,
         ReconciliationError,
+        PipelineResolverError,
+        SourceSinkCatalogError,
+        ProjectReportError,
+        SyntheticDataError,
         ReviewWorkflowError,
         GovernanceError,
         ReadinessError,
@@ -852,7 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-o", "--output", help="Output Python file; defaults to standard output")
     parser.add_argument(
         "--sas-version",
-        choices=("auto", "9.4M8", "Viya"),
+        choices=("auto", "9.4M4", "9.4M8", "Viya"),
         default="auto",
         help=(
             "Source SAS release profile; auto reads the source marker or defaults "

@@ -45,7 +45,7 @@ from .date_functions import (
     render_format,
     translate_date_literals,
 )
-from .sas_parser import SasParseError, parse_program
+from .sas_parser import SasParseError, SasStatement, parse_program
 from .sql_calculated import rewrite_calculated
 
 # Source-to-source passes applied in order after macro expansion.
@@ -87,11 +87,17 @@ class ConversionResult:
     version_source: str = "default"
 
 
-_SAS_VERSION_PROFILES = {"9.4m8": "9.4M8", "viya": "Viya"}
+_SAS_VERSION_PROFILES = {
+    "9.4m4": "9.4M4",
+    "9.4m8": "9.4M8",
+    "viya": "Viya",
+}
 _SAS_VERSION_MARKER = re.compile(
     r"^\s*sas2pyspark\s*:\s*sas-version\s*=\s*([^*\s]+)\s*$",
     re.IGNORECASE,
 )
+_REMOTE_SUBMIT_CONTROL = re.compile(r"^\s*(signon|signoff|rsubmit|endrsubmit)\b", re.I)
+_REMOTE_SUBMIT_OPTION = re.compile(r"^\s*options\b.*\bremote\s*=", re.I)
 
 
 def _sas_version_markers(source: str) -> list[str]:
@@ -183,6 +189,24 @@ def _resolve_sas_version(
         "Viya compatibility profile. Per-release syntax and semantic gates "
         "are not implemented yet.",
     )
+
+
+def _reject_sas_connect_statement(statement: SasStatement | _Statement) -> None:
+    if _REMOTE_SUBMIT_CONTROL.match(statement.text) or _REMOTE_SUBMIT_OPTION.match(
+        statement.text
+    ):
+        command = statement.text.strip().split(None, 1)[0].upper()
+        raise ConversionError(
+            f"{command} is a SAS/CONNECT control statement and cannot be "
+            "flattened into local PySpark. Resolve its remote server and "
+            "convert remote code separately.",
+            line=(
+                statement.span.start_line
+                if isinstance(statement, SasStatement)
+                else statement.line
+            ),
+            statement=statement.text,
+        )
 
 
 _DATASET = re.compile(r"^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)$")
@@ -782,6 +806,8 @@ class SasToPySparkConverter:
             raise ConversionError(error.message, line=error.line) from error
         try:
             parsed_program = parse_program(source)
+            for statement in parsed_program.statements:
+                _reject_sas_connect_statement(statement)
             statements = expand_macros(
                 [
                     _Statement(statement.text, statement.span.start_line)
@@ -789,6 +815,8 @@ class SasToPySparkConverter:
                 ],
                 allow_sysget=self.allow_sysget,
             )
+            for statement in statements:
+                _reject_sas_connect_statement(statement)
             for rewrite in _REWRITE_PASSES:
                 statements = rewrite(statements)
         except SasParseError as error:

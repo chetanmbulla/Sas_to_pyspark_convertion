@@ -147,6 +147,21 @@ class MigrationProjectTests(unittest.TestCase):
                 self.assertIn("df_output = df_source", output.getvalue())
                 self.assertIn("SAS source profile: 9.4M8 (override)", errors.getvalue())
 
+    def test_existing_conversion_cli_accepts_a_sas_94m4_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "input.sas")
+            path.write_text(
+                "/* sas2pyspark: sas-version=9.4M4 */ "
+                "data output; set source; run;",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            errors = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                self.assertEqual(main([str(path), "--sas-version", "9.4M4"]), 0)
+            self.assertIn("df_output = df_source", output.getvalue())
+            self.assertIn("SAS source profile: 9.4M4 (override)", errors.getvalue())
+
     def test_discovery_inventories_sas_assets_and_skips_configured_directories(self):
         source = b"""/* proc ignored; */
 * proc also_ignored; ;

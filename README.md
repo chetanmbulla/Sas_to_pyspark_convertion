@@ -87,26 +87,26 @@ Convert a SAS file into a Python file:
 .\.venv\Scripts\sas2pyspark.exe input.sas --output output.py
 ```
 
-The compatibility target is the Base SAS language surface shared by current
-SAS Viya and legacy SAS 9.4M8 programs. The Viya profile follows the current
+The compatibility target is a supported Base SAS subset from current SAS Viya
+and legacy SAS 9.4M4/9.4M8 programs. The Viya profile follows the current
 language baseline; it is not pinned to a specific Viya deployment release and
 does not imply support for SAS/STAT, CAS, DS2, or other separately licensed
 products. Declare the source release in the SAS file when known:
 
 ```sas
-/* sas2pyspark: sas-version=9.4M8 */
+/* sas2pyspark: sas-version=9.4M4 */
 ```
 
-Or select a profile explicitly with `--sas-version 9.4M8` or
+Or select a profile explicitly with `--sas-version 9.4M4`, `--sas-version 9.4M8`, or
 `--sas-version Viya`. The default `auto` mode reads the marker; if absent, it
 selects Viya and emits a warning. The Python API accepts the same keyword
-(`convert_sas(source, sas_version="9.4M8")`), and the GUI and
+(`convert_sas(source, sas_version="9.4M4")`), and the GUI and
 `project convert` command expose the same selection. If a marker and explicit
 override disagree, conversion fails. At this stage, the profile records
 release selection and validates marker consistency; it does not yet enforce a
 complete per-release syntax/semantic feature matrix. Every conversion warns
-about this limitation. Selecting 9.4M8 does not emulate SAS runtime
-differences.
+about this limitation. Selecting 9.4M4 or 9.4M8 does not emulate SAS runtime
+differences; profile selection is not a claim of full release certification.
 
 The command also works as `sas2pyspark input.sas -o output.py` when the
 environment's scripts directory is on `PATH`. To print generated code to the
@@ -548,7 +548,8 @@ sas2pyspark project convert migration.project.json --root .
 ```
 
 Use `--sas-version auto` to resolve each program from its in-source marker or
-default to the Viya profile. Pass `--sas-version 9.4M8` or `--sas-version Viya`
+default to the Viya profile. Pass `--sas-version 9.4M4`, `--sas-version 9.4M8`,
+or `--sas-version Viya`
 to set one source profile for the batch.
 
 The JSON manifest uses schema version `1` and starts with empty `programs`,
@@ -598,11 +599,95 @@ assumed to exist. The command writes the report and updates the manifest even
 when references or cycles remain, then returns status `1` to indicate that the
 plan needs attention.
 
-This is static, conservative analysis—not a full SAS parser. Dynamic macro
-resolution, `LIBNAME` path resolution, dataset options that generate names,
-complex macro expansion, dictionary tables, and nonliteral include paths
-cannot be reliably inferred; inspect unresolved references and the graph
-before using its order as an execution plan.
+This plan is static, conservative analysis—not a full SAS parser. It does not
+resolve `LIBNAME` physical paths, dataset options that generate names, complex
+macro expansion, dictionary tables, or nonliteral include paths; inspect
+unresolved references and the graph before using its order as an execution
+plan. The separate pipeline resolver below handles configured server paths and
+supported include forms.
+
+`project resolve-pipeline` builds a separate job-rooted include report. Its
+configuration maps each SAS server's drive letters to repository-relative
+folders and declares the scheduled SAS entrypoints:
+
+```json
+{
+  "schema_version": 1,
+  "servers": {
+    "DI": {
+      "drives": {"V": "server-1-DI/V"},
+      "initialization_scripts": ["server-1-DI/V/autoexec.sas"]
+    },
+    "BI": {
+      "drives": {"U": "server-2-BI/U", "W": "server-2-BI/W"},
+      "initialization_scripts": ["server-2-BI/autoexec.sas"]
+    }
+  },
+  "entrypoints": [
+    {"server": "DI", "path": "server-1-DI/V/Arcelordwh/Stock_FIP/fact_tables/Jams/DWHS2045.sas"},
+    {"server": "BI", "path": "server-2-BI/U/Arcelordwh/Stock_FIP/Jams/DWHS2049.sas"}
+  ],
+  "remote_aliases": {}
+}
+```
+
+Run `sas2pyspark project resolve-pipeline --root . --config pipeline.json`.
+The generated report includes recursively resolved quoted `%INCLUDE` paths and
+`FILENAME` fileref members, reachable and unreached `.sas` files, mapped
+`LIBNAME` physical paths, remote `LIBNAME SERVER=` references, SQL pass-through
+engines, and `SIGNON`/`RSUBMIT`/`REMOTE=` references. Connection credentials
+and raw connection strings are not copied into the report. Mapped `RSUBMIT`
+blocks are bounded and their includes and physical libraries are resolved in
+the configured target server's drive mappings; an unknown alias is never
+resolved against the local server. Populate
+`remote_aliases` only when a remote alias is confirmed to identify one of the
+configured servers; the resolver does not guess server relationships.
+Optional `initialization_scripts` are scanned before each job entrypoint so
+simple `%LET` values and fileref assignments established by server autoexec
+files can resolve paths. This is static expansion, not macro execution.
+Reachability is conservative static potential reachability: conditional macro
+branches are not executed, and dynamic paths, unsupported `FILENAME` forms,
+or unresolved remote aliases are reported for review. It does not execute SAS
+or establish that an unreached script is unused outside the configured
+entrypoints.
+The resolver records each remote block's target and source lines, but does not
+reproduce SAS/CONNECT sessions, transfer state, credentials, or remote runtime
+behavior. `project convert` rejects SAS/CONNECT control statements rather than
+flattening remote code into local PySpark; convert and validate remote code
+separately on its target platform.
+
+`project catalog --root . --pipeline-report pipeline.pipeline.json` writes a
+source/sink and external-system catalog to
+`pipeline.pipeline.catalog.json` (or `--report`). It links statically observed
+SAS dataset reads and writes to mapped `LIBNAME`s, remote SAS librefs, and
+external files; it also records SQL pass-through engines, imports/exports, and
+configured remote-submit aliases. Remote submission is inventory-only and is
+never executed.
+Explicit DATA-step `LENGTH`, `ATTRIB`, and `FORMAT` declarations are retained as
+partial schema evidence. Unavailable table schemas, unresolved library
+references, dynamic file locations, and unmapped remote endpoints are flagged
+instead of guessed. This report does not inspect SAS datasets or execute
+connection code, so it is an inventory to be enriched with authoritative
+`PROC CONTENTS` or platform metadata—not a complete schema extract.
+
+`project report --pipeline-report pipeline.pipeline.json --catalog-report
+pipeline.pipeline.catalog.json --plan-report project.plan.json
+--conversion-report project.conversion.json --output project-report.md`
+combines pipeline, resource, plan, and conversion evidence into project-level
+Markdown with a Mermaid data-flow graph. Its per-script and project complexity
+scores start from the static plan score and incorporate observed conversion
+failures, not-yet-run programs, and warnings. Scores are prioritization
+heuristics, not effort estimates or evidence of runtime equivalence. Existing
+Markdown reports are protected; use `--force` to replace one.
+
+`project synthesize --catalog project.catalog.json --output-dir test-data
+--rows 100 --seed 0` creates deterministic CSV fixtures and a
+`synthetic-data-manifest.json`. Only numeric and character columns with known
+types are generated; unknown schemas and unknown column types are skipped.
+Fixtures from partial schemas are marked as partial and can omit fields needed
+by the full program. Existing outputs are not overwritten unless `--force` is
+specified. Generated data is not representative of production distributions,
+null rates, keys, or cross-table relationships.
 
 `project convert` calls the existing SAS converter separately for each
 registered program. Successful outputs are written under `--output-dir`

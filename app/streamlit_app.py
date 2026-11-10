@@ -58,11 +58,11 @@ source = st.text_area(
 
 sas_version = st.selectbox(
     "SAS source version",
-    ("auto", "9.4M8", "Viya"),
+    ("auto", "9.4M4", "9.4M8", "Viya"),
     help=(
         "Auto reads a sas2pyspark version marker; if absent, the Viya profile is "
-        "selected and a warning is shown. This profile does not yet gate every "
-        "language feature by SAS release."
+        "selected and a warning is shown. Release selection does not certify "
+        "complete SAS-version-specific syntax or runtime equivalence."
     ),
 )
 
