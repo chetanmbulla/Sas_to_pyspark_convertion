@@ -14,7 +14,7 @@ from decimal import (
     Decimal,
     InvalidOperation,
 )
-from typing import NoReturn
+from typing import Mapping, NoReturn
 
 
 @dataclass(frozen=True)
@@ -530,8 +530,15 @@ def _split_top_level(arguments: str, statement: MacroStatement) -> list[str]:
 
 class _MacroProcessor:
     def __init__(
-        self, statements: list[MacroStatement], *, allow_sysget: bool = False
+        self,
+        statements: list[MacroStatement],
+        *,
+        allow_sysget: bool = False,
+        initial_variables: Mapping[str, str] | None = None,
     ) -> None:
+        self.initial_variables = {
+            name.casefold(): value for name, value in (initial_variables or {}).items()
+        }
         self.macros: dict[str, _Macro] = {}
         self.allow_sysget = allow_sysget
         self.statement_count = 0
@@ -544,7 +551,7 @@ class _MacroProcessor:
         self.statements = self._extract_definitions(statements)
 
     def expand(self) -> list[MacroStatement]:
-        result = self._process(self.statements, {}, (), 0)
+        result = self._process(self.statements, dict(self.initial_variables), (), 0)
         self._check_goto_resolved()
         return result
 
@@ -1292,6 +1299,11 @@ class _MacroProcessor:
 
 
 def expand_macros(
-    statements: list[MacroStatement], *, allow_sysget: bool = False
+    statements: list[MacroStatement],
+    *,
+    allow_sysget: bool = False,
+    initial_variables: Mapping[str, str] | None = None,
 ) -> list[MacroStatement]:
-    return _MacroProcessor(statements, allow_sysget=allow_sysget).expand()
+    return _MacroProcessor(
+        statements, allow_sysget=allow_sysget, initial_variables=initial_variables
+    ).expand()

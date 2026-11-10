@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .includes import IncludeError, inline_includes
 from .user_formats import (
@@ -233,6 +233,11 @@ _PROC_IMPORT_TOKEN = re.compile(
     r"([A-Za-z_]\w*)\s*=\s*(\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[^\s]+)"
     r"|([A-Za-z_]\w*)"
 )
+
+
+def _squeeze_equals(text: str) -> str:
+    """Remove blanks around `=` so `data = x` splits like `data=x`."""
+    return re.sub(r"\s*=\s*", "=", text.strip())
 
 
 def _dataset_name(value: str) -> str:
@@ -795,13 +800,17 @@ class SasToPySparkConverter:
         sas_version: str = "auto",
         include_dir: str | Path | None = None,
         include_root: str | Path | None = None,
+        include_drives: Mapping[str, str | Path] | None = None,
+        macro_variables: Mapping[str, str] | None = None,
     ) -> ConversionResult:
         selected_version, version_source, version_warning = _resolve_sas_version(
             source, sas_version
         )
         reset_formats()
         try:
-            source = inline_includes(source, include_dir, include_root)
+            source = inline_includes(
+                source, include_dir, include_root, include_drives, macro_variables
+            )
         except IncludeError as error:
             raise ConversionError(error.message, line=error.line) from error
         try:
@@ -814,6 +823,7 @@ class SasToPySparkConverter:
                     for statement in parsed_program.statements
                 ],
                 allow_sysget=self.allow_sysget,
+                initial_variables=macro_variables,
             )
             for statement in statements:
                 _reject_sas_connect_statement(statement)
@@ -3436,7 +3446,7 @@ class SasToPySparkConverter:
         nodup = False
         dupout: str | None = None
         where_filters: list[str] = []
-        header_options = statements[start].text[len("proc sort") :].strip().split()
+        header_options = _squeeze_equals(statements[start].text[len("proc sort") :]).split()
         for option in header_options:
             lower_option = option.lower()
             if lower_option.startswith("data="):
@@ -3701,7 +3711,7 @@ class SasToPySparkConverter:
         base: str | None = None
         data: str | None = None
         force = False
-        for option in statements[start].text[len("proc append") :].split():
+        for option in _squeeze_equals(statements[start].text[len("proc append") :]).split():
             lower_option = option.lower()
             if lower_option.startswith("base="):
                 base = _dataset_name(option[5:])
@@ -3724,7 +3734,7 @@ class SasToPySparkConverter:
         self, statements: list[_Statement], start: int
     ) -> tuple[list[str], int]:
         library = "work"
-        for option in statements[start].text[len("proc datasets") :].split():
+        for option in _squeeze_equals(statements[start].text[len("proc datasets") :]).split():
             lower_option = option.lower()
             if lower_option.startswith(("lib=", "library=")):
                 library = option.split("=", 1)[1].lower()
@@ -3974,7 +3984,7 @@ class SasToPySparkConverter:
     ) -> tuple[list[str], int, int]:
         data: str | None = None
         include_missing = False
-        header_options = statements[start].text[len("proc freq") :].strip().split()
+        header_options = _squeeze_equals(statements[start].text[len("proc freq") :]).split()
         for option in header_options:
             if option.lower().startswith("data="):
                 data = _dataset_name(option[5:])

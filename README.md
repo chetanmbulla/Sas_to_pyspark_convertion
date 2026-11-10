@@ -792,7 +792,13 @@ step. Everything lands in `<folder>`: `inventory.json`, `pipeline-report.json`,
 output folder must be outside `--root`, so the SAS tree is never modified, and a
 non-empty folder is reused only with `--force`. It accepts `--sas-version`,
 `--rows`, and `--seed`. The same static-analysis limits as the individual
-commands apply.
+commands apply. During conversion, `project analyze` seeds each program with
+the `%LET` values from its server's initialization scripts (plus config
+`macro_variables`) and resolves drive-letter `%INCLUDE` paths and
+`%INCLUDE fileref(member)` through the configured server drives, so includes
+that the resolver follows are also inlined by the converter. Library-level
+`%INCLUDE` accepts CRLF sources, and PROC SORT/APPEND/DATASETS/FREQ headers
+accept blanks around `=`.
 
 `project synthesize --catalog project.catalog.json --output-dir test-data
 --rows 100 --seed 0` creates deterministic CSV fixtures and a

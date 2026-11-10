@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,11 @@ from .business_context import build_business_context, build_prompts, render_mark
 from .source_sink_catalog import build_source_sink_catalog, load_pipeline_report
 from .schema_assets import load_schema_assets
 from .synthetic_data import generate_synthetic_data, load_catalog_report
+
+_SIMPLE_LET = re.compile(
+    r"^[ \t]*%let[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*([^;&%\r\n]*);",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 INDEX_NAME = "phase1-index.json"
 INDEX_SCHEMA_VERSION = 1
@@ -132,6 +138,37 @@ def run_phase1_analysis(
             Dependency.create(edge.source_id, edge.target_id, f"analysis:{edge.kind}")
         )
 
+    server_by_path = {
+        str(item.get("path", "")).casefold(): item.get("server")
+        for item in pipeline.to_dict().get("scripts", [])
+    }
+    config_data = json.loads(config_file.read_text(encoding="utf-8-sig"))
+
+    def include_drives(source_path: str) -> dict[str, Path]:
+        server = server_by_path.get(source_path.replace("\\", "/").casefold())
+        drives = config_data.get("servers", {}).get(server, {}).get("drives", {})
+        return {letter: repository_root / target for letter, target in drives.items()}
+
+    def macro_variables(source_path: str) -> dict[str, str]:
+        server = server_by_path.get(source_path.replace("\\", "/").casefold())
+        values: dict[str, str] = {}
+        settings = config_data.get("servers", {}).get(server, {})
+        for script in settings.get("initialization_scripts", []):
+            try:
+                text = (repository_root / script).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in _SIMPLE_LET.finditer(text):
+                values[match.group(1)] = match.group(2).strip()
+        values.update(
+            {
+                name: value
+                for name, value in config_data.get("macro_variables", {}).items()
+                if isinstance(value, str)
+            }
+        )
+        return values
+
     conversion = convert_project(
         project,
         repository_root,
@@ -139,6 +176,8 @@ def run_phase1_analysis(
         force=force,
         sas_version=sas_version,
         output_base=files["generated_code"],
+        include_drives=include_drives,
+        macro_variables=macro_variables,
     )
     conversion.save(files["conversion"])
     project.validate()

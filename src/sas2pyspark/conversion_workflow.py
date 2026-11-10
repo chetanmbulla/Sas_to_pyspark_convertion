@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from .converter import ConversionError, SasToPySparkConverter
 from .discovery import _decode_source
@@ -140,6 +140,8 @@ def convert_project(
     force: bool = False,
     sas_version: str = "auto",
     output_base: str | Path | None = None,
+    include_drives: Callable[[str], Mapping[str, str | Path]] | None = None,
+    macro_variables: Callable[[str], Mapping[str, str]] | None = None,
 ) -> BatchConversionReport:
     """Convert each registered program independently and record its outcome.
 
@@ -273,6 +275,8 @@ def convert_project(
                 sas_version=sas_version,
                 include_dir=source_path.parent,
                 include_root=root,
+                include_drives=include_drives(source_relative) if include_drives else None,
+                macro_variables=macro_variables(source_relative) if macro_variables else None,
             )
         except ConversionError as error:
             record_failure(str(error))

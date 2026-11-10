@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Mapping
 
 _INCLUDE = re.compile(
-    r"^[ \t]*%include[ \t]+(['\"])(.*?)\1[ \t]*;[ \t]*$", re.IGNORECASE | re.MULTILINE
+    r"^[ \t]*%include[ \t]+(['\"])(.*?)\1[ \t]*;[ \t]*\r?$", re.IGNORECASE | re.MULTILINE
 )
 _ANY_INCLUDE = re.compile(r"^[ \t]*%include\b", re.IGNORECASE | re.MULTILINE)
+_DRIVE_PATH = re.compile(r"^([A-Za-z]):(?:[\\/]+(.*))?$")
 _LET = re.compile(
     r"^[ \t]*%let[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*([^;\r\n]*);",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FILENAME = re.compile(
+    r"^[ \t]*filename[ \t]+([A-Za-z_]\w*)[ \t]+(['\"])(.*?)\2[ \t]*;", re.IGNORECASE | re.MULTILINE
+)
+_FILEREF_INCLUDE = re.compile(
+    r"^[ \t]*%include[ \t]+([A-Za-z_]\w*)\(([^)\r\n]+)\)[ \t]*;[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
 _VARIABLE = re.compile(r"&([A-Za-z_]\w*)\.?")
@@ -25,12 +34,17 @@ class IncludeError(ValueError):
 
 
 def inline_includes(
-    source: str, include_dir: Path | str | None, include_root: Path | str | None = None
+    source: str,
+    include_dir: Path | str | None,
+    include_root: Path | str | None = None,
+    drives: Mapping[str, Path | str] | None = None,
+    macro_variables: Mapping[str, str] | None = None,
 ) -> str:
     """Replace literal %INCLUDE statements with the referenced file contents.
 
     Included files must live under include_root (default include_dir), and
-    relative paths resolve against the including file's directory.
+    relative paths resolve against the including file's directory. Paths with a
+    drive letter resolve through ``drives`` (letter -> directory) when given.
     """
     if not _ANY_INCLUDE.search(source):
         return source
@@ -40,7 +54,12 @@ def inline_includes(
         )
     base = Path(include_dir).resolve()
     root = Path(include_root).resolve() if include_root is not None else base
-    return _expand(source, base, root, (), 0, {})
+    mapped = {
+        letter.rstrip(":").casefold(): Path(path).resolve()
+        for letter, path in (drives or {}).items()
+    }
+    seed = {name.casefold(): value for name, value in (macro_variables or {}).items()}
+    return _expand(source, base, root, (), 0, seed, mapped)
 
 
 def _expand(
@@ -50,6 +69,7 @@ def _expand(
     stack: tuple[Path, ...],
     depth: int,
     variables: dict[str, str],
+    drives: Mapping[str, Path],
 ) -> str:
     if depth > _MAX_DEPTH:
         raise IncludeError(f"%INCLUDE nesting is deeper than {_MAX_DEPTH} levels.")
@@ -60,8 +80,18 @@ def _expand(
             variables[let.group(1).casefold()] = _resolve_variables(
                 let.group(2).strip(), variables, let.start(), source
             )
+        for filename in _FILENAME.finditer(source, cursor, match.start()):
+            variables["filename:" + filename.group(1).casefold()] = _resolve_variables(
+                filename.group(3).strip(), variables, filename.start(), source
+            )
         include = _INCLUDE.match(source, match.start())
         line = source.count("\n", 0, match.start()) + 1
+        member = _FILEREF_INCLUDE.match(source, match.start())
+        if include is None and member is not None:
+            directory = variables.get("filename:" + member.group(1).casefold())
+            if directory is not None:
+                include = member
+                include_path = directory.rstrip("\\/") + "/" + member.group(2).strip()
         if include is None:
             raise IncludeError(
                 "%INCLUDE requires a quoted path; dynamic paths must resolve from "
@@ -69,13 +99,24 @@ def _expand(
                 line=line,
             )
         try:
-            include_path = _resolve_variables(
-                include.group(2), variables, match.start(), source
-            )
+            if include is not member:
+                include_path = _resolve_variables(
+                    include.group(2), variables, match.start(), source
+                )
         except IncludeError as error:
             raise IncludeError(error.message, line=line) from error
         line = source.count("\n", 0, match.start()) + 1
-        target = (base / include_path).resolve()
+        drive = _DRIVE_PATH.match(include_path)
+        if drive is not None:
+            drive_root = drives.get(drive.group(1).casefold())
+            if drive_root is None:
+                raise IncludeError(
+                    f"%INCLUDE drive {drive.group(1).upper()}: is not mapped: {include_path!r}.",
+                    line=line,
+                )
+            target = (drive_root / (drive.group(2) or "").replace("\\", "/")).resolve()
+        else:
+            target = (base / include_path).resolve()
         try:
             target.relative_to(root)
         except ValueError:
@@ -95,7 +136,7 @@ def _expand(
             ) from error
         output.append(source[cursor : match.start()])
         output.append(
-            _expand(text, target.parent, root, stack + (target,), depth + 1, variables)
+            _expand(text, target.parent, root, stack + (target,), depth + 1, variables, drives)
         )
         cursor = include.end()
     output.append(source[cursor:])
