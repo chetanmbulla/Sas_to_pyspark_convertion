@@ -733,6 +733,22 @@ as `ultimate_source` (read, never written by reachable code), `intermediate` or
 DATA-step SET/MERGE and PROC SQL lineage only; outputs written by other PROCs
 (`APPEND`, `SORT OUT=`, imports) have no traced upstream sources.
 
+`project graph --pipeline-report P --catalog-report C --output knowledge-graph.json`
+merges both reports into one typed graph (`--format json|graphml|mermaid`,
+`--no-columns` to drop column nodes; `project analyze` writes
+`knowledge-graph.json` automatically). Nodes are `job`, `script`, `dataset`,
+`file`, `system` and `column`; edges are `runs`, `includes`, `reads`, `writes`,
+`uses`, `stored_in`, `derived_from`, `column_derived_from` and `belongs_to`.
+`project lineage --graph knowledge-graph.json --query <q> --node <name>` answers
+`upstream`, `downstream`, `sources` (ultimate upstream datasets/files), `sinks`,
+`path` (with `--to`), `neighbours` and `search`; `--depth`, `--types`, `--json`
+and `--mermaid FILE` refine or export the result. A node can be given as a full
+id (`dataset:cpp.rts_daily`), a name, or a unique fragment; ambiguous names are
+rejected with candidates. Lineage follows data flow through scripts
+(`reads`/`writes`) and dataset/column derivation, so it inherits the limits of
+the catalog (macro-generated code and non-SQL/DATA-step PROC outputs are not
+traced).
+
 `project report --pipeline-report pipeline.pipeline.json --catalog-report
 pipeline.pipeline.catalog.json --plan-report project.plan.json
 --conversion-report project.conversion.json --output project-report.md`

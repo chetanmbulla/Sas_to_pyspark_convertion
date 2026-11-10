@@ -32,6 +32,20 @@ from .source_sink_catalog import (
 from .project_report import ProjectReportError, build_project_report_from_files
 from .phase1_analysis import Phase1AnalysisError, run_phase1_analysis
 from .schema_assets import SchemaAssetError, load_schema_assets
+from .knowledge_graph import (
+    KnowledgeGraphError,
+    NODE_TYPES,
+    build_knowledge_graph,
+    find_path,
+    load_knowledge_graph,
+    neighbours,
+    resolve_node,
+    search_nodes,
+    to_graphml,
+    to_mermaid,
+    traverse,
+    ultimate_nodes,
+)
 from .synthetic_data import (
     SyntheticDataError,
     generate_synthetic_data,
@@ -171,6 +185,36 @@ def _project_main(argv: list[str]) -> int:
     synthetic_parser.add_argument("--rows", type=int, default=100)
     synthetic_parser.add_argument("--seed", type=int, default=0)
     synthetic_parser.add_argument("--force", action="store_true")
+    graph_parser = commands.add_parser(
+        "graph",
+        help="Export the pipeline/catalog knowledge graph (JSON, GraphML or Mermaid)",
+    )
+    graph_parser.add_argument("--pipeline-report", required=True)
+    graph_parser.add_argument("--catalog-report", required=True)
+    graph_parser.add_argument("--output", required=True)
+    graph_parser.add_argument("--format", choices=("json", "graphml", "mermaid"), default="json")
+    graph_parser.add_argument(
+        "--no-columns", action="store_true", help="Omit column nodes and column lineage edges"
+    )
+    graph_parser.add_argument("--force", action="store_true")
+    lineage_parser = commands.add_parser(
+        "lineage",
+        help="Query a knowledge graph: upstream, downstream, sources, path, neighbours, search",
+    )
+    lineage_parser.add_argument("--graph", required=True, help="knowledge-graph.json")
+    lineage_parser.add_argument(
+        "--query",
+        required=True,
+        choices=("upstream", "downstream", "sources", "sinks", "path", "neighbours", "search"),
+    )
+    lineage_parser.add_argument("--node", required=True, help="Node id, name or unique fragment")
+    lineage_parser.add_argument("--to", help="Target node for --query path")
+    lineage_parser.add_argument("--depth", type=int, help="Maximum traversal depth")
+    lineage_parser.add_argument(
+        "--types", nargs="+", choices=NODE_TYPES, help="Only report these node types"
+    )
+    lineage_parser.add_argument("--json", action="store_true", help="Print JSON instead of text")
+    lineage_parser.add_argument("--mermaid", help="Also write the result sub-graph as Mermaid to this file")
     analyze_parser = commands.add_parser(
         "analyze",
         help="Run the full Phase 1 analysis and write all artifacts to one folder",
@@ -641,6 +685,82 @@ def _project_main(argv: list[str]) -> int:
                 f"{report['summary']['partial_schema_count']} from partial schemas."
             )
             print(f"Synthetic data manifest: {Path(args.output_dir).resolve() / 'synthetic-data-manifest.json'}")
+        elif args.command == "graph":
+            output_path = Path(args.output).resolve(strict=False)
+            if output_path.exists() and not args.force:
+                raise KnowledgeGraphError(
+                    f"Graph output already exists: {output_path}. Use --force to replace it."
+                )
+            graph = build_knowledge_graph(
+                load_pipeline_report(args.pipeline_report),
+                load_catalog_report(args.catalog_report),
+                include_columns=not args.no_columns,
+            )
+            if args.format == "json":
+                text = json.dumps(graph, indent=2, sort_keys=True) + "\n"
+            elif args.format == "graphml":
+                text = to_graphml(graph)
+            else:
+                text = to_mermaid(
+                    graph,
+                    [n["id"] for n in graph["nodes"] if n["type"] in {"script", "dataset", "file", "job"}],
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(text, encoding="utf-8", newline="\n")
+            summary = graph["summary"]
+            print(
+                f"Knowledge graph: {output_path} "
+                f"({summary['node_count']} node(s), {summary['edge_count']} edge(s))."
+            )
+        elif args.command == "lineage":
+            graph = load_knowledge_graph(args.graph)
+            if args.query == "search":
+                found = search_nodes(graph, args.node, args.types)
+                payload: dict[str, Any] = {"query": "search", "nodes": found}
+                selected = [n["id"] for n in found]
+            else:
+                start = resolve_node(graph, args.node)
+                if args.query in {"upstream", "downstream"}:
+                    walk = traverse(
+                        graph, start, args.query, max_depth=args.depth, types=args.types
+                    )
+                    payload = {"query": args.query, "start": start, "nodes": walk["nodes"]}
+                    selected = [start, *[n["id"] for n in walk["nodes"]]]
+                elif args.query in {"sources", "sinks"}:
+                    direction = "upstream" if args.query == "sources" else "downstream"
+                    found = ultimate_nodes(
+                        graph, start, direction, args.types or ("dataset", "file")
+                    )
+                    payload = {"query": args.query, "start": start, "nodes": found}
+                    selected = [start, *[n["id"] for n in found]]
+                elif args.query == "path":
+                    if not args.to:
+                        raise KnowledgeGraphError("--to is required for --query path.")
+                    goal = resolve_node(graph, args.to)
+                    path = find_path(graph, start, goal)
+                    payload = {"query": "path", "start": start, "goal": goal, "path": path}
+                    selected = path or []
+                else:
+                    edges = neighbours(graph, start)
+                    payload = {"query": "neighbours", "start": start, "edges": edges}
+                    selected = [start, *{e["source"] for e in edges}, *{e["target"] for e in edges}]
+            if args.mermaid:
+                mermaid_path = Path(args.mermaid).resolve(strict=False)
+                mermaid_path.parent.mkdir(parents=True, exist_ok=True)
+                mermaid_path.write_text(to_mermaid(graph, selected), encoding="utf-8", newline="\n")
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            elif payload["query"] == "path":
+                print(" -> ".join(payload["path"]) if payload["path"] else "No data-flow path found.")
+            elif payload["query"] == "neighbours":
+                for edge in payload["edges"]:
+                    print(f"{edge['source']} --{edge['type']}--> {edge['target']}")
+            else:
+                for node in payload["nodes"]:
+                    depth = f"[{node['depth']}] " if "depth" in node else ""
+                    flag = " [temporary]" if node.get("temporary") else ""
+                    print(f"{depth}{node['type']}: {node['label']}{flag}")
+                print(f"{len(payload['nodes'])} node(s).")
         elif args.command == "analyze":
             index = run_phase1_analysis(
                 args.root,
@@ -1074,6 +1194,7 @@ def _project_main(argv: list[str]) -> int:
         SyntheticDataError,
         Phase1AnalysisError,
         SchemaAssetError,
+        KnowledgeGraphError,
         ReadinessError,
     ) as error:
         print(f"sas2pyspark: error: {error}", file=sys.stderr)

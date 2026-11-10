@@ -17,6 +17,7 @@ from .discovery import (
 from .pipeline_resolver import load_pipeline_config, resolve_pipeline
 from .project import Dependency, MigrationProject
 from .project_report import build_project_report_from_files
+from .knowledge_graph import build_knowledge_graph
 from .source_sink_catalog import build_source_sink_catalog, load_pipeline_report
 from .schema_assets import load_schema_assets
 from .synthetic_data import generate_synthetic_data, load_catalog_report
@@ -73,6 +74,7 @@ def run_phase1_analysis(
         "inventory": out / "inventory.json",
         "pipeline_report": out / "pipeline-report.json",
         "catalog": out / "catalog.json",
+        "knowledge_graph": out / "knowledge-graph.json",
         "plan": out / "plan.json",
         "conversion": out / "conversion.json",
         "report": out / "project-report.md",
@@ -102,6 +104,8 @@ def run_phase1_analysis(
     )
     catalog["schema_asset_warnings"] = asset_warnings
     _write_json(files["catalog"], catalog)
+    graph = build_knowledge_graph(pipeline.to_dict(), catalog)
+    _write_json(files["knowledge_graph"], graph)
 
     plan = build_migration_plan(project, repository_root)
     plan.save(files["plan"])
@@ -151,6 +155,7 @@ def run_phase1_analysis(
         },
         "pipeline": pipeline.to_dict()["summary"],
         "catalog": catalog["summary"],
+        "knowledge_graph": graph["summary"],
         "plan": plan.to_dict()["summary"],
         "conversion": conversion.to_dict()["summary"],
         "report": {

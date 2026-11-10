@@ -945,6 +945,11 @@ def build_source_sink_catalog(
         ),
         "schemas": sorted(catalog_schemas, key=lambda item: item["dataset"]),
         "column_lineage": column_lineage,
+        "dataset_lineage": [
+            {"target": target, "sources": sorted(sources - {target})}
+            for target, sources in sorted(dataset_edges.items())
+            if sources - {target}
+        ],
         "script_classification": script_roles,
         "resource_roles": resource_roles,
         "dynamic_references": sorted(
