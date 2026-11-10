@@ -934,8 +934,11 @@ class SasToPySparkConverter:
                     output.extend(block)
                     warnings.extend(block_warnings)
                 elif lower == "proc sql" or lower == "proc sql noprint":
-                    block, index, sql_count = self._convert_sql(statements, index, sql_count)
+                    block, index, sql_count, block_warnings = self._convert_sql(
+                        statements, index, sql_count
+                    )
                     output.extend(block)
+                    warnings.extend(block_warnings)
                 elif lower == "proc freq" or lower.startswith("proc freq "):
                     block, index, freq_count = self._convert_freq(
                         statements, index, freq_count
@@ -1040,10 +1043,26 @@ class SasToPySparkConverter:
         self, statements: list[_Statement], start: int
     ) -> tuple[list[str], int, list[str]]:
         target_statement = statements[start].text
-        match = re.fullmatch(r"data\s+((?:[\w]+\.)?[\w]+)", target_statement, re.I)
+        match = re.fullmatch(
+            r"data\s+((?:[\w]+\.)?[\w]+)(?:\s*\((.*?)\))?",
+            target_statement,
+            re.I | re.S,
+        )
         if not match:
             raise ConversionError(f"Unsupported DATA statement: {target_statement!r}.")
         target = _dataset_name(match.group(1))
+        data_option: re.Match[str] | None = None
+        if match.group(2):
+            data_option = re.fullmatch(
+                r"\s*(drop|keep)\s*=\s*(?:\(\s*([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*)\s*\)"
+                r"|([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*))\s*",
+                match.group(2),
+                re.I,
+            )
+            if data_option is None:
+                raise ConversionError(
+                    f"Unsupported DATA-step dataset option: {match.group(2)!r}."
+                )
         sources: tuple[str, ...] | None = None
         merge_sources: tuple[str, ...] | None = None
         merge_in_vars: tuple[str, ...] = ()
@@ -1054,6 +1073,13 @@ class SasToPySparkConverter:
         actions: list[_DataAction] = []
         keep: list[str] | None = None
         drop: list[str] = []
+        rename_pairs: list[tuple[str, str]] = []
+        if data_option is not None:
+            option_columns = (data_option.group(2) or data_option.group(3)).split()
+            if data_option.group(1).casefold() == "keep":
+                keep = option_columns
+            else:
+                drop = option_columns
         retain_vars: dict[str, tuple[str, str]] = {}
         retain_seen: set[str] = set()
         retain_resets: dict[str, tuple[str, str]] = {}
@@ -2083,9 +2109,30 @@ class SasToPySparkConverter:
                         raise ConversionError(str(error)) from error
                     display_formats.update(format_match.group(1).split())
                 elif lower.startswith("keep "):
-                    keep = statement[5:].split()
+                    statement_keep = statement[5:].split()
+                    keep = list(dict.fromkeys([*(keep or []), *statement_keep]))
                 elif lower.startswith("drop "):
                     drop.extend(statement[5:].split())
+                elif lower.startswith("rename "):
+                    rename_text = statement[7:].strip().rstrip(";")
+                    rename_matches = list(
+                        re.finditer(
+                            r"([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)",
+                            rename_text,
+                        )
+                    )
+                    remainder = re.sub(
+                        r"([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)",
+                        "",
+                        rename_text,
+                    )
+                    if not rename_matches or remainder.strip():
+                        raise ConversionError(
+                            "RENAME supports one or more simple old=new variable pairs."
+                        )
+                    rename_pairs.extend(
+                        (item.group(1), item.group(2)) for item in rename_matches
+                    )
                 else:
                     assignment = _DATA_ASSIGNMENT.fullmatch(statement)
                     if not assignment:
@@ -3247,6 +3294,11 @@ class SasToPySparkConverter:
         in_names = [name for name in merge_in_vars if name]
         if in_names:
             lines.append(f"{_python_name(target)} = {_python_name(target)}.drop(*{in_names!r})")
+        for old_name, new_name in rename_pairs:
+            lines.append(
+                f"{_python_name(target)} = {_python_name(target)}.withColumnRenamed("
+                f"{old_name!r}, {new_name!r})"
+            )
         lines.extend(
             [
                 f"{_python_name(target)}.createOrReplaceTempView({target!r})",
@@ -3585,15 +3637,28 @@ class SasToPySparkConverter:
         self, statements: list[_Statement], start: int
     ) -> tuple[list[str], int]:
         header = statements[start].text[len("proc format") :].strip()
-        cntlin_match = re.fullmatch(
-            r"cntlin\s*=\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)",
+        format_options = {
+            match.group(1).casefold(): match.group(2)
+            for match in re.finditer(
+                r"\b(cntlin|lib)\s*=\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)",
+                header,
+                re.I,
+            )
+        }
+        remainder = re.sub(
+            r"\b(cntlin|lib)\s*=\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)",
+            "",
             header,
-            re.I,
+            flags=re.I,
         )
-        if header and cntlin_match is None:
+        if (header and remainder.strip()) or len(format_options) != len(
+            re.findall(r"\b(?:cntlin|lib)\s*=", header, re.I)
+        ):
             raise ConversionError(f"Unsupported PROC FORMAT option: {header!r}.")
-        if cntlin_match:
-            dataset = _dataset_name(cntlin_match.group(1))
+        if format_options.get("lib", "work").casefold() != "work":
+            raise ConversionError("PROC FORMAT supports only LIB=WORK.")
+        if "cntlin" in format_options:
+            dataset = _dataset_name(format_options["cntlin"])
             register_cntlin(dataset)
         names: list[str] = []
         index = start + 1
@@ -3603,7 +3668,7 @@ class SasToPySparkConverter:
             if lower in {"run", "quit"}:
                 break
             try:
-                if cntlin_match:
+                if "cntlin" in format_options:
                     raise ConversionError(
                         "PROC FORMAT CNTLIN= does not accept VALUE, INVALUE or PICTURE "
                         "statements in the same step."
@@ -3636,7 +3701,7 @@ class SasToPySparkConverter:
             index += 1
         else:
             raise ConversionError("PROC FORMAT is missing RUN.")
-        if cntlin_match:
+        if "cntlin" in format_options:
             source = _python_name(dataset)
             lines = [
                 "# PROC FORMAT CNTLIN: rows are collected to the driver; use a small control dataset.",
@@ -4759,8 +4824,9 @@ class SasToPySparkConverter:
 
     def _convert_sql(
         self, statements: list[_Statement], start: int, sql_count: int
-    ) -> tuple[list[str], int, int]:
+    ) -> tuple[list[str], int, int, list[str]]:
         lines: list[str] = []
+        warnings: list[str] = []
         index = start + 1
         while index < len(statements) and statements[index].text.lower() != "quit":
             source_statement = statements[index]
@@ -4779,6 +4845,31 @@ class SasToPySparkConverter:
                             f"{_python_name(target)}.createOrReplaceTempView({target!r})",
                             "",
                         ]
+                    )
+                elif index_create := re.fullmatch(
+                    r"create\s+(?:unique\s+)?index\s+([A-Za-z_]\w*)\s+on\s+"
+                    r"((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)\s*\(([^()]*)\)\s*;?",
+                    statement,
+                    re.I,
+                ):
+                    columns = [
+                        column.strip()
+                        for column in index_create.group(3).split(",")
+                    ]
+                    if not columns or any(
+                        not re.fullmatch(r"[A-Za-z_]\w*", column)
+                        for column in columns
+                    ):
+                        raise ConversionError(
+                            "CREATE INDEX supports only simple column names."
+                        )
+                    warnings.append(
+                        "SAS PROC SQL CREATE INDEX is omitted; Spark has no "
+                        "equivalent physical index."
+                    )
+                    lines.append(
+                        f"# SAS index {index_create.group(1)} on "
+                        f"{index_create.group(2)} omitted (no Spark equivalent)."
                     )
                 elif re.match(r"^(select|with)\b", statement, re.I):
                     into = _SQL_INTO.search(statement)
@@ -4826,7 +4917,7 @@ class SasToPySparkConverter:
             index += 1
         if index >= len(statements):
             raise ConversionError("PROC SQL is missing QUIT.")
-        return lines, index + 1, sql_count
+        return lines, index + 1, sql_count, warnings
 
     @staticmethod
     def _normalize_sql(query: str) -> str:

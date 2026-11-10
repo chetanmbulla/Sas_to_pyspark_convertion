@@ -275,7 +275,7 @@ def render_informat(value: str, spec: str) -> str:
         return _date_count(
             f"to_date(trim(CAST({value} AS STRING)), '{pattern}')"
         )
-    if name == "" and width:
+    if name in {"", "BEST"} and width:
         return f"try_cast(trim(CAST({value} AS STRING)) AS DOUBLE)"
     raise DateFunctionError(
         f"Informat {spec.strip()!r} is unsupported; supported: DATE9., YYMMDD10., "

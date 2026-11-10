@@ -214,6 +214,10 @@ and execute it.
   standard `FMTNAME`, `TYPE`, `START`, `END`, `LABEL` and `HLO` columns; its rows are
   collected to the driver and should remain small. `LIBNAME lib 'path';` / `LIBNAME lib CLEAR;`
   are accepted as no-ops with a warning (library prefixes are dropped).
+  DATA-step `DROP=`/`KEEP=` dataset options and simple `RENAME old=new` statements
+  are supported. Numeric `BESTw.` informats map to a tolerant numeric cast.
+  `PROC SQL CREATE INDEX` is omitted with a warning because Spark has no equivalent
+  physical index. `%SYSFUNC(DATETIME())` is evaluated when conversion runs.
   `%INCLUDE 'file';` with a quoted path is inlined before parsing; paths resolve
   relative to the including file, must stay inside the source directory (or
   repository root in batch mode), and circular includes are rejected. A quoted

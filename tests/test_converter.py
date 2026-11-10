@@ -1058,6 +1058,53 @@ class ConverterTests(unittest.TestCase):
                 "proc sql; create table o as select calculated nope from a; quit;"
             )
 
+    def test_sql_create_index_is_skipped_with_warning(self):
+        result = self.converter.convert(
+            "proc sql; create index idx_a on work.people(a); quit;"
+        )
+        self.assertIn("SAS index idx_a on work.people omitted", result.code)
+        self.assertTrue(
+            any("CREATE INDEX is omitted" in warning for warning in result.warnings)
+        )
+        compile(result.code, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert(
+                "proc sql; create index idx_a on work.people(a + 1); quit;"
+            )
+
+    def test_data_step_drop_dataset_option(self):
+        code = self.converter.convert(
+            "data out(drop = old_a old_b); set source; run;"
+        ).code
+        self.assertIn("df_out = df_out.drop(*['old_a', 'old_b'])", code)
+        compile(code, "<generated-pyspark>", "exec")
+
+    def test_data_step_rename_statement(self):
+        code = self.converter.convert(
+            "data out; set source; rename old_a = new_a old_b=new_b; run;"
+        ).code
+        self.assertIn("withColumnRenamed('old_a', 'new_a')", code)
+        self.assertIn("withColumnRenamed('old_b', 'new_b')", code)
+        compile(code, "<generated-pyspark>", "exec")
+
+    def test_best_numeric_informat(self):
+        code = self.converter.convert(
+            "data out; set source; value = input(raw, best4.); run;"
+        ).code
+        self.assertIn(
+            "try_cast(trim(CAST(raw AS STRING)) AS DOUBLE)",
+            code,
+        )
+        compile(code, "<generated-pyspark>", "exec")
+
+    def test_sysfunc_datetime_compile_time_value(self):
+        code = self.converter.convert(
+            "%let now = %sysfunc(datetime()); "
+            "data out; set source; stamp = &now; run;"
+        ).code
+        self.assertRegex(code, r"withColumn\('stamp', F\.expr\('[0-9.]+'\)")
+        compile(code, "<generated-pyspark>", "exec")
+
     def test_macro_text_functions(self):
         source = """
 %let name = sales_2024_q1;
@@ -1784,7 +1831,7 @@ run;
         compile(code, "<generated-pyspark>", "exec")
 
         cntlin = self.converter.convert(
-            "proc format cntlin=control; run;"
+            "proc format lib=work cntlin=control; run;"
             "data out; set source; label = put(score, band.); date_label = put(dt, date9.); run;"
         ).code
         self.assertIn("df_control.select('FMTNAME', 'TYPE', 'START', 'END', 'LABEL', 'HLO')", cntlin)
@@ -1792,6 +1839,8 @@ run;
         self.assertIn("date_format(date_add(DATE'1960-01-01', CAST((dt) AS INT)), 'ddMMMyyyy')", cntlin)
         self.assertNotIn("sas2pyspark_cntlin_format('date9'", cntlin)
         compile(cntlin, "<generated-pyspark>", "exec")
+        with self.assertRaises(ConversionError):
+            self.converter.convert("proc format lib=permanent; run;")
 
     def test_if_then_do_blocks_and_delete_rewrite_to_conditionals(self):
         result = self.converter.convert(

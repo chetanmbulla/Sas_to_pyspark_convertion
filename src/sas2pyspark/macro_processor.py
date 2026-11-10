@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import (
     ROUND_CEILING,
     Context,
@@ -393,7 +394,12 @@ def _sysfunc(call: str, statement: MacroStatement) -> str:
             statement,
         )
     name = match.group(1).casefold()
-    arguments = [item.strip() for item in _split_top_level(match.group(2), statement)]
+    raw_arguments = match.group(2)
+    arguments = (
+        [item.strip() for item in _split_top_level(raw_arguments, statement)]
+        if raw_arguments.strip()
+        else []
+    )
 
     def number(text: str) -> Decimal:
         try:
@@ -415,6 +421,10 @@ def _sysfunc(call: str, statement: MacroStatement) -> str:
         return text_functions[name](arguments[0])
     if name == "length" and len(arguments) == 1:
         return str(len(arguments[0]))
+    if name == "datetime" and not arguments:
+        return _format_number(
+            Decimal(str((datetime.now() - datetime(1960, 1, 1)).total_seconds()))
+        )
     numeric_unary = {
         "abs": abs,
         "int": lambda value: value.to_integral_value(rounding=ROUND_DOWN),
