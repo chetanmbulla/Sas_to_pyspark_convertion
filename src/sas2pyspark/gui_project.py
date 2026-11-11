@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import ntpath
 import shutil
@@ -9,8 +10,9 @@ import stat
 import tempfile
 import zipfile
 from io import BytesIO
+from itertools import islice
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .execution_workflow import run_project
 from .phase1_analysis import run_phase1_analysis
@@ -101,6 +103,7 @@ def analyze_zip(
     archive: bytes,
     *,
     config: bytes | None = None,
+    schema_asset: tuple[str, bytes] | None = None,
     sas_version: str = "auto",
     rows: int = 100,
     seed: int = 0,
@@ -128,9 +131,20 @@ def analyze_zip(
     else:
         source_root = extracted
         config_path.write_bytes(config)
+    schema_path = None
+    if schema_asset is not None:
+        filename, content = schema_asset
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".csv", ".json", ".sql", ".ddl"}:
+            raise GuiProjectError("Schema asset must be a CSV, JSON, SQL or DDL file.")
+        if len(content) > 50_000_000:
+            raise GuiProjectError("Schema asset exceeds the 50 MB limit.")
+        schema_path = workspace / f"schema-asset{suffix}"
+        schema_path.write_bytes(content)
     output = workspace / "phase1"
     index = run_phase1_analysis(
-        source_root, config_path, output, sas_version=sas_version, rows=rows, seed=seed
+        source_root, config_path, output, sas_version=sas_version, rows=rows, seed=seed,
+        schemas=schema_path,
     )
     return {
         "workspace": str(workspace),
@@ -151,6 +165,84 @@ def regenerate_synthetic_data(
     )
 
 
+def preview_synthetic_data(
+    output_root: Path, manifest: dict[str, Any], dataset: str, *, limit: int = 20
+) -> tuple[list[str], list[list[str]]]:
+    """Read a bounded preview of a generated fixture inside this project."""
+    if not 1 <= limit <= 100:
+        raise GuiProjectError("Preview row limit must be between 1 and 100.")
+    records = [
+        item for item in manifest["datasets"]
+        if item["dataset"] == dataset
+        and item["status"] in {"generated", "generated_partial_schema"}
+    ]
+    if len(records) != 1:
+        raise GuiProjectError(f"Generated synthetic dataset is not uniquely available: {dataset!r}.")
+    root = Path(output_root).resolve(strict=True)
+    fixture_root = Path(manifest["output_directory"]).resolve(strict=True)
+    if not fixture_root.is_relative_to(root):
+        raise GuiProjectError("Synthetic input directory is outside this project output.")
+    path = _inside(fixture_root, records[0]["path"])
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.reader(stream, strict=True)
+            header = next(reader, None)
+            if not header:
+                raise GuiProjectError(f"Synthetic dataset {dataset!r} has no CSV header.")
+            expected = [column["name"] for column in records[0]["columns"]]
+            if header != expected:
+                raise GuiProjectError(f"Synthetic dataset {dataset!r} does not match its manifest columns.")
+            rows = list(islice(reader, limit))
+            if any(len(row) != len(header) for row in rows):
+                raise GuiProjectError(f"Synthetic dataset {dataset!r} has a malformed CSV row.")
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise GuiProjectError(f"Cannot preview synthetic dataset {dataset!r}: {error}") from error
+    return header, rows
+
+
+def read_converted_code(output_root: Path, relative_path: str) -> str:
+    """Read a generated program from the Phase 1 code directory."""
+    return _inside(output_root / "code", relative_path).read_text(encoding="utf-8")
+
+
+def pipeline_flow_graph(pipeline: Mapping[str, Any], *, max_nodes: int = 80) -> tuple[str, bool]:
+    """Create a bounded DOT graph of job entrypoints and resolved includes."""
+    if max_nodes < 1:
+        raise GuiProjectError("Graph node limit must be positive.")
+    nodes: dict[tuple[str, str], str] = {}
+    edges: set[tuple[str, str]] = set()
+    truncated = False
+
+    def node(kind: str, label: str) -> str | None:
+        nonlocal truncated
+        key = (kind, label)
+        if key not in nodes:
+            if len(nodes) >= max_nodes:
+                truncated = True
+                return None
+            nodes[key] = f"n{len(nodes)}"
+        return nodes[key]
+
+    for job in pipeline.get("jobs", []):
+        if job.get("entrypoint"):
+            source = node("Job", str(job.get("name") or job["entrypoint"]))
+            target = node("Script", str(job["entrypoint"]))
+            if source and target:
+                edges.add((source, target))
+    for include in pipeline.get("includes", []):
+        if include.get("status") == "resolved" and include.get("source") and include.get("target"):
+            source = node("Script", str(include["source"]))
+            target = node("Script", str(include["target"]))
+            if source and target:
+                edges.add((source, target))
+    lines = ["digraph pipeline {", "  rankdir=LR;"]
+    for (kind, label), identifier in nodes.items():
+        lines.append(f"  {identifier} [label={json.dumps(kind + ': ' + label)}, shape=box];")
+    lines.extend(f"  {source} -> {target};" for source, target in sorted(edges))
+    lines.append("}")
+    return "\n".join(lines), truncated
+
+
 def run_converted_programs(
     project_state: dict[str, Any],
     synthetic_manifest: dict[str, Any],
@@ -158,6 +250,8 @@ def run_converted_programs(
     *,
     timeout_seconds: int,
     master: str = "local[1]",
+    programs: Sequence[str] | None = None,
+    edited_code: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Stage successful conversions and selected synthetic inputs, then run them."""
     source_root = Path(project_state["source_root"]).resolve(strict=True)
@@ -167,6 +261,25 @@ def run_converted_programs(
     successful = [item for item in conversion_report["outcomes"] if item["status"] == "succeeded"]
     if not successful:
         raise GuiProjectError("No successfully converted programs are available to execute.")
+    if programs is not None:
+        if not programs or len(programs) != len(set(programs)):
+            raise GuiProjectError("Select one or more distinct converted programs.")
+        available = {item["source_path"] for item in successful}
+        missing = set(programs) - available
+        if missing:
+            raise GuiProjectError(f"Programs are not successfully converted: {', '.join(sorted(missing))}.")
+        selected_set = set(programs)
+        successful = [item for item in successful if item["source_path"] in selected_set]
+    edits = dict(edited_code or {})
+    if set(edits) - {item["source_path"] for item in successful}:
+        raise GuiProjectError("Edited code must belong to a selected converted program.")
+    for path, code in edits.items():
+        if not isinstance(code, str) or not code.strip():
+            raise GuiProjectError(f"Edited code is empty for {path!r}.")
+        try:
+            compile(code, path, "exec")
+        except SyntaxError as error:
+            raise GuiProjectError(f"Edited code has a syntax error for {path!r}: {error}") from error
     selected_records = {
         item["dataset"]: item
         for item in synthetic_manifest["datasets"]
@@ -192,7 +305,10 @@ def run_converted_programs(
             if destination.exists():
                 raise GuiProjectError(f"Execution staging path collision: {relative!r}.")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
+            if origin == output_root / "code" and item["source_path"] in edits:
+                destination.write_text(edits[item["source_path"]], encoding="utf-8")
+            else:
+                shutil.copyfile(source, destination)
     mappings = []
     for name in datasets:
         record = selected_records[name]
@@ -212,4 +328,5 @@ def run_converted_programs(
     )
     report = result.to_dict()
     report["execution_root"] = str(stage)
+    report["edited_programs"] = sorted(edits)
     return report

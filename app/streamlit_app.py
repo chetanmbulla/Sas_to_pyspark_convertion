@@ -10,14 +10,18 @@ from sas2pyspark.discovery import _decode_source
 from sas2pyspark.gui_testing import performance_notes, run_pyspark_test
 
 
-st.set_page_config(page_title="SAS to PySpark", layout="wide")
+st.set_page_config(page_title="SAS to PySpark", layout="wide", initial_sidebar_state="expanded")
 
 st.title("SAS to PySpark")
 st.write(
     "Convert SAS source, review or edit the generated PySpark, and test it "
     "against sample data."
 )
-st.info("For ZIP projects and Phase 1 reports, open **Project Analysis** in the sidebar.")
+st.info(
+    "Project workflow: open **Project Analysis** for Phase 1 ZIP upload and pipeline "
+    "documentation, **Phase 2 Synthetic Data** for fixtures, then **Phase 3 Conversion "
+    "Testing** to select and run converted programs."
+)
 st.warning(
     "Testing executes Python code under the account running this app. "
     "This is not a security sandbox; only run code you trust, and keep the "

@@ -1,25 +1,16 @@
-"""Analyze an uploaded SAS project and run converted programs locally."""
+"""Upload a project and inspect Phase 1 analysis."""
 
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 
 import streamlit as st
 
-from sas2pyspark.gui_project import (
-    analyze_zip,
-    regenerate_synthetic_data,
-    run_converted_programs,
-)
+from sas2pyspark.gui_project import analyze_zip, pipeline_flow_graph
 
-st.set_page_config(page_title="SAS project analysis", layout="wide")
-st.title("SAS project analysis")
-st.caption("Upload a SAS project ZIP, inspect Phase 1, create fixtures and run converted programs.")
-st.warning(
-    "Execution runs generated Python under the server account and is not sandboxed. "
-    "Use this local app only with trusted source and data."
-)
+st.set_page_config(page_title="Phase 1 pipeline analysis", layout="wide", initial_sidebar_state="expanded")
+st.title("Phase 1: Pipeline analysis and assets")
+st.caption("Upload a SAS project ZIP and inspect pipeline, schemas, documentation and migration complexity.")
 
 archive = st.file_uploader("SAS project ZIP", type=["zip"], key="project_zip")
 config = st.file_uploader(
@@ -27,6 +18,12 @@ config = st.file_uploader(
     type=["json"],
     key="project_config",
     help="Paths must be relative to the ZIP root. Include server drives and job entrypoints.",
+)
+schema_asset = st.file_uploader(
+    "Table schema metadata (optional)",
+    type=["csv", "json", "sql", "ddl"],
+    key="project_schema_asset",
+    help="Upload PROC CONTENTS CSV, schema JSON, or CREATE TABLE DDL; do not upload production data.",
 )
 if config is None:
     st.info(
@@ -44,11 +41,20 @@ if st.button("Run Phase 1 analysis", type="primary", disabled=archive is None) a
     st.session_state.pop("project_execution", None)
     st.session_state.pop("project_execution_inputs", None)
     st.session_state.pop("project_trusted", None)
+    st.session_state.pop("phase2_dataset", None)
+    st.session_state.pop("project_phase1_stale", None)
+    st.session_state.pop("phase3_program", None)
+    st.session_state.pop("phase3_editor", None)
+    st.session_state.pop("phase3_editor_program", None)
+    st.session_state.pop("phase3_inputs", None)
+    st.session_state.pop("phase3_inputs_program", None)
+    st.session_state.pop("phase1_dataset", None)
     try:
         with st.spinner("Analyzing the SAS project and generating synthetic data..."):
             result = analyze_zip(
                 archive.getvalue(),
                 config=config.getvalue() if config else None,
+                schema_asset=(schema_asset.name, schema_asset.getvalue()) if schema_asset else None,
                 sas_version=version,
                 rows=int(rows),
                 seed=int(seed),
@@ -59,6 +65,10 @@ if st.button("Run Phase 1 analysis", type="primary", disabled=archive is None) a
         st.session_state.project_archive_hash = hashlib.sha256(archive.getvalue()).hexdigest()
         st.session_state.project_config_hash = (
             hashlib.sha256(config.getvalue()).hexdigest() if config else None
+        )
+        st.session_state.project_schema_hash = (
+            (schema_asset.name.rsplit(".", 1)[-1].lower(), hashlib.sha256(schema_asset.getvalue()).hexdigest())
+            if schema_asset else None
         )
         st.session_state.project_analysis_version = version
         st.session_state.project_synthetic = manifest
@@ -71,13 +81,19 @@ if project:
     index = project["index"]
     current_archive_hash = hashlib.sha256(archive.getvalue()).hexdigest() if archive else None
     current_config_hash = hashlib.sha256(config.getvalue()).hexdigest() if config else None
+    current_schema_hash = (
+        (schema_asset.name.rsplit(".", 1)[-1].lower(), hashlib.sha256(schema_asset.getvalue()).hexdigest())
+        if schema_asset else None
+    )
     stale = (
         current_archive_hash != st.session_state.get("project_archive_hash")
         or current_config_hash != st.session_state.get("project_config_hash")
+        or current_schema_hash != st.session_state.get("project_schema_hash")
         or version != st.session_state.get("project_analysis_version")
     )
+    st.session_state.project_phase1_stale = stale
     if stale:
-        st.warning("The ZIP, configuration, or SAS version has changed; results below are from the previous analysis.")
+        st.warning("The ZIP, configuration, schema metadata, or SAS version has changed; results below are from the previous analysis.")
     st.success("Phase 1 analysis completed.")
     st.caption(f"Local output folder: {output}")
     if project["configuration"] == "all_scripts_fallback":
@@ -108,6 +124,76 @@ if project:
         file_name="project-report.md",
         mime="text/markdown",
     )
+    try:
+        pipeline_report = json.loads((output / "pipeline-report.json").read_text(encoding="utf-8"))
+        catalog_report = json.loads((output / "catalog.json").read_text(encoding="utf-8"))
+        complexity = json.loads((output / "complexity.json").read_text(encoding="utf-8"))
+        report_text = (output / "project-report.md").read_text(encoding="utf-8")
+        business_text = (output / "business-context.md").read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        st.error(f"Cannot load Phase 1 results: {error}")
+        st.stop()
+    st.subheader("Migration complexity")
+    score = complexity["project"]
+    cols = st.columns(3)
+    cols[0].metric("Score", f"{score['score']}/100")
+    cols[1].metric("Complexity", score["band"])
+    cols[2].metric("Confidence", f"{score['confidence']:.0%}")
+    st.caption("A prioritization heuristic, not a delivery estimate or proof of equivalence.")
+    st.dataframe(
+        [{"Factor": name, "Raw": value["raw"], "Points": value["points"]}
+         for name, value in score["factors"].items()],
+        use_container_width=True, hide_index=True,
+    )
+    tabs = st.tabs(["Jobs and includes", "Libraries and systems", "Datasets and schemas", "Documentation"])
+    with tabs[0]:
+        st.markdown("**Job and include flow**")
+        graph, truncated = pipeline_flow_graph(pipeline_report)
+        st.graphviz_chart(graph, use_container_width=True)
+        if truncated:
+            st.warning("The visual flow is limited to 80 nodes; use the full knowledge graph download for all nodes.")
+        st.caption("Resolved static includes only; runtime-generated, waived and unresolved includes are not shown as edges.")
+        for label, key in (("Jobs / entrypoints", "jobs"), ("Scripts", "scripts"), ("Recursive includes", "includes")):
+            st.markdown(f"**{label}**")
+            st.dataframe(pipeline_report.get(key, []), use_container_width=True, hide_index=True)
+    with tabs[1]:
+        st.markdown("**SAS libraries and physical paths**")
+        st.dataframe(pipeline_report.get("libraries", []), use_container_width=True, hide_index=True)
+        st.markdown("**External connections (input and output)**")
+        st.dataframe(pipeline_report.get("external_connections", []), use_container_width=True, hide_index=True)
+        st.markdown("**Identified systems**")
+        st.dataframe(catalog_report.get("systems", []), use_container_width=True, hide_index=True)
+    with tabs[2]:
+        resources = [item for item in catalog_report.get("resources", []) if item.get("kind") == "sas_dataset"]
+        st.dataframe([
+            {"Dataset": item["name"], "Direction": item.get("direction"),
+             "Schema status": (item.get("schema") or {}).get("status"),
+             "Attributes": len((item.get("schema") or {}).get("columns") or [])}
+            for item in resources
+        ], use_container_width=True, hide_index=True)
+        names = [item["name"] for item in resources]
+        if names:
+            selected_dataset = st.selectbox("Inspect schema", names, key="phase1_dataset")
+            resource = next((item for item in resources if item["name"] == selected_dataset), None)
+            if resource:
+                attributes = (resource.get("schema") or {}).get("columns") or []
+                if attributes:
+                    st.dataframe(attributes, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No column definitions are available for this dataset.")
+    with tabs[3]:
+        st.caption("The report contains Mermaid process-flow source. Business context is an offline template, not AI-verified.")
+        with st.expander("Migration report and process flow"):
+            st.markdown(report_text)
+        with st.expander("Business context"):
+            st.markdown(business_text)
+        for label, name, mime in (
+            ("Download business context", "business-context.md", "text/markdown"),
+            ("Download knowledge graph", "knowledge-graph.json", "application/json"),
+            ("Download catalog", "catalog.json", "application/json"),
+            ("Download AI prompts", "ai-prompts.json", "application/json"),
+        ):
+            st.download_button(label, data=(output / name).read_bytes(), file_name=name, mime=mime)
 
     conversion = json.loads((output / "conversion.json").read_text(encoding="utf-8"))
     st.subheader("Conversion to PySpark")
@@ -131,111 +217,4 @@ if project:
         mime="application/json",
     )
 
-    st.subheader("Synthetic data")
-    st.caption(
-        "Phase 1 creates fixtures from known catalog columns. Unknown or unsupported "
-        "schemas are skipped; partial fixtures may not contain all required columns."
-    )
-    if st.button("Create synthetic data with current settings", disabled=stale):
-        try:
-            manifest = regenerate_synthetic_data(output, rows=int(rows), seed=int(seed))
-            st.session_state.project_synthetic = manifest
-            st.session_state.pop("project_execution", None)
-            st.session_state.pop("project_execution_inputs", None)
-        except (OSError, ValueError) as error:
-            st.error(f"Synthetic data generation failed: {error}")
-    manifest = st.session_state.get("project_synthetic")
-    if manifest:
-        cols = st.columns(3)
-        cols[0].metric("Generated", manifest["summary"]["generated_count"])
-        cols[1].metric("Partial schemas", manifest["summary"]["partial_schema_count"])
-        cols[2].metric("Skipped", manifest["summary"]["skipped_count"])
-        st.caption(f"Fixture folder: {manifest['output_directory']}")
-        with st.expander("Synthetic dataset details"):
-            st.dataframe(
-                [
-                    {"Dataset": item["dataset"], "Status": item["status"], "Reason": item.get("reason", "")}
-                    for item in manifest["datasets"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-        st.download_button(
-            "Download synthetic data manifest",
-            data=json.dumps(manifest, indent=2).encode("utf-8"),
-            file_name="synthetic-data-manifest.json",
-            mime="application/json",
-        )
-
-        st.subheader("Execute converted PySpark programs")
-        st.caption(
-            "Each successfully converted program runs independently using the selected "
-            "fixtures. Program dependencies are not chained. Missing or partial inputs "
-            "can cause execution failures; success does not prove equivalence to SAS."
-        )
-        available = [
-            item["dataset"] for item in manifest["datasets"]
-            if item["status"] in {"generated", "generated_partial_schema"}
-        ]
-        selected = st.multiselect("Synthetic input datasets", available, key="project_execution_inputs")
-        timeout = st.number_input("Timeout per program (seconds)", min_value=1, max_value=3600, value=120, key="project_timeout")
-        trusted = st.checkbox("I trust this project and understand execution is not sandboxed", key="project_trusted")
-        has_pyspark = importlib.util.find_spec("pyspark") is not None
-        if not has_pyspark:
-            st.info("Install the GUI extra to enable PySpark execution.")
-        if st.button(
-            "Execute all converted programs",
-            disabled=stale or not trusted or not has_pyspark or conversion["summary"]["succeeded"] == 0,
-        ):
-            st.session_state.pop("project_execution", None)
-            try:
-                with st.spinner("Running converted programs in local Spark workers..."):
-                    st.session_state.project_execution = run_converted_programs(
-                        project, manifest, selected, timeout_seconds=int(timeout)
-                    )
-            except (OSError, ValueError, KeyError) as error:
-                st.error(f"Could not run converted programs: {error}")
-
-        execution = st.session_state.get("project_execution")
-        if execution:
-            summary = execution["summary"]
-            cols = st.columns(4)
-            cols[0].metric("Attempted", summary["program_count"])
-            cols[1].metric("Succeeded", summary["succeeded"])
-            cols[2].metric("Failed", summary["failed"])
-            cols[3].metric("Timed out", summary["timed_out"])
-            st.caption(
-                f"Only converted programs were attempted; {conversion['summary']['failed']} "
-                "conversion failures were not executed."
-            )
-            st.dataframe(
-                [
-                    {
-                        "SAS program": item["source_path"],
-                        "Status": item["status"],
-                        "Reason": item.get("error") or "",
-                        "Stderr log": str(Path(execution["execution_root"]) / item["stderr_path"]),
-                    }
-                    for item in execution["results"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-            for item in execution["results"]:
-                if item["status"] != "succeeded":
-                    with st.expander(f"Execution log: {item['source_path']}"):
-                        log_path = Path(execution["execution_root"]) / item["stderr_path"]
-                        try:
-                            with log_path.open("rb") as log:
-                                log.seek(0, 2)
-                                log.seek(max(0, log.tell() - 32768))
-                                text = log.read().decode("utf-8", errors="replace")
-                            st.code(text or item.get("error") or "No stderr output.")
-                        except OSError as error:
-                            st.error(f"Cannot read execution log: {error}")
-            st.download_button(
-                "Download execution report",
-                data=json.dumps(execution, indent=2).encode("utf-8"),
-                file_name="execution-report.json",
-                mime="application/json",
-            )
+    st.info("Continue to Phase 2 Synthetic Data and then Phase 3 Conversion Testing in the sidebar.")

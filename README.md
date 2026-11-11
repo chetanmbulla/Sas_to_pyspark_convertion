@@ -160,15 +160,55 @@ whose paths are relative to the ZIP root (see
 every SAS file is treated as an entrypoint on a placeholder server; job
 reachability and server drive mappings are not authoritative.
 
-The page displays Phase 1 summaries, conversion counts and failure reasons,
-and offers report downloads. It also generates synthetic CSV fixtures from
-known catalog schemas; unknown schemas are skipped and partial schemas may
-omit required columns. Adjust the row count and seed to generate new fixtures.
-Select the fixtures to use as inputs and confirm that the project is trusted
-before executing converted programs. Each program runs independently, not as
-a chained pipeline; review per-program status and stderr for failures. Programs
-that failed conversion are not executed. Execution success does not establish
-SAS equivalence.
+The page displays jobs, recursive includes, libraries, physical paths,
+external input/output connections, datasets, schemas, conversion issues, and
+the heuristic complexity score. The downloadable Markdown report includes
+Mermaid process-flow source; business context is an offline template and AI
+prompts are exported without contacting an AI service. Phase 1 also generates
+initial synthetic fixtures and conversions, which can be reviewed in the
+subsequent pages.
+
+### Phase 2: synthetic test data
+
+After running Phase 1, select **Phase 2 Synthetic Data** in the sidebar. The
+page lists catalog datasets and their schema and fixture statuses. Select an
+object to inspect its available attributes and up to 20 synthetic CSV rows.
+The page can also regenerate fixtures with a chosen row count and seed; the
+new fixtures are used by Phase 3.
+If the upload widgets are cleared when switching back to Project Analysis,
+reselect the same ZIP and optional configuration/schema files, and the same
+SAS version, to re-enable execution without rerunning Phase 1.
+
+For better structural coverage, upload a single optional schema metadata file
+on the Project Analysis page before running Phase 1. Supported formats are
+`PROC CONTENTS OUT=` CSV, schema JSON, and `CREATE TABLE` SQL/DDL; see
+[schema assets](#migration-project-foundation). This is metadata only: do not
+upload production data. Matching is by catalog dataset name, and unmatched
+metadata is reported. Without authoritative schemas, inferred attributes and
+types may be incomplete or unknown; datasets with unknown types are skipped.
+CSV files preserve known column names and character-length limits, but CSV
+does not enforce SAS types or formats. Synthetic values do not reproduce
+production distributions, missing values, keys, or relationships; obtain and
+validate metadata and test requirements before treating fixtures as structurally
+equivalent to real tables.
+
+### Phase 3: conversion testing
+
+Select **Phase 3 Conversion Testing** to review conversion issues, select a
+successfully converted program, edit its PySpark and choose synthetic inputs.
+Static catalog-detected inputs are preselected when fixtures exist; review the
+list, missing-input warnings and schemas before running. Only the current
+program's edits are used for a run; they are staged in a separate execution
+workspace and the original conversion remains unchanged. Download edits to
+retain them. The execution report includes the executed code snapshot and
+hash. You can run the selected program or all converted programs independently
+with the same selected fixtures; the current editor applies only to its
+selected program. Logs and statuses are shown for each attempt.
+
+Runs do not chain intermediate outputs between programs, and runtime success
+does not validate the full pipeline or establish SAS equivalence. Programs
+that failed conversion cannot be executed from this page. Use reference
+outputs and the reconciliation workflow for value-level comparison.
 
 Project uploads, reports, generated code, fixtures, and execution logs are
 stored in a persistent local temporary workspace shown on the page. Remove
