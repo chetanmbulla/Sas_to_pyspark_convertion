@@ -145,6 +145,7 @@ def analyze_zip(
     index = run_phase1_analysis(
         source_root, config_path, output, sas_version=sas_version, rows=rows, seed=seed,
         schemas=schema_path,
+        configuration_source="all_scripts_fallback" if config is None else "provided",
     )
     return {
         "workspace": str(workspace),

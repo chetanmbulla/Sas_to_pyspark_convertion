@@ -23,6 +23,17 @@ _SUPPORTED_TYPES = {"numeric", "character"}
 _MAX_ROWS = 1_000_000
 
 
+def _fixture_type(column: Mapping[str, Any]) -> str | None:
+    value = column.get("type")
+    if value is None or value == "" or (
+        isinstance(value, str) and value.casefold() == "unknown"
+    ):
+        return "character"
+    if isinstance(value, str) and value.casefold() in _SUPPORTED_TYPES:
+        return value.casefold()
+    return None
+
+
 def load_catalog_report(path: str | Path) -> dict[str, Any]:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -101,7 +112,7 @@ def generate_synthetic_data(
     seed: int = 0,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Generate deterministic CSVs for datasets with known column data types."""
+    """Generate CSVs, assuming character for columns with unknown types."""
     if catalog.get("schema_version") != 1:
         raise SyntheticDataError("Catalog has an unsupported schema version.")
     if not isinstance(rows, int) or isinstance(rows, bool) or not 1 <= rows <= _MAX_ROWS:
@@ -132,7 +143,7 @@ def generate_synthetic_data(
         if not columns or any(
             not isinstance(column, Mapping)
             or not column.get("name")
-            or str(column.get("type", "")).casefold() not in _SUPPORTED_TYPES
+            or _fixture_type(column) is None
             for column in columns
         ):
             continue
@@ -168,7 +179,11 @@ def generate_synthetic_data(
                 {
                     "dataset": dataset_name,
                     "status": "skipped",
-                    "reason": f"Schema status is {schema.get('status', 'unknown')}; no column definitions are available.",
+                    "reason": (
+                        f"Schema status is {schema.get('status', 'unknown')}; no column "
+                        "definitions were discovered in the SAS files/ZIP or supplied "
+                        "schema metadata."
+                    ),
                 }
             )
             continue
@@ -178,7 +193,7 @@ def generate_synthetic_data(
                 invalid_columns.append("<invalid column record>")
             elif (
                 not column.get("name")
-                or str(column.get("type", "")).casefold() not in _SUPPORTED_TYPES
+                or _fixture_type(column) is None
             ):
                 invalid_columns.append(str(column.get("name") or "<unnamed>"))
         if invalid_columns:
@@ -186,11 +201,20 @@ def generate_synthetic_data(
                 {
                     "dataset": dataset_name,
                     "status": "skipped",
-                    "reason": "One or more columns have unknown or unsupported types.",
+                    "reason": "One or more columns are unnamed, invalid, or have unsupported types.",
                     "columns": invalid_columns,
                 }
             )
             continue
+
+        fixture_columns = []
+        assumed_columns = []
+        for column in columns:
+            fixture_column = dict(column)
+            fixture_column["type"] = _fixture_type(column)
+            if column.get("type") is None or str(column.get("type")).casefold() in {"", "unknown"}:
+                assumed_columns.append(str(column["name"]))
+            fixture_columns.append(fixture_column)
 
         output_path = destination / f"{_stable_file_stem(dataset_name)}.csv"
         if output_path.exists() and not force:
@@ -214,12 +238,12 @@ def generate_synthetic_data(
                 delete=False,
             ) as temporary:
                 writer = csv.writer(temporary, lineterminator="\n")
-                writer.writerow([column["name"] for column in columns])
+                writer.writerow([column["name"] for column in fixture_columns])
                 for row_index in range(rows):
                     writer.writerow(
                         [
                             _synthetic_value(column, row_index, randomizer)
-                            for column in columns
+                            for column in fixture_columns
                         ]
                     )
                 temporary_path = Path(temporary.name)
@@ -240,12 +264,13 @@ def generate_synthetic_data(
                 "dataset": dataset_name,
                 "status": (
                     "generated"
-                    if schema.get("status") == "complete"
+                    if schema.get("status") == "complete" and not assumed_columns
                     else "generated_partial_schema"
                 ),
                 "schema_status": schema.get("status", "unknown"),
                 "rows": rows,
                 "seed": seed,
+                "assumed_character_columns": assumed_columns,
                 "columns": [
                     {
                         "name": column["name"],
@@ -253,7 +278,7 @@ def generate_synthetic_data(
                         "length": column.get("length"),
                         "format": column.get("format"),
                     }
-                    for column in columns
+                    for column in fixture_columns
                 ],
                 "path": output_path.name,
             }
@@ -279,10 +304,14 @@ def generate_synthetic_data(
                 item["status"] == "generated_partial_schema" for item in generated
             ),
             "skipped_count": sum(item["status"] == "skipped" for item in records),
+            "assumed_type_dataset_count": sum(
+                bool(item.get("assumed_character_columns")) for item in generated
+            ),
         },
         "limitations": [
             "Generated rows are deterministic synthetic fixtures, not a statistical model of production data.",
-            "Only catalogued columns with known numeric or character types are generated.",
+            "Unknown column types are assumed character for fixtures, not inferred SAS types.",
+            "Datasets without discovered columns and columns with unsupported types are skipped.",
             "Partial schemas produce partial fixtures; downstream programs may require uncatalogued columns.",
             "Missing-value rates, keys, constraints, and cross-table relationships are not inferred.",
         ],

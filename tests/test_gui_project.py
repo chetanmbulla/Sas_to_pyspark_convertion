@@ -90,6 +90,14 @@ class GuiProjectTests(unittest.TestCase):
             self.assertEqual(conversion["summary"]["succeeded"], 1)
             self.assertEqual(result["configuration"], "all_scripts_fallback")
             self.assertEqual(result["index"]["summaries"]["inventory"]["program_count"], 1)
+            self.assertTrue((output / "phase1-quality.json").is_file())
+            quality = json.loads((output / "phase1-quality.json").read_text(encoding="utf-8"))
+            self.assertEqual(quality["assessment"], "not_certified")
+            self.assertEqual(
+                quality["gates"][0]["status"],
+                "blocked",
+            )
+            self.assertIn("quality", result["index"]["summaries"])
             synthetic = regenerate_synthetic_data(output, rows=2, seed=3)
             self.assertEqual(synthetic["rows_per_dataset"], 2)
 
@@ -287,10 +295,16 @@ class GuiProjectPageTests(unittest.TestCase):
             output = Path(result["output_root"])
             manifest = json.loads((output / "synthetic-data" / "synthetic-data-manifest.json").read_text(encoding="utf-8"))
             app.session_state["project_analysis"] = result
-            app.session_state["project_synthetic"] = manifest
             app.run(timeout=30)
-            app.selectbox[0].select("work.source").run(timeout=30)
             self.assertEqual(len(app.exception), 0)
+            selected = app.selectbox[0].value
+            self.assertIn(
+                next(item["status"] for item in manifest["datasets"] if item["dataset"] == selected),
+                {"generated", "generated_partial_schema"},
+            )
+            self.assertEqual(app.session_state["project_synthetic"], manifest)
+            self.assertTrue(any("dataset(s) were skipped" in item.value for item in app.warning))
+            app.selectbox[0].select("work.source").run(timeout=30)
             self.assertEqual(list(app.dataframe[1].value["Attribute"]), ["id", "label"])
             self.assertEqual(app.dataframe[1].value["Label"].iloc[1], "Description")
             self.assertEqual(list(app.dataframe[2].value.columns), ["id", "label"])
@@ -306,6 +320,68 @@ class GuiProjectPageTests(unittest.TestCase):
             app.selectbox[0].select("work.missing_input").run(timeout=30)
             self.assertEqual(len(app.exception), 0)
             self.assertTrue(any("No fixture was generated" in item.value for item in app.warning))
+
+    def test_phase2_reports_when_no_fixtures_can_be_generated(self):
+        from streamlit.testing.v1 import AppTest
+
+        page = Path(__file__).resolve().parents[1] / "app" / "pages" / "2_Phase_2_Synthetic_Data.py"
+        with tempfile.TemporaryDirectory() as directory:
+            real_mkdtemp = tempfile.mkdtemp
+
+            def temporary_workspace(prefix, **kwargs):
+                return real_mkdtemp(prefix=prefix, dir=directory, **kwargs)
+
+            with patch("sas2pyspark.gui_project.tempfile.mkdtemp", temporary_workspace):
+                result = analyze_zip(
+                    make_zip({"main.sas": "data result; set source; run;"})
+                )
+            app = AppTest.from_file(str(page))
+            app.session_state["project_analysis"] = result
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("No sample fixtures are available" in item.value for item in app.info))
+            app.button[0].click().run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("No dataset fixtures were generated" in item.value for item in app.warning))
+            self.assertFalse(any("Synthetic data generation completed" in item.value for item in app.success))
+
+    def test_phase2_generates_unknown_types_with_visible_assumptions(self):
+        from streamlit.testing.v1 import AppTest
+
+        page = Path(__file__).resolve().parents[1] / "app" / "pages" / "2_Phase_2_Synthetic_Data.py"
+        with tempfile.TemporaryDirectory() as directory:
+            real_mkdtemp = tempfile.mkdtemp
+
+            def temporary_workspace(prefix, **kwargs):
+                return real_mkdtemp(prefix=prefix, dir=directory, **kwargs)
+
+            with patch("sas2pyspark.gui_project.tempfile.mkdtemp", temporary_workspace):
+                result = analyze_zip(
+                    make_zip({"main.sas": "data result; set source; run;"})
+                )
+            catalog_path = Path(result["output_root"]) / "catalog.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            resource = next(
+                item for item in catalog["resources"] if item["name"] == "work.source"
+            )
+            resource["schema"] = {
+                "status": "partial", "columns": [{"name": "mystery", "type": "unknown"}]
+            }
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            app = AppTest.from_file(str(page))
+            app.session_state["project_analysis"] = result
+            app.run(timeout=30)
+            app.button[0].click().run(timeout=30)
+            app.selectbox[0].select("work.source").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("assumed to be strings" in item.value for item in app.warning))
+            self.assertTrue(any("mystery" in item.value for item in app.warning))
+            self.assertTrue(any("mystery" in frame.value.columns for frame in app.dataframe))
+            record = next(
+                item for item in app.session_state["project_synthetic"]["datasets"]
+                if item["dataset"] == "work.source"
+            )
+            self.assertEqual(record["assumed_character_columns"], ["mystery"])
 
     def test_project_page_renders(self):
         from streamlit.testing.v1 import AppTest
@@ -328,6 +404,7 @@ class GuiProjectPageTests(unittest.TestCase):
             with patch("sas2pyspark.gui_project.tempfile.mkdtemp", temporary_workspace):
                 result = analyze_zip(make_zip({"main.sas": "data result; set source; run;"}))
             output = Path(result["output_root"])
+            (output / "file-classification.json").unlink()
             conversion_path = output / "conversion.json"
             conversion = json.loads(conversion_path.read_text(encoding="utf-8"))
             conversion["outcomes"].append(
@@ -356,10 +433,19 @@ class GuiProjectPageTests(unittest.TestCase):
             }
             app.run(timeout=30)
             self.assertEqual(len(app.exception), 0)
+            self.assertTrue((output / "file-classification.json").is_file())
+            self.assertTrue(
+                any("Rebuilding it from the saved source inventory" in item.value
+                    for item in app.warning)
+            )
             self.assertTrue(any("previous analysis" in item.value for item in app.warning))
             self.assertTrue(any(item.label == "Converted" and item.value == "1" for item in app.metric))
             self.assertTrue(any(item.label == "Failed" and item.value == "1" for item in app.metric))
             self.assertTrue(any(item.label == "Score" for item in app.metric))
+            self.assertTrue(any(item.label == "Files classified" and item.value == "1" for item in app.metric))
+            self.assertTrue(any(item.label == "Technical" for item in app.metric))
+            self.assertTrue(any(item.label == "Classification summary" for item in app.selectbox))
+            self.assertTrue(any(item.label == "File classification" for item in app.tabs))
             self.assertTrue(any(item.label == "Jobs and includes" for item in app.tabs))
             app.session_state["project_archive_hash"] = None
             app.run(timeout=30)

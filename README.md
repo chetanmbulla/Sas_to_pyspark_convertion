@@ -162,17 +162,37 @@ reachability and server drive mappings are not authoritative.
 
 The page displays jobs, recursive includes, libraries, physical paths,
 external input/output connections, datasets, schemas, conversion issues, and
-the heuristic complexity score. The downloadable Markdown report includes
+the heuristic complexity score. Its evidence-quality gates identify unverified
+JAMS configuration, unresolved includes and libraries, incomplete schemas,
+unknown external endpoints, unresolved lineage and template business context.
+An uploaded configuration is not treated as independently verified, and the
+gate report explicitly avoids claiming analysis accuracy. The downloadable Markdown report includes
 Mermaid process-flow source; business context is an offline template and AI
 prompts are exported without contacting an AI service. Phase 1 also generates
 initial synthetic fixtures and conversions, which can be reviewed in the
 subsequent pages.
+The CLI workflow also writes `phase1-quality.json`; it lists evidence gates and
+blockers without presenting a percentage as proof of analysis accuracy. For PoC
+work, the report records source-derived assumptions and lists unavailable
+evidence fields with the value `NA`. `NA` means that no supplied evidence supports
+the value; it is not a guess or proof that the value does not exist. Conversion
+failures remain failures and retain their reported reasons.
+Phase 1 also writes `file-classification.json`, a per-SAS-file inventory with
+technical category, business domain, program type, execution characteristics,
+evidence, confidence by dimension, and unresolved questions. The Project
+Analysis page displays this inventory. Classifications are deterministic
+static-analysis results; runtime history is not inferred, and unsupported or
+ambiguous evidence remains `Unknown / Unclassified` for review.
 
 ### Phase 2: synthetic test data
 
 After running Phase 1, select **Phase 2 Synthetic Data** in the sidebar. The
 page lists catalog datasets and their schema and fixture statuses. Select an
-object to inspect its available attributes and up to 20 synthetic CSV rows.
+object to inspect its available attributes and up to 20 synthetic CSV rows;
+the first dataset with a generated fixture is selected by default. Skipped
+datasets remain selectable and show the reason no fixture was generated. If
+no datasets can be generated, the page reports this instead of reporting
+generation as a success.
 The page can also regenerate fixtures with a chosen row count and seed; the
 new fixtures are used by Phase 3.
 If the upload widgets are cleared when switching back to Project Analysis,
@@ -185,7 +205,10 @@ on the Project Analysis page before running Phase 1. Supported formats are
 [schema assets](#migration-project-foundation). This is metadata only: do not
 upload production data. Matching is by catalog dataset name, and unmatched
 metadata is reported. Without authoritative schemas, inferred attributes and
-types may be incomplete or unknown; datasets with unknown types are skipped.
+types may be incomplete or unknown. Unknown types are assumed to be character
+strings for synthetic fixtures, and the affected columns are listed in the
+manifest and UI. This does not establish their SAS types. Datasets without
+discovered columns or with unsupported types are skipped.
 CSV files preserve known column names and character-length limits, but CSV
 does not enforce SAS types or formats. Synthetic values do not reproduce
 production distributions, missing values, keys, or relationships; obtain and
@@ -209,6 +232,21 @@ Runs do not chain intermediate outputs between programs, and runtime success
 does not validate the full pipeline or establish SAS equivalence. Programs
 that failed conversion cannot be executed from this page. Use reference
 outputs and the reconciliation workflow for value-level comparison.
+
+### Phase 1 task agents
+
+Workspace-scoped custom agents are available in `.github/agents/`:
+
+- **Phase 1 Pipeline and JAMS** — entrypoints, recursive includes, macros, and drive mappings.
+- **Phase 1 Schemas and Lineage** — authoritative schema assets and dataset/column lineage.
+- **Phase 1 External Systems** — read-only review of libraries, physical paths, connections, and endpoints.
+- **Phase 1 Context and Complexity** — reports, Mermaid flows, offline business context, and complexity.
+- **Phase 1 Evidence Coordinator** — read-only cross-report reconciliation and blocker prioritization.
+
+The specialist agents have bounded file ownership; the external-systems reviewer
+and coordinator are read-only to reduce conflicting edits. Agents must distinguish
+code defects from missing project evidence and must not claim 100% accuracy
+without authoritative JAMS/platform inputs, complete schemas, and owner validation.
 
 Project uploads, reports, generated code, fixtures, and execution logs are
 stored in a persistent local temporary workspace shown on the page. Remove
@@ -855,7 +893,7 @@ Markdown reports are protected; use `--force` to replace one.
 `project analyze --root <repo> --config pipeline.json --out <folder>` runs
 discover, resolve-pipeline, catalog, plan, convert, report and synthesize in one
 step. Everything lands in `<folder>`: `inventory.json`, `pipeline-report.json`,
-`catalog.json`, `plan.json`, `conversion.json`, `project.json`,
+`catalog.json`, `file-classification.json`, `plan.json`, `conversion.json`, `project.json`,
 `project-report.md`, `synthetic-data/`, generated PySpark under `code/`, and
 `phase1-index.json` (artifact paths, per-step summaries, and limitations). The
 output folder must be outside `--root`, so the SAS tree is never modified, and a
@@ -893,8 +931,10 @@ planning additional converter support.
 
 `project synthesize --catalog project.catalog.json --output-dir test-data
 --rows 100 --seed 0` creates deterministic CSV fixtures and a
-`synthetic-data-manifest.json`. Only numeric and character columns with known
-types are generated; unknown schemas and unknown column types are skipped.
+`synthetic-data-manifest.json`. Known numeric and character columns are
+generated using their catalog types; unknown types are assumed character and
+recorded as assumptions. Datasets with no discovered columns or unsupported
+types are skipped.
 Fixtures from partial schemas are marked as partial and can omit fields needed
 by the full program. Existing outputs are not overwritten unless `--force` is
 specified. Generated data is not representative of production distributions,

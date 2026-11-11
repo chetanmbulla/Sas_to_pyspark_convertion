@@ -76,7 +76,7 @@ class SyntheticDataTests(unittest.TestCase):
 
         self.assertEqual(manifest_path.read_bytes(), manifest_before)
 
-    def test_rejects_unknown_column_types(self):
+    def test_assumes_unknown_types_are_character_and_records_assumptions(self):
         catalog = {
             "schema_version": 1,
             "resources": [
@@ -84,16 +84,53 @@ class SyntheticDataTests(unittest.TestCase):
                     "name": "ods.bad",
                     "kind": "sas_dataset",
                     "schema": {
-                        "status": "partial",
-                        "columns": [{"name": "value", "type": "unknown"}],
+                        "status": "complete",
+                        "columns": [
+                            {"name": "id", "type": "numeric"},
+                            {"name": "value", "type": "unknown"},
+                            {"name": "missing_type"},
+                        ],
                     },
                 }
             ],
         }
-        report = generate_synthetic_data(catalog, self.root / "unsupported")
+        report = generate_synthetic_data(catalog, self.root / "unknown", rows=2)
 
-        self.assertEqual(report["summary"]["skipped_count"], 1)
-        self.assertEqual(report["datasets"][0]["status"], "skipped")
+        self.assertEqual(report["summary"]["generated_count"], 1)
+        self.assertEqual(report["summary"]["assumed_type_dataset_count"], 1)
+        record = report["datasets"][0]
+        self.assertEqual(record["status"], "generated_partial_schema")
+        self.assertEqual(record["assumed_character_columns"], ["value", "missing_type"])
+        self.assertEqual([col["type"] for col in record["columns"]], [
+            "numeric", "character", "character",
+        ])
+        with (self.root / "unknown" / record["path"]).open(
+            encoding="utf-8", newline=""
+        ) as stream:
+            data = list(csv.reader(stream))
+        self.assertEqual(data[0], ["id", "value", "missing_type"])
+        self.assertEqual(len(data), 3)
+        self.assertTrue(data[1][1].startswith("SYN_"))
+        self.assertEqual(catalog["resources"][0]["schema"]["columns"][1]["type"], "unknown")
+
+    def test_unsupported_types_and_missing_columns_remain_skipped(self):
+        catalog = {
+            "schema_version": 1,
+            "resources": [
+                {"name": "ods.bad", "kind": "sas_dataset", "schema": {
+                    "status": "partial", "columns": [{"name": "value", "type": "binary"}]
+                }},
+                {"name": "ods.empty", "kind": "sas_dataset", "schema": {
+                    "status": "unknown", "columns": []
+                }},
+            ],
+        }
+        report = generate_synthetic_data(catalog, self.root / "unsupported")
+        self.assertEqual(report["summary"]["skipped_count"], 2)
+        records = {record["dataset"]: record for record in report["datasets"]}
+        self.assertIn("unsupported types", records["ods.bad"]["reason"])
+        self.assertIn("no column definitions were discovered", records["ods.empty"]["reason"])
+        self.assertIn("SAS files/ZIP", records["ods.empty"]["reason"])
 
     def test_cli_writes_manifest(self):
         catalog_path = self.root / "catalog.json"

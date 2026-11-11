@@ -26,6 +26,8 @@ from .synthetic_data import generate_synthetic_data, load_catalog_report
 from .validation import validate_generated_code
 from .enterprise_guide import build_enterprise_guide_inventory
 from .coverage_report import build_coverage_report
+from .phase1_quality import build_phase1_quality_report
+from .file_classification import build_file_classification
 
 _SIMPLE_LET = re.compile(
     r"^[ \t]*%let[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*([^;&%\r\n]*);",
@@ -55,6 +57,7 @@ def run_phase1_analysis(
     seed: int = 0,
     force: bool = False,
     schemas: str | Path | None = None,
+    configuration_source: str = "provided",
 ) -> dict[str, Any]:
     """Run discover, resolve, catalog, plan, convert, report and synthesize.
 
@@ -68,6 +71,10 @@ def run_phase1_analysis(
         raise Phase1AnalysisError(f"Cannot access input: {error}") from error
     if not repository_root.is_dir():
         raise Phase1AnalysisError(f"Repository root is not a directory: {repository_root}")
+    if configuration_source not in {"provided", "all_scripts_fallback"}:
+        raise Phase1AnalysisError(
+            "configuration_source must be 'provided' or 'all_scripts_fallback'."
+        )
     out = Path(output_dir).resolve(strict=False)
     if out == repository_root or repository_root in out.parents or out in repository_root.parents:
         raise Phase1AnalysisError(
@@ -95,6 +102,8 @@ def run_phase1_analysis(
         "validation": out / "validation.json",
         "enterprise_guide": out / "enterprise-guide.json",
         "coverage": out / "coverage.json",
+        "quality": out / "phase1-quality.json",
+        "classification": out / "file-classification.json",
         "synthetic_data": out / "synthetic-data",
         "generated_code": out / "code",
     }
@@ -123,6 +132,14 @@ def run_phase1_analysis(
     )
     catalog["schema_asset_warnings"] = asset_warnings
     _write_json(files["catalog"], catalog)
+    classification = build_file_classification(
+        repository_root,
+        inventory.programs,
+        pipeline.to_dict(),
+        catalog,
+        configuration_source=configuration_source,
+    )
+    _write_json(files["classification"], classification)
     graph = build_knowledge_graph(pipeline.to_dict(), catalog)
     _write_json(files["knowledge_graph"], graph)
     context = build_business_context(pipeline.to_dict(), catalog, root=repository_root)
@@ -243,6 +260,7 @@ def run_phase1_analysis(
             "asset_count": len(inventory.assets),
             "issue_count": len(inventory.issues),
         },
+        "classification": classification["summary"],
         "pipeline": pipeline.to_dict()["summary"],
         "catalog": catalog["summary"],
         "knowledge_graph": graph["summary"],
@@ -260,6 +278,15 @@ def run_phase1_analysis(
         },
         "synthetic_data": synthetic["summary"],
     }
+    quality = build_phase1_quality_report(
+        configuration=configuration_source,
+        pipeline_config=config_data,
+        pipeline_report=pipeline.to_dict(),
+        catalog_report=catalog,
+        phase1_index={"summaries": summaries},
+    )
+    _write_json(files["quality"], quality)
+    summaries["quality"] = quality["summary"]
     index = {
         "schema_version": INDEX_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -273,6 +300,8 @@ def run_phase1_analysis(
         "limitations": [
             "Reachability, libraries, systems and schemas are static analysis results; "
             "unresolved and unknown items are listed in the pipeline report and catalog.",
+            "phase1-quality.json reports evidence gaps; it cannot certify accuracy "
+            "against actual SAS runtime behavior or business intent.",
             "Schemas come only from explicit LENGTH/ATTRIB/FORMAT declarations and are partial.",
             "Complexity is a prioritization heuristic, not an effort estimate.",
             "Remote (RSUBMIT) code is tracked but not converted or executed.",

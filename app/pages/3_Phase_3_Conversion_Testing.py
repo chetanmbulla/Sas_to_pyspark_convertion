@@ -93,6 +93,19 @@ if st.session_state.get("phase3_inputs_program") != program:
     st.session_state.phase3_inputs = [name for name in available if name in inputs]
     st.session_state.phase3_inputs_program = program
 selected = st.multiselect("Synthetic input datasets", available, key="phase3_inputs")
+assumed_inputs = [
+    item for item in manifest["datasets"]
+    if item["dataset"] in selected and item.get("assumed_character_columns")
+]
+if assumed_inputs:
+    st.warning(
+        "Some selected fixtures use strings for unknown SAS column types: "
+        + "; ".join(
+            f"{item['dataset']} ({', '.join(item['assumed_character_columns'])})"
+            for item in assumed_inputs
+        )
+        + ". Test behavior may differ from SAS."
+    )
 timeout = st.number_input("Timeout per program (seconds)", min_value=1, max_value=3600, value=120, key="phase3_timeout")
 trusted = st.checkbox("I trust this code and understand execution is not sandboxed", key="phase3_trusted")
 has_pyspark = importlib.util.find_spec("pyspark") is not None

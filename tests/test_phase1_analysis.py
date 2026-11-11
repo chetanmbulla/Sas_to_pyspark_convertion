@@ -48,8 +48,19 @@ class Phase1AnalysisTests(unittest.TestCase):
         self.assertTrue((self.out / "validation.json").is_file())
         self.assertTrue((self.out / "enterprise-guide.json").is_file())
         self.assertTrue((self.out / "coverage.json").is_file())
+        self.assertTrue((self.out / "phase1-quality.json").is_file())
+        self.assertTrue((self.out / "file-classification.json").is_file())
         self.assertIn("validation", index["summaries"])
         self.assertIn("coverage", index["summaries"])
+        self.assertIn("quality", index["summaries"])
+        self.assertIn("classification", index["summaries"])
+        classification = json.loads(
+            (self.out / "file-classification.json").read_text("utf-8")
+        )
+        self.assertEqual(classification["summary"]["file_count"], 1)
+        self.assertEqual(len(classification["files"]), 1)
+        quality = json.loads((self.out / "phase1-quality.json").read_text("utf-8"))
+        self.assertEqual(quality["assessment"], "not_certified")
         self.assertEqual(before, sorted(path.name for path in self.root.rglob("*")))
 
     def test_refuses_non_empty_output_without_force(self):
